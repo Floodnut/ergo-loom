@@ -15,15 +15,19 @@
     <filter id="shadow" x="-16" y="-14" width="160" height="160" color-interpolation-filters="sRGB">
       <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#6b5134" flood-opacity="0.18"/>
     </filter>
+    <clipPath id="shape">
+      <rect width="128" height="128" rx="30"/>
+    </clipPath>
   </defs>
-  <rect width="128" height="128" fill="url(#field)"/>
-  <rect x="8" y="8" width="112" height="112" rx="26" fill="#fff9ef" opacity="0.18"/>
-  <path d="M26 33h76M22 58h84M26 83h76" fill="none" stroke="#c9a87d" stroke-width="2" stroke-linecap="round" opacity="0.35"/>
-  <g filter="url(#shadow)">
-    <path d="M64 101V62" fill="none" stroke="url(#thread)" stroke-width="8" stroke-linecap="round"/>
-    <path d="M64 62C52 55 44 47 37 34M64 62c12-7 20-15 27-28M64 74c-14 1-25 7-34 18M64 74c14 1 25 7 34 18" fill="none" stroke="url(#thread)" stroke-width="7" stroke-linecap="round"/>
-    <path d="M45 49c7 4 14 6 19 13 5-7 12-9 19-13M42 88c9-5 16-7 22-14 6 7 13 9 22 14" fill="none" stroke="#f7efe3" stroke-width="3" stroke-linecap="round" opacity="0.82"/>
-    <circle cx="64" cy="62" r="6" fill="#f7efe3"/>
-    <circle cx="64" cy="62" r="3" fill="#8a5a3a"/>
+  <g clip-path="url(#shape)">
+    <rect width="128" height="128" rx="30" fill="url(#field)"/>
+    <path d="M26 33h76M22 58h84M26 83h76" fill="none" stroke="#c9a87d" stroke-width="2" stroke-linecap="round" opacity="0.35"/>
+    <g filter="url(#shadow)">
+      <path d="M64 101V62" fill="none" stroke="url(#thread)" stroke-width="8" stroke-linecap="round"/>
+      <path d="M64 62C52 55 44 47 37 34M64 62c12-7 20-15 27-28M64 74c-14 1-25 7-34 18M64 74c14 1 25 7 34 18" fill="none" stroke="url(#thread)" stroke-width="7" stroke-linecap="round"/>
+      <path d="M45 49c7 4 14 6 19 13 5-7 12-9 19-13M42 88c9-5 16-7 22-14 6 7 13 9 22 14" fill="none" stroke="#f7efe3" stroke-width="3" stroke-linecap="round" opacity="0.82"/>
+      <circle cx="64" cy="62" r="6" fill="#f7efe3"/>
+      <circle cx="64" cy="62" r="3" fill="#8a5a3a"/>
+    </g>
   </g>
 </svg>

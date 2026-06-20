@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import sharp from "sharp";
 
 const root = process.cwd();
 const source = path.join(root, "apps", "desktop-or-web", "static", "icon.svg");
@@ -12,6 +13,10 @@ const png = path.join(buildDir, "icon.png");
 const icns = path.join(buildDir, "icon.icns");
 
 fs.mkdirSync(assetDir, { recursive: true });
+fs.rmSync(rendered, { force: true });
+fs.rmSync(png, { force: true });
+fs.rmSync(icns, { force: true });
+fs.rmSync(iconsetDir, { force: true, recursive: true });
 fs.mkdirSync(iconsetDir, { recursive: true });
 
 function run(command, args) {
@@ -21,7 +26,7 @@ function run(command, args) {
   }
 }
 
-run("qlmanage", ["-t", "-s", "1024", "-o", assetDir, source]);
+await sharp(source).resize(1024, 1024).png().toFile(rendered);
 fs.copyFileSync(rendered, png);
 
 const sizes = [
