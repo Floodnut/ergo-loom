@@ -132,10 +132,16 @@ dist-packaged/Ergo-Loom-0.1.0-arm64.dmg
 dist-packaged/latest-mac.yml
 ```
 
-The app icon is generated from:
+The GitHub/README brand icon is kept at:
 
 ```text
 apps/desktop-or-web/static/icon.svg
+```
+
+The installable macOS app icon is generated from:
+
+```text
+apps/desktop-or-web/static/icon-app.svg
 ```
 
 into:

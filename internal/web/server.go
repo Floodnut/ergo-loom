@@ -145,6 +145,11 @@ func (s Server) state(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
+	tools, err := s.store.ListTools()
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
 	profiles, err := s.store.ListProviderProfiles()
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
@@ -181,6 +186,7 @@ func (s Server) state(w http.ResponseWriter, r *http.Request) {
 		"projects":      projects,
 		"providers":     providers,
 		"agents":        agents,
+		"tools":         tools,
 		"profiles":      profiles,
 		"models":        models,
 		"routes":        routes,

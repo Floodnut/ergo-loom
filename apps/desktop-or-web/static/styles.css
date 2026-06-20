@@ -1520,6 +1520,9 @@ h2 {
 
 .workspace-tabs button,
 .mini-tabs button {
+  display: flex;
+  align-items: center;
+  gap: 5px;
   min-width: 0;
   overflow: hidden;
   border: 0;
@@ -1532,6 +1535,31 @@ h2 {
   padding: 6px 8px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.workspace-tabs button {
+  display: block;
+}
+
+.mini-tabs button span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tab-close {
+  display: inline-grid;
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  place-items: center;
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.tab-close:hover {
+  background: var(--chrome-strong);
+  color: var(--text);
 }
 
 .workspace-tabs button.active,
@@ -1592,6 +1620,35 @@ h2 {
 .workspace-activity-item .activity-detail {
   max-height: 96px;
   overflow: auto;
+}
+
+.tool-registry-list {
+  margin-bottom: 10px;
+}
+
+.tool-registry-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.tool-registry-chip {
+  overflow: hidden;
+  max-width: 100%;
+  border-radius: 999px;
+  background: rgb(71 104 93 / 0.11);
+  color: var(--moss);
+  font-size: 10px;
+  font-weight: 750;
+  padding: 4px 7px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-registry-chip.disabled {
+  background: var(--soft);
+  color: var(--muted);
+  opacity: 0.66;
 }
 
 .auth-status-list {

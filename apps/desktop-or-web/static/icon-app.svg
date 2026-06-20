@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">Ergo Loom app icon</title>
+  <desc id="desc">A warm woven world-tree mark sized for macOS app surfaces.</desc>
+  <defs>
+    <linearGradient id="field" x1="20" y1="10" x2="108" y2="118" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fff9ef"/>
+      <stop offset="0.62" stop-color="#efe1cc"/>
+      <stop offset="1" stop-color="#d9b88f"/>
+    </linearGradient>
+    <linearGradient id="thread" x1="34" y1="24" x2="98" y2="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7b5f3d"/>
+      <stop offset="0.52" stop-color="#9b5e3f"/>
+      <stop offset="1" stop-color="#2f5147"/>
+    </linearGradient>
+    <filter id="shadow" x="-16" y="-14" width="160" height="160" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="7" stdDeviation="7" flood-color="#6b5134" flood-opacity="0.16"/>
+    </filter>
+    <clipPath id="shape">
+      <rect width="128" height="128" rx="30"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#shape)">
+    <rect width="128" height="128" rx="30" fill="url(#field)"/>
+    <path d="M31 37h66M27 61h74M31 85h66" fill="none" stroke="#c9a87d" stroke-width="2" stroke-linecap="round" opacity="0.32"/>
+    <g filter="url(#shadow)" transform="translate(64 66) scale(0.72) translate(-64 -66)">
+      <path d="M64 101V62" fill="none" stroke="url(#thread)" stroke-width="8" stroke-linecap="round"/>
+      <path d="M64 62C52 55 44 47 37 34M64 62c12-7 20-15 27-28M64 74c-14 1-25 7-34 18M64 74c14 1 25 7 34 18" fill="none" stroke="url(#thread)" stroke-width="7" stroke-linecap="round"/>
+      <path d="M45 49c7 4 14 6 19 13 5-7 12-9 19-13M42 88c9-5 16-7 22-14 6 7 13 9 22 14" fill="none" stroke="#f7efe3" stroke-width="3" stroke-linecap="round" opacity="0.82"/>
+      <circle cx="64" cy="62" r="6" fill="#f7efe3"/>
+      <circle cx="64" cy="62" r="3" fill="#8a5a3a"/>
+    </g>
+  </g>
+</svg>

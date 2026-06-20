@@ -4,7 +4,7 @@ import path from "node:path";
 import sharp from "sharp";
 
 const root = process.cwd();
-const source = path.join(root, "apps", "desktop-or-web", "static", "icon.svg");
+const source = path.join(root, "apps", "desktop-or-web", "static", "icon-app.svg");
 const buildDir = path.join(root, "build");
 const assetDir = path.join(buildDir, "assets");
 const iconsetDir = path.join(buildDir, "icon.iconset");

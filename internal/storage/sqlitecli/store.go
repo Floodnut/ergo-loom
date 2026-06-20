@@ -394,6 +394,14 @@ ORDER BY id ASC;
 `)
 }
 
+func (s Store) ListTools() ([]RegistryItem, error) {
+	return s.listRegistry(`
+SELECT id, display_name, kind, enabled
+FROM tool_registry
+ORDER BY id ASC;
+`)
+}
+
 func (s Store) ListProviderProfiles() ([]ProviderProfile, error) {
 	out, err := s.queryJSON(`
 SELECT id, provider_plugin_id, display_name, is_default

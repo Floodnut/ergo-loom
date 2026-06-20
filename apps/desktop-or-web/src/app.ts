@@ -11,6 +11,7 @@ const state = {
   profiles: [],
   models: [],
   usage: [],
+  tools: [],
   authStatuses: [],
   contextUsage: null,
   selectedSessionId: null,
@@ -148,6 +149,7 @@ const els = {
   workspaceActivity: q("#workspace-activity"),
   workspaceApprovals: q("#workspace-approvals"),
   authStatusList: q("#auth-status-list"),
+  toolRegistryList: q("#tool-registry-list"),
   terminalTabs: q("#terminal-tabs"),
   newTerminalTab: q("#new-terminal-tab"),
   fileTabs: q("#file-tabs"),
@@ -185,6 +187,7 @@ async function loadState() {
   state.profiles = data.profiles || [];
   state.models = data.models || [];
   state.usage = data.usage || [];
+  state.tools = data.tools || [];
   state.authStatuses = data.auth || [];
   renderProjectName();
   renderProjects();
@@ -195,6 +198,7 @@ async function loadState() {
   renderNavUsage();
   renderWorkspaceActivity();
   renderAuthStatuses();
+  renderToolRegistrySummary();
   renderTerminalPanel();
   renderFilePanel();
   renderRegistry(els.providers, groupedProviderRegistry(data.providers || []));
@@ -947,6 +951,24 @@ function renderAuthStatuses() {
   }
 }
 
+function renderToolRegistrySummary() {
+  els.toolRegistryList.replaceChildren();
+  if (!state.tools.length) return;
+  const label = document.createElement("div");
+  label.className = "workspace-panel-label";
+  label.textContent = "Tool Registry";
+  const list = document.createElement("div");
+  list.className = "tool-registry-grid";
+  for (const tool of state.tools) {
+    const item = document.createElement("span");
+    item.className = tool.Enabled ? "tool-registry-chip" : "tool-registry-chip disabled";
+    item.textContent = tool.DisplayName;
+    item.title = `${tool.ID} · ${tool.Kind}`;
+    list.append(item);
+  }
+  els.toolRegistryList.append(label, list);
+}
+
 function renderWorkspaceActivity() {
   els.workspaceActivity.replaceChildren();
   if (state.workspaceEvents.length === 0) {
@@ -1191,10 +1213,14 @@ function renderTerminalPanel() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = tab.id === state.activeTerminalId ? "active" : "";
-    button.textContent = tab.title;
+    button.innerHTML = `<span>${escapeHTML(tab.title)}</span><span class="tab-close" aria-hidden="true">×</span>`;
     button.addEventListener("click", () => {
       state.activeTerminalId = tab.id;
       renderTerminalPanel();
+    });
+    button.querySelector(".tab-close").addEventListener("click", (event) => {
+      event.stopPropagation();
+      closeTerminalTab(tab.id);
     });
     els.terminalTabs.append(button);
   }
@@ -1241,6 +1267,26 @@ function newTerminalTab() {
   renderTerminalPanel();
 }
 
+function closeTerminalTab(tabId) {
+  if (state.terminalTabs.length === 1) {
+    const tab = activeTerminalTab();
+    tab.pendingCommand = "";
+    tab.running = false;
+    tab.lines = [{ text: "$ ergo status", className: "" }, { text: "Local runtime ready", className: "muted" }];
+    terminalControllers.get(tab.id)?.abort();
+    terminalControllers.delete(tab.id);
+    renderTerminalPanel();
+    return;
+  }
+  terminalControllers.get(tabId)?.abort();
+  terminalControllers.delete(tabId);
+  state.terminalTabs = state.terminalTabs.filter((tab) => tab.id !== tabId);
+  if (state.activeTerminalId === tabId) {
+    state.activeTerminalId = state.terminalTabs[0].id;
+  }
+  renderTerminalPanel();
+}
+
 function appendTerminalLine(text, className = "") {
   const tab = activeTerminalTab();
   const line = { text, className };
@@ -1266,10 +1312,14 @@ function renderFilePanel() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = tab.id === state.activeFileId ? "active" : "";
-    button.textContent = tab.title;
+    button.innerHTML = `<span>${escapeHTML(tab.title)}</span><span class="tab-close" aria-hidden="true">×</span>`;
     button.addEventListener("click", () => {
       state.activeFileId = tab.id;
       renderFilePanel();
+    });
+    button.querySelector(".tab-close").addEventListener("click", (event) => {
+      event.stopPropagation();
+      closeFileTab(tab.id);
     });
     els.fileTabs.append(button);
   }
@@ -1305,6 +1355,24 @@ function newFileTab() {
   state.fileTabs.push(tab);
   state.activeFileId = tab.id;
   switchWorkspaceTab("files");
+  renderFilePanel();
+}
+
+function closeFileTab(tabId) {
+  if (state.fileTabs.length === 1) {
+    const tab = activeFileTab();
+    tab.title = "No file";
+    tab.path = "";
+    tab.content = "No file open";
+    tab.status = "idle";
+    tab.size = 0;
+    renderFilePanel();
+    return;
+  }
+  state.fileTabs = state.fileTabs.filter((tab) => tab.id !== tabId);
+  if (state.activeFileId === tabId) {
+    state.activeFileId = state.fileTabs[0].id;
+  }
   renderFilePanel();
 }
 
