@@ -15,7 +15,7 @@
     "build:web": "tsc -p apps/desktop-or-web/tsconfig.json",
     "check:desktop": "npm run check:web && tsc -p apps/electron/tsconfig.json --noEmit",
     "check:web": "tsc -p apps/desktop-or-web/tsconfig.json --noEmit",
-    "package:mac": "npm run build:desktop && electron-builder --mac pkg dir",
+    "package:mac": "npm run build:desktop && electron-builder --mac dmg dir",
     "start:desktop": "npm run build:desktop && electron ."
   },
   "build": {
@@ -23,7 +23,7 @@
     "productName": "Ergo Loom",
     "asar": true,
     "directories": {
-      "output": "dist-packaged"
+      "output": "dist-release"
     },
     "files": [
       "dist/electron/**/*",
@@ -51,14 +51,15 @@
       "category": "public.app-category.developer-tools",
       "icon": "build/icon.icns",
       "target": [
-        "pkg",
+        "dmg",
         "dir"
       ],
       "identity": null
     },
-    "pkg": {
+    "dmg": {
       "artifactName": "Ergo-Loom-${version}-${arch}.${ext}",
-      "installLocation": "/Applications"
+      "backgroundColor": "#fffdf8",
+      "icon": "build/icon.icns"
     },
     "publish": [
       {

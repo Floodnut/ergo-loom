@@ -25,14 +25,14 @@ Ergo Loom focuses on local-first usage. API-billed routes are not the default in
 
 ## Installation
 
-Install Ergo Loom with the official macOS `.pkg` installer only.
+Install Ergo Loom with the official macOS `.dmg` installer only.
 
-1. Download the latest `Ergo Loom.pkg` from the project release page.
-2. Open the package installer.
-3. Follow the macOS installation steps.
+1. Download the latest `Ergo Loom.dmg` from the project release page.
+2. Open the disk image.
+3. Drag **Ergo Loom** into Applications.
 4. Launch **Ergo Loom** from Applications.
 
-Do not install Ergo Loom by manually copying app bundles from build folders. The package installer is the supported installation method because it installs the desktop app and companion local runtime together.
+Do not install Ergo Loom by manually copying app bundles from build folders. The disk image is the supported installation method because it contains the desktop app and companion local runtime together.
 
 ## Minimum Requirements
 

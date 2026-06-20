@@ -6,5 +6,6 @@ build/assets/
 build/*.iconset/
 dist/
 dist-packaged/
+dist-release/
 node_modules/
 .DS_Store
