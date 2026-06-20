@@ -1,4 +1,5 @@
-import { app, BrowserWindow, shell } from "electron";
+import { app, BrowserWindow, Menu, dialog, shell, type MenuItemConstructorOptions } from "electron";
+import { autoUpdater } from "electron-updater";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
@@ -143,13 +144,124 @@ function stopBackend(): void {
   backend = null;
 }
 
+function configureAutoUpdater(): void {
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  autoUpdater.on("update-available", (info) => {
+    mainWindow?.webContents.send("ergo-update-status", {
+      status: "available",
+      version: info.version,
+    });
+  });
+  autoUpdater.on("update-not-available", (info) => {
+    mainWindow?.webContents.send("ergo-update-status", {
+      status: "not-available",
+      version: info.version,
+    });
+  });
+  autoUpdater.on("error", (error) => {
+    mainWindow?.webContents.send("ergo-update-status", {
+      status: "error",
+      message: error.message,
+    });
+  });
+  autoUpdater.on("update-downloaded", (info) => {
+    mainWindow?.webContents.send("ergo-update-status", {
+      status: "downloaded",
+      version: info.version,
+    });
+    void dialog.showMessageBox({
+      type: "info",
+      buttons: ["Install and restart", "Later"],
+      defaultId: 0,
+      cancelId: 1,
+      message: "A new Ergo Loom update is ready.",
+      detail: `Version ${info.version} has been downloaded. Your local data in ~/.ergo-loom will be preserved.`,
+    }).then((result) => {
+      if (result.response === 0) {
+        stopBackend();
+        autoUpdater.quitAndInstall(false, true);
+      }
+    });
+  });
+}
+
+function checkForUpdates(silent = true): void {
+  if (!app.isPackaged) {
+    if (!silent) {
+      void dialog.showMessageBox({
+        type: "info",
+        message: "Updates are checked only in packaged builds.",
+        detail: "Run npm run package:mac and launch the packaged app to test update checks.",
+      });
+    }
+    return;
+  }
+  autoUpdater.checkForUpdatesAndNotify().catch((error) => {
+    if (!silent) {
+      void dialog.showErrorBox("Update check failed", error.message);
+    }
+  });
+}
+
+function installAppMenu(): void {
+  const template: MenuItemConstructorOptions[] = [
+    {
+      label: "Ergo Loom",
+      submenu: [
+        { role: "about" },
+        {
+          label: "Check for Updates...",
+          click: () => checkForUpdates(false),
+        },
+        { type: "separator" },
+        { role: "quit" },
+      ],
+    },
+    {
+      label: "Edit",
+      submenu: [
+        { role: "undo" },
+        { role: "redo" },
+        { type: "separator" },
+        { role: "cut" },
+        { role: "copy" },
+        { role: "paste" },
+        { role: "selectAll" },
+      ],
+    },
+    {
+      label: "View",
+      submenu: [
+        { role: "reload" },
+        { role: "toggleDevTools" },
+        { type: "separator" },
+        { role: "resetZoom" },
+        { role: "zoomIn" },
+        { role: "zoomOut" },
+        { type: "separator" },
+        { role: "togglefullscreen" },
+      ],
+    },
+    {
+      label: "Window",
+      submenu: [{ role: "minimize" }, { role: "close" }],
+    },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
 app.setName("Ergo Loom");
 
 app.whenReady().then(() => {
+  installAppMenu();
+  configureAutoUpdater();
   void createWindow().catch((error) => {
     console.error(error);
     app.quit();
   });
+  setTimeout(() => checkForUpdates(true), 2500);
 });
 
 app.on("activate", () => {

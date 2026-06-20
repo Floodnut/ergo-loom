@@ -10,6 +10,9 @@ Ergo Loom's desktop shell is a thin installed runtime around the same local Go c
 - `ERGO_LOOM_DATA_DIR` can override the local data directory.
 - `ERGO_LOOM_APP_ROOT` lets the Go binary find bundled schema/static resources when launched by a desktop shell.
 - `npm run package:mac` builds `dist-packaged/mac-arm64/Ergo Loom.app` with the custom icon.
+- `npm run package:mac` also emits `dist-packaged/Ergo-Loom-<version>-<arch>.dmg` for install/update by replacing the app bundle.
+- App updates replace only `Ergo Loom.app`; local state remains in `~/.ergo-loom/local.db`.
+- Packaged builds check GitHub Releases (`Floodnut/ergo-loom`) via `electron-updater`; signing/notarization should be added before public distribution.
 
 Packaging still needs a follow-up pass for `.app`/`.dmg` creation and resource copying, but the runtime boundary is already:
 
