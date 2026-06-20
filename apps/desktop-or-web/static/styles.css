@@ -1510,6 +1510,90 @@ h2 {
   background: var(--soft-hover);
 }
 
+.workspace-tabs,
+.mini-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 10px;
+  min-width: 0;
+}
+
+.workspace-tabs button,
+.mini-tabs button {
+  min-width: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+  padding: 6px 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-tabs button.active,
+.workspace-tabs button:hover,
+.mini-tabs button.active,
+.mini-tabs button:hover {
+  background: var(--soft);
+  color: var(--text);
+}
+
+.workspace-panel {
+  margin-bottom: 18px;
+}
+
+.workspace-panel[hidden] {
+  display: none;
+}
+
+.workspace-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.workspace-panel-label {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  margin-bottom: 7px;
+  text-transform: uppercase;
+}
+
+.workspace-approvals {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.workspace-approvals:empty {
+  display: none;
+}
+
+.workspace-activity {
+  display: grid;
+  gap: 8px;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.workspace-activity-item {
+  border-radius: 6px;
+  background: var(--soft);
+  padding: 9px;
+}
+
+.workspace-activity-item .activity-detail {
+  max-height: 96px;
+  overflow: auto;
+}
+
 .terminal-view,
 .branch-card,
 .file-viewer {
@@ -1528,6 +1612,32 @@ h2 {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   font-size: 11px;
   overflow: auto;
+}
+
+.file-open-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.file-open-form input {
+  min-width: 0;
+  border: 0;
+  border-radius: 6px;
+  background: var(--soft);
+  color: var(--text);
+  padding: 9px 10px;
+}
+
+.file-open-form button {
+  border: 0;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fffdf8;
+  cursor: pointer;
+  font-weight: 700;
+  padding: 0 12px;
 }
 
 .terminal-line {
@@ -1577,6 +1687,22 @@ h2 {
 .file-viewer {
   min-height: 180px;
   background: var(--soft);
+}
+
+.file-viewer pre {
+  margin: 0;
+  max-height: 260px;
+  overflow: auto;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.file-viewer pre.error {
+  color: var(--cedar);
 }
 
 .nav-pane > :not(.brand-row) {

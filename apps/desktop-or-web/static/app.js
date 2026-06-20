@@ -14,8 +14,31 @@ const state = {
     selectedSessionId: null,
     selectedModelId: "",
     thinkingEffort: "medium",
-    pendingCommand: "",
     pendingApprovals: [],
+    workspaceEvents: [],
+    activeWorkspaceTab: "activity",
+    terminalTabs: [
+        {
+            id: "terminal-1",
+            title: "zsh 1",
+            pendingCommand: "",
+            lines: [
+                { text: "$ ergo status", className: "" },
+                { text: "Local runtime ready", className: "muted" },
+            ],
+        },
+    ],
+    activeTerminalId: "terminal-1",
+    fileTabs: [
+        {
+            id: "file-1",
+            title: "No file",
+            path: "",
+            content: "No file open",
+            status: "idle",
+        },
+    ],
+    activeFileId: "file-1",
     runningSessionId: "",
     searchTimer: null,
     showAllSessions: false,
@@ -108,6 +131,16 @@ const els = {
     terminalPendingCommand: q("#terminal-pending-command"),
     terminalRun: q("#terminal-run"),
     terminalCancel: q("#terminal-cancel"),
+    workspaceTabs: q("#workspace-tabs"),
+    workspaceActivity: q("#workspace-activity"),
+    workspaceApprovals: q("#workspace-approvals"),
+    terminalTabs: q("#terminal-tabs"),
+    newTerminalTab: q("#new-terminal-tab"),
+    fileTabs: q("#file-tabs"),
+    newFileTab: q("#new-file-tab"),
+    fileOpenForm: q("#file-open-form"),
+    filePath: q("#file-path"),
+    fileContent: q("#file-content"),
 };
 async function request(path, options = {}) {
     const response = await fetch(path, {
@@ -138,6 +171,9 @@ async function loadState() {
     renderRoutePicker();
     renderModelPicker();
     renderNavUsage();
+    renderWorkspaceActivity();
+    renderTerminalPanel();
+    renderFilePanel();
     renderRegistry(els.providers, groupedProviderRegistry(data.providers || []));
     renderRegistry(els.agents, data.agents || []);
     renderRoutes(state.routes);
@@ -331,22 +367,24 @@ function queueTerminalCommand(event) {
     const command = els.terminalCommand.value.trim();
     if (!command)
         return;
-    state.pendingCommand = command;
-    els.terminalPending.hidden = false;
-    els.terminalPendingCommand.textContent = command;
+    const tab = activeTerminalTab();
+    tab.pendingCommand = command;
+    renderTerminalPanel();
 }
 function cancelTerminalCommand() {
-    state.pendingCommand = "";
-    els.terminalPending.hidden = true;
-    els.terminalPendingCommand.textContent = "";
+    const tab = activeTerminalTab();
+    tab.pendingCommand = "";
+    renderTerminalPanel();
 }
 async function runTerminalCommand() {
-    const command = state.pendingCommand;
+    const tab = activeTerminalTab();
+    const command = tab.pendingCommand;
     if (!command)
         return;
     els.terminalRun.disabled = true;
     appendTerminalLine(`$ ${command}`);
-    appendTerminalLine("running...", "muted");
+    const runningLine = appendTerminalLine("running...", "muted");
+    appendWorkspaceEvent("tool", { toolName: "zsh", command, text: "Queued from terminal tab" });
     try {
         const data = await request("/api/terminal/run", {
             method: "POST",
@@ -355,9 +393,22 @@ async function runTerminalCommand() {
                 sessionId: state.selectedSessionId || "",
             }),
         });
+        runningLine.text = "completed";
         renderTerminalRun(data.run);
+        appendWorkspaceEvent("result", {
+            toolName: "zsh",
+            command,
+            text: [data.run.Stdout, data.run.Stderr].filter(Boolean).join("\n"),
+            status: data.run.Status,
+        });
         els.terminalCommand.value = "";
         cancelTerminalCommand();
+    }
+    catch (error) {
+        runningLine.text = error.message || String(error);
+        runningLine.className = "error";
+        appendWorkspaceEvent("error", { toolName: "zsh", command, text: error.message || String(error) });
+        renderTerminalPanel();
     }
     finally {
         els.terminalRun.disabled = false;
@@ -742,6 +793,7 @@ function appendReasoning(text) {
     return item;
 }
 function appendActivityEvent(kind, payload = {}) {
+    appendWorkspaceEvent(kind, payload);
     const item = document.createElement("div");
     item.className = `reasoning-item activity-${kind}`;
     const title = document.createElement("div");
@@ -771,6 +823,57 @@ function appendActivityEvent(kind, payload = {}) {
     els.reasoningCount.textContent = String(els.reasoningStream.children.length);
     return item;
 }
+function appendWorkspaceEvent(kind, payload = {}) {
+    state.workspaceEvents.unshift({
+        id: `event-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        kind,
+        payload,
+        createdAt: new Date(),
+    });
+    state.workspaceEvents = state.workspaceEvents.slice(0, 80);
+    renderWorkspaceActivity();
+}
+function renderWorkspaceActivity() {
+    els.workspaceActivity.replaceChildren();
+    if (state.workspaceEvents.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "meta";
+        empty.textContent = "No tool activity yet";
+        els.workspaceActivity.append(empty);
+    }
+    for (const event of state.workspaceEvents) {
+        const item = document.createElement("div");
+        item.className = `workspace-activity-item activity-${event.kind}`;
+        const title = document.createElement("div");
+        title.className = "activity-title";
+        title.textContent = activityTitle(event.kind, event.payload);
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        meta.textContent = event.createdAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+        item.append(title, meta);
+        const detailText = [event.payload.command, event.payload.text].filter(Boolean).join("\n").trim();
+        if (detailText) {
+            const detail = document.createElement("pre");
+            detail.className = "activity-detail";
+            detail.textContent = detailText;
+            item.append(detail);
+        }
+        els.workspaceActivity.append(item);
+    }
+    renderWorkspaceApprovals();
+}
+function renderWorkspaceApprovals() {
+    els.workspaceApprovals.replaceChildren();
+    if (state.pendingApprovals.length === 0)
+        return;
+    const label = document.createElement("div");
+    label.className = "workspace-panel-label";
+    label.textContent = "Pending approvals";
+    els.workspaceApprovals.append(label);
+    for (const approval of state.pendingApprovals) {
+        els.workspaceApprovals.append(toolApprovalCard(approval));
+    }
+}
 function addToolApproval(payload) {
     if (!payload.approvalId)
         return;
@@ -788,6 +891,7 @@ function renderToolApprovals() {
     for (const approval of state.pendingApprovals) {
         els.approvalList.append(toolApprovalCard(approval));
     }
+    renderWorkspaceApprovals();
 }
 function toolApprovalCard(approval) {
     const card = document.createElement("section");
@@ -854,6 +958,11 @@ async function resolveApproval(payload, decision, sourceButton) {
             }),
         });
         state.pendingApprovals = state.pendingApprovals.filter((item) => item.approvalId !== payload.approvalId);
+        appendWorkspaceEvent(decision === "accept" ? "approval" : "error", {
+            ...payload,
+            status: decision,
+            text: decision === "accept" ? "Approved by user" : "Declined by user",
+        });
         renderToolApprovals();
     }
     catch (error) {
@@ -920,12 +1029,78 @@ function renderContextMeter() {
         : `${estimatedTokens.toLocaleString()} ctx est.`;
     els.contextMeter.textContent = `${messageCount} messages · ${tokenLabel} · ${providerChats} provider chats`;
 }
-function appendTerminalLine(text, className = "") {
-    const line = document.createElement("div");
-    line.className = `terminal-line ${className}`.trim();
-    line.textContent = text;
-    els.terminalOutput.append(line);
+function activeTerminalTab() {
+    let tab = state.terminalTabs.find((item) => item.id === state.activeTerminalId);
+    if (!tab) {
+        tab = state.terminalTabs[0];
+        state.activeTerminalId = tab.id;
+    }
+    return tab;
+}
+function activeFileTab() {
+    let tab = state.fileTabs.find((item) => item.id === state.activeFileId);
+    if (!tab) {
+        tab = state.fileTabs[0];
+        state.activeFileId = tab.id;
+    }
+    return tab;
+}
+function switchWorkspaceTab(tabID) {
+    state.activeWorkspaceTab = tabID;
+    for (const button of els.workspaceTabs.querySelectorAll("[data-workspace-tab]")) {
+        const tabButton = button;
+        tabButton.classList.toggle("active", tabButton.dataset.workspaceTab === tabID);
+    }
+    for (const panel of document.querySelectorAll("[data-workspace-panel]")) {
+        const workspacePanel = panel;
+        const active = workspacePanel.dataset.workspacePanel === tabID;
+        workspacePanel.classList.toggle("active", active);
+        workspacePanel.hidden = !active;
+    }
+}
+function renderTerminalPanel() {
+    const active = activeTerminalTab();
+    els.terminalTabs.replaceChildren();
+    for (const tab of state.terminalTabs) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = tab.id === state.activeTerminalId ? "active" : "";
+        button.textContent = tab.title;
+        button.addEventListener("click", () => {
+            state.activeTerminalId = tab.id;
+            renderTerminalPanel();
+        });
+        els.terminalTabs.append(button);
+    }
+    els.terminalOutput.replaceChildren();
+    for (const line of active.lines) {
+        const node = document.createElement("div");
+        node.className = `terminal-line ${line.className || ""}`.trim();
+        node.textContent = line.text;
+        els.terminalOutput.append(node);
+    }
+    els.terminalPending.hidden = !active.pendingCommand;
+    els.terminalPendingCommand.textContent = active.pendingCommand || "";
     els.terminalOutput.parentElement.scrollTop = els.terminalOutput.parentElement.scrollHeight;
+}
+function newTerminalTab() {
+    const next = state.terminalTabs.length + 1;
+    const tab = {
+        id: `terminal-${Date.now()}`,
+        title: `zsh ${next}`,
+        pendingCommand: "",
+        lines: [{ text: "$ ergo status", className: "" }, { text: "Local runtime ready", className: "muted" }],
+    };
+    state.terminalTabs.push(tab);
+    state.activeTerminalId = tab.id;
+    switchWorkspaceTab("terminals");
+    renderTerminalPanel();
+}
+function appendTerminalLine(text, className = "") {
+    const tab = activeTerminalTab();
+    const line = { text, className };
+    tab.lines.push(line);
+    renderTerminalPanel();
     return line;
 }
 function renderTerminalRun(run) {
@@ -936,6 +1111,67 @@ function renderTerminalRun(run) {
         }
     }
     appendTerminalLine(`exit ${run.ExitCode} · ${run.Status}`, run.ExitCode === 0 ? "muted" : "error");
+}
+function renderFilePanel() {
+    const active = activeFileTab();
+    els.fileTabs.replaceChildren();
+    for (const tab of state.fileTabs) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = tab.id === state.activeFileId ? "active" : "";
+        button.textContent = tab.title;
+        button.addEventListener("click", () => {
+            state.activeFileId = tab.id;
+            renderFilePanel();
+        });
+        els.fileTabs.append(button);
+    }
+    els.filePath.value = active.path || "";
+    els.fileContent.textContent = active.content || "No file open";
+    els.fileContent.className = active.status === "error" ? "error" : "";
+}
+function newFileTab() {
+    const next = state.fileTabs.length + 1;
+    const tab = {
+        id: `file-${Date.now()}`,
+        title: `File ${next}`,
+        path: "",
+        content: "No file open",
+        status: "idle",
+    };
+    state.fileTabs.push(tab);
+    state.activeFileId = tab.id;
+    switchWorkspaceTab("files");
+    renderFilePanel();
+}
+async function openFileInActiveTab(event) {
+    event.preventDefault();
+    const tab = activeFileTab();
+    const filePath = els.filePath.value.trim();
+    if (!filePath)
+        return;
+    tab.path = filePath;
+    tab.title = filePath.split("/").filter(Boolean).pop() || filePath;
+    tab.content = "Loading...";
+    tab.status = "loading";
+    renderFilePanel();
+    try {
+        const data = await request("/api/files/read", {
+            method: "POST",
+            body: JSON.stringify({ path: filePath }),
+        });
+        tab.path = data.path || filePath;
+        tab.title = tab.path.split("/").filter(Boolean).pop() || tab.path;
+        tab.content = data.content || "";
+        tab.status = "loaded";
+        appendWorkspaceEvent("tool", { toolName: "file.read", command: tab.path, text: "Opened in file viewer" });
+    }
+    catch (error) {
+        tab.content = error.message || String(error);
+        tab.status = "error";
+        appendWorkspaceEvent("error", { toolName: "file.read", command: filePath, text: tab.content });
+    }
+    renderFilePanel();
 }
 function renderRegistry(target, items) {
     target.replaceChildren();
@@ -1510,9 +1746,21 @@ els.input.addEventListener("keydown", handleComposerKeydown);
 els.modelPicker.addEventListener("click", toggleModelMenu);
 els.modelEffort.addEventListener("click", toggleThinkingEffort);
 els.modelSearch.addEventListener("input", () => renderModelMenu(modelOptions()));
+els.workspaceTabs.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-workspace-tab]");
+    if (!button)
+        return;
+    switchWorkspaceTab(button.dataset.workspaceTab);
+});
+els.newTerminalTab.addEventListener("click", newTerminalTab);
 els.terminalForm.addEventListener("submit", queueTerminalCommand);
 els.terminalRun.addEventListener("click", runTerminalCommand);
 els.terminalCancel.addEventListener("click", cancelTerminalCommand);
+els.newFileTab.addEventListener("click", newFileTab);
+els.fileOpenForm.addEventListener("submit", openFileInActiveTab);
+switchWorkspaceTab(state.activeWorkspaceTab);
+renderTerminalPanel();
+renderFilePanel();
 loadState().catch((error) => {
     els.messages.textContent = error.message;
 });

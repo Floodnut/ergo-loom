@@ -122,13 +122,28 @@
       </section>
 
       <aside class="workspace-pane">
-        <section>
-          <h2>Terminal</h2>
+        <div class="workspace-tabs" id="workspace-tabs" role="tablist" aria-label="Workspace tools">
+          <button class="active" type="button" data-workspace-tab="activity">Activity</button>
+          <button type="button" data-workspace-tab="terminals">Terminals</button>
+          <button type="button" data-workspace-tab="files">Files</button>
+        </div>
+
+        <section class="workspace-panel active" id="workspace-activity-panel" data-workspace-panel="activity">
+          <h2>Tool Activity</h2>
+          <div class="workspace-approvals" id="workspace-approvals"></div>
+          <div class="workspace-activity" id="workspace-activity">
+            <div class="meta">No tool activity yet</div>
+          </div>
+        </section>
+
+        <section class="workspace-panel" id="workspace-terminal-panel" data-workspace-panel="terminals" hidden>
+          <div class="workspace-section-head">
+            <h2>Terminals</h2>
+            <button class="small-button" id="new-terminal-tab" type="button">+</button>
+          </div>
+          <div class="mini-tabs" id="terminal-tabs" role="tablist" aria-label="Terminal tabs"></div>
           <div class="terminal-view">
-            <div id="terminal-output">
-              <div class="terminal-line">$ ergo status</div>
-              <div class="terminal-line muted">Local runtime ready</div>
-            </div>
+            <div id="terminal-output"></div>
           </div>
           <form class="terminal-form" id="terminal-form">
             <input id="terminal-command" type="text" placeholder="Type a command">
@@ -143,17 +158,27 @@
             </div>
           </div>
         </section>
+
+        <section class="workspace-panel" id="workspace-files-panel" data-workspace-panel="files" hidden>
+          <div class="workspace-section-head">
+            <h2>File Viewer</h2>
+            <button class="small-button" id="new-file-tab" type="button">+</button>
+          </div>
+          <div class="mini-tabs" id="file-tabs" role="tablist" aria-label="File tabs"></div>
+          <form class="file-open-form" id="file-open-form">
+            <input id="file-path" type="text" placeholder="Open local file path">
+            <button type="submit">Open</button>
+          </form>
+          <div class="file-viewer">
+            <pre id="file-content">No file open</pre>
+          </div>
+        </section>
+
         <section>
           <h2>Current Branch</h2>
           <div class="branch-card">
             <strong>main</strong>
             <div class="meta">No branch session selected</div>
-          </div>
-        </section>
-        <section>
-          <h2>File Viewer</h2>
-          <div class="file-viewer">
-            <div class="meta">No file open</div>
           </div>
         </section>
         <section>

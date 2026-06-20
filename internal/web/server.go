@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -103,6 +104,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/sessions/", s.renameSession)
 	mux.HandleFunc("POST /api/sessions/", s.sessionMessage)
 	mux.HandleFunc("POST /api/sessions", s.createSession)
+	mux.HandleFunc("POST /api/files/read", s.readFile)
 	mux.HandleFunc("POST /api/terminal/run", s.runTerminalCommand)
 	mux.HandleFunc("POST /api/tool-approvals/", s.resolveToolApproval)
 	staticFiles, err := fs.Sub(webapp.Files(), "static")
@@ -387,6 +389,70 @@ func (s Server) runTerminalCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"run": run})
+}
+
+func (s Server) readFile(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	filePath := strings.TrimSpace(input.Path)
+	if filePath == "" {
+		writeError(w, errors.New("path is required"), http.StatusBadRequest)
+		return
+	}
+	if strings.HasPrefix(filePath, "~") {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			writeError(w, err, http.StatusInternalServerError)
+			return
+		}
+		filePath = filepath.Join(homeDir, strings.TrimPrefix(filePath, "~"))
+	}
+	if !filepath.IsAbs(filePath) {
+		project, err := s.store.DefaultProject()
+		if err != nil {
+			writeError(w, err, http.StatusInternalServerError)
+			return
+		}
+		base := strings.TrimSpace(project.RootPath)
+		if base == "" {
+			base, err = os.Getwd()
+			if err != nil {
+				writeError(w, err, http.StatusInternalServerError)
+				return
+			}
+		}
+		filePath = filepath.Join(base, filePath)
+	}
+	cleanPath := filepath.Clean(filePath)
+	info, err := os.Stat(cleanPath)
+	if err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	if info.IsDir() {
+		writeError(w, errors.New("path is a directory"), http.StatusBadRequest)
+		return
+	}
+	const maxFileSize = 512 * 1024
+	if info.Size() > maxFileSize {
+		writeError(w, fmt.Errorf("file is too large for preview: %d bytes", info.Size()), http.StatusBadRequest)
+		return
+	}
+	content, err := os.ReadFile(cleanPath)
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"path":    cleanPath,
+		"content": string(content),
+		"size":    info.Size(),
+	})
 }
 
 func (s Server) resolveToolApproval(w http.ResponseWriter, r *http.Request) {
