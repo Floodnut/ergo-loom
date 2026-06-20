@@ -90,6 +90,15 @@ type ProjectAccessRoute struct {
 	Priority  int
 }
 
+type ModeratorPreference struct {
+	Scope                    string
+	ProjectID                string
+	Mode                     string
+	PrimaryProviderGroupID   string
+	SecondaryProviderGroupID string
+	Source                   string
+}
+
 type TokenUsageInput struct {
 	ProviderPluginID  string
 	ProviderProfileID string
@@ -156,15 +165,28 @@ func (s Store) Init() error {
 		return err
 	}
 
-	return s.run(string(schema))
+	if err := s.run(string(schema)); err != nil {
+		return err
+	}
+	return s.ensureSessionProjectColumn()
 }
 
 func (s Store) ListSessions() ([]core.Session, error) {
+	return s.ListSessionsForProject("")
+}
+
+func (s Store) ListSessionsForProject(projectID string) ([]core.Session, error) {
+	projectID = strings.TrimSpace(projectID)
+	where := ""
+	if projectID != "" {
+		where = fmt.Sprintf("WHERE COALESCE(project_id, 'default') = %s", quote(projectID))
+	}
 	out, err := s.queryJSON(`
-SELECT id, source_tool, source_id, title, created_at, updated_at,
+SELECT id, COALESCE(project_id, 'default') AS project_id, source_tool, source_id, title, created_at, updated_at,
        COALESCE(parent_session_id, '') AS parent_id,
        COALESCE(branch_from_message_id, '') AS branch_from_id
 FROM sessions
+` + where + `
 ORDER BY updated_at DESC, id ASC;
 `)
 	if err != nil {
@@ -192,7 +214,7 @@ ORDER BY updated_at DESC, id ASC;
 
 func (s Store) GetSession(id string) (core.Session, []core.Message, error) {
 	sessionOut, err := s.queryJSON(fmt.Sprintf(`
-SELECT id, source_tool, source_id, title, created_at, updated_at,
+SELECT id, COALESCE(project_id, 'default') AS project_id, source_tool, source_id, title, created_at, updated_at,
        COALESCE(parent_session_id, '') AS parent_id,
        COALESCE(branch_from_message_id, '') AS branch_from_id
 FROM sessions
@@ -243,21 +265,85 @@ ORDER BY ordinal ASC;
 }
 
 func (s Store) CreateChatSession(title string) (core.Session, error) {
+	return s.CreateChatSessionForProject("", title)
+}
+
+func (s Store) CreateChatSessionForProject(projectID string, title string) (core.Session, error) {
 	if strings.TrimSpace(title) == "" {
 		title = "Untitled chat"
+	}
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		projectID = "default"
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	sessionID := "session_" + randomHex(16)
-	stmt := fmt.Sprintf(`INSERT INTO sessions (id, source_tool, source_id, title, created_at, updated_at)
-VALUES (%s, 'ergo', %s, %s, %s, %s);
-`, quote(sessionID), quote(sessionID), quote(title), quote(now), quote(now))
+	stmt := fmt.Sprintf(`INSERT INTO sessions (id, project_id, source_tool, source_id, title, created_at, updated_at)
+VALUES (%s, %s, 'ergo', %s, %s, %s, %s);
+`, quote(sessionID), quote(projectID), quote(sessionID), quote(title), quote(now), quote(now))
 
 	if err := s.run(stmt); err != nil {
 		return core.Session{}, err
 	}
 	session, _, err := s.GetSession(sessionID)
 	return session, err
+}
+
+func (s Store) ListSessionProviderGroups(sessionID string) ([]string, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, errors.New("session id is required")
+	}
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT provider_group_id
+FROM session_provider_groups
+WHERE session_id = %s
+ORDER BY created_at ASC, provider_group_id ASC;
+`, quote(sessionID)))
+	if err != nil {
+		return nil, err
+	}
+	var rows []struct {
+		ProviderGroupID string `json:"provider_group_id"`
+	}
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if strings.TrimSpace(row.ProviderGroupID) != "" {
+			ids = append(ids, row.ProviderGroupID)
+		}
+	}
+	return ids, nil
+}
+
+func (s Store) SetSessionProviderGroups(sessionID string, providerGroupIDs []string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return errors.New("session id is required")
+	}
+	if _, _, err := s.GetSession(sessionID); err != nil {
+		return err
+	}
+	seen := map[string]bool{}
+	values := make([]string, 0, len(providerGroupIDs))
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, providerGroupID := range providerGroupIDs {
+		providerGroupID = strings.TrimSpace(providerGroupID)
+		if providerGroupID == "" || seen[providerGroupID] {
+			continue
+		}
+		seen[providerGroupID] = true
+		values = append(values, fmt.Sprintf("(%s, %s, %s)", quote(sessionID), quote(providerGroupID), quote(now)))
+	}
+	stmt := fmt.Sprintf("DELETE FROM session_provider_groups WHERE session_id = %s;\n", quote(sessionID))
+	if len(values) > 0 {
+		stmt += "INSERT INTO session_provider_groups (session_id, provider_group_id, created_at) VALUES\n"
+		stmt += strings.Join(values, ",\n") + ";\n"
+	}
+	return s.run(stmt)
 }
 
 func (s Store) RenameSession(sessionID string, title string) (core.Session, error) {
@@ -347,9 +433,9 @@ func (s Store) CreateBranch(sessionID string, fromMessageID string) (core.Sessio
 
 	var sql bytes.Buffer
 	fmt.Fprintf(&sql, "BEGIN;\n")
-	fmt.Fprintf(&sql, `INSERT INTO sessions (id, source_tool, source_id, title, created_at, updated_at, parent_session_id, branch_from_message_id)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
-`, quote(branchSessionID), quote(string(session.SourceTool)), quote(branchSessionID), quote(title), quote(now), quote(now), quote(session.ID), quote(fromMessageID))
+	fmt.Fprintf(&sql, `INSERT INTO sessions (id, project_id, source_tool, source_id, title, created_at, updated_at, parent_session_id, branch_from_message_id)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+`, quote(branchSessionID), nullable(session.ProjectID), quote(string(session.SourceTool)), quote(branchSessionID), quote(title), quote(now), quote(now), quote(session.ID), quote(fromMessageID))
 
 	for i, message := range messages[:fromOrdinal+1] {
 		fmt.Fprintf(&sql, `INSERT INTO messages (id, session_id, source_id, role, content, created_at, ordinal)
@@ -807,6 +893,77 @@ WHERE project_id = %s AND access_route_id = %s;
 	return s.run(stmt)
 }
 
+func (s Store) ModeratorPreference(projectID string) (ModeratorPreference, error) {
+	projectID = strings.TrimSpace(projectID)
+	if projectID != "" {
+		if pref, err := s.moderatorPreferenceForScope("project", projectID); err == nil {
+			pref.Source = "project"
+			return pref, nil
+		} else if !errors.Is(err, ErrNotFound) {
+			return ModeratorPreference{}, err
+		}
+	}
+	if pref, err := s.moderatorPreferenceForScope("global", ""); err == nil {
+		pref.Source = "global"
+		return pref, nil
+	} else if !errors.Is(err, ErrNotFound) {
+		return ModeratorPreference{}, err
+	}
+	return ModeratorPreference{Scope: "default", Mode: "auto", Source: "default"}, nil
+}
+
+func (s Store) UpsertProjectModeratorPreference(projectID string, mode string, primary string, secondary string) (ModeratorPreference, error) {
+	projectID = strings.TrimSpace(projectID)
+	mode = strings.TrimSpace(mode)
+	if projectID == "" {
+		return ModeratorPreference{}, errors.New("project id is required")
+	}
+	if mode == "" {
+		mode = "auto"
+	}
+	if mode != "auto" && mode != "manual" {
+		return ModeratorPreference{}, errors.New("moderator mode must be auto or manual")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	stmt := fmt.Sprintf(`
+INSERT INTO moderator_preferences (
+  scope, project_id, mode, primary_provider_group_id, secondary_provider_group_id, updated_at
+) VALUES ('project', %s, %s, %s, %s, %s)
+ON CONFLICT(scope, project_id) DO UPDATE SET
+  mode = excluded.mode,
+  primary_provider_group_id = excluded.primary_provider_group_id,
+  secondary_provider_group_id = excluded.secondary_provider_group_id,
+  updated_at = excluded.updated_at;
+`, quote(projectID), quote(mode), nullable(primary), nullable(secondary), quote(now))
+	if err := s.run(stmt); err != nil {
+		return ModeratorPreference{}, err
+	}
+	return s.ModeratorPreference(projectID)
+}
+
+func (s Store) moderatorPreferenceForScope(scope string, projectID string) (ModeratorPreference, error) {
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT scope,
+       project_id,
+       mode,
+       COALESCE(primary_provider_group_id, '') AS primary_provider_group_id,
+       COALESCE(secondary_provider_group_id, '') AS secondary_provider_group_id
+FROM moderator_preferences
+WHERE scope = %s AND project_id = %s;
+`, quote(scope), quote(projectID)))
+	if err != nil {
+		return ModeratorPreference{}, err
+	}
+	var rows []moderatorPreferenceRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return ModeratorPreference{}, err
+	}
+	if len(rows) == 0 {
+		return ModeratorPreference{}, ErrNotFound
+	}
+	return rows[0].toCore(), nil
+}
+
 func (s Store) AddTokenUsage(input TokenUsageInput) error {
 	if input.ProviderPluginID == "" {
 		return errors.New("provider plugin id is required")
@@ -1019,8 +1176,23 @@ func (s Store) queryJSON(sql string) (string, error) {
 	return string(out), nil
 }
 
+func (s Store) ensureSessionProjectColumn() error {
+	out, err := s.queryJSON(`PRAGMA table_info(sessions);`)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(out, `"name":"project_id"`) {
+		return nil
+	}
+	return s.run(`
+ALTER TABLE sessions ADD COLUMN project_id TEXT REFERENCES projects(id);
+UPDATE sessions SET project_id = 'default' WHERE project_id IS NULL OR project_id = '';
+`)
+}
+
 type sessionRow struct {
 	ID           string `json:"id"`
+	ProjectID    string `json:"project_id"`
 	SourceTool   string `json:"source_tool"`
 	SourceID     string `json:"source_id"`
 	Title        string `json:"title"`
@@ -1041,6 +1213,7 @@ func (r sessionRow) toCore() (core.Session, error) {
 	}
 	return core.Session{
 		ID:           r.ID,
+		ProjectID:    r.ProjectID,
 		SourceTool:   core.SourceTool(r.SourceTool),
 		SourceID:     r.SourceID,
 		Title:        r.Title,
@@ -1146,6 +1319,24 @@ type projectAccessRouteRow struct {
 	SupportsHandoff   int    `json:"supports_handoff"`
 	CostModel         string `json:"cost_model"`
 	Status            string `json:"status"`
+}
+
+type moderatorPreferenceRow struct {
+	Scope                    string `json:"scope"`
+	ProjectID                string `json:"project_id"`
+	Mode                     string `json:"mode"`
+	PrimaryProviderGroupID   string `json:"primary_provider_group_id"`
+	SecondaryProviderGroupID string `json:"secondary_provider_group_id"`
+}
+
+func (r moderatorPreferenceRow) toCore() ModeratorPreference {
+	return ModeratorPreference{
+		Scope:                    r.Scope,
+		ProjectID:                r.ProjectID,
+		Mode:                     r.Mode,
+		PrimaryProviderGroupID:   r.PrimaryProviderGroupID,
+		SecondaryProviderGroupID: r.SecondaryProviderGroupID,
+	}
 }
 
 func (r projectAccessRouteRow) toAccessRoute() AccessRoute {

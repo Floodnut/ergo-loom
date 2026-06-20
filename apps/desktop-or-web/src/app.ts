@@ -7,6 +7,9 @@ const state = {
   projects: [],
   routes: [],
   project: null,
+  selectedProjectId: savedProjectID(),
+  selectedProviderIds: [],
+  moderatorPreference: null,
   projectRoutes: [],
   profiles: [],
   models: [],
@@ -48,6 +51,8 @@ const state = {
   recentFiles: [],
   activeFileId: "file-1",
   runningSessionId: "",
+  chatQueue: [],
+  queueDragId: "",
   searchTimer: null,
   showAllSessions: false,
 };
@@ -77,6 +82,110 @@ const searchProviders = [
   },
 ];
 
+const warmBuildPrompts = [
+  "오늘은 작은 맥락 하나가 큰 실마리가 될지도 몰라요.",
+  "흩어진 생각을 천천히 엮어볼까요?",
+  "가벼운 질문 하나로 오늘의 작업을 열어봐요.",
+  "지금 손에 잡히는 것부터 함께 풀어봐요.",
+  "복잡한 일도 한 줄의 대화에서 시작돼요.",
+  "오늘의 작업 실을 어디서부터 잡아볼까요?",
+  "조용히 쌓아둔 맥락을 다음 행동으로 이어봐요.",
+  "조금 막힌 곳이 있다면 거기서부터 시작해도 좋아요.",
+  "작은 수정 하나가 좋은 흐름을 만들 수 있어요.",
+  "오늘의 프로젝트에 필요한 첫 매듭을 지어볼까요?",
+  "아직 흐릿한 아이디어도 괜찮아요. 같이 선명하게 해봐요.",
+  "생각의 가지를 나누고 다시 엮을 준비가 됐어요.",
+  "가장 귀찮은 부분부터 덜어내볼까요?",
+  "오늘은 어떤 대화를 작업으로 바꿔볼까요?",
+  "작은 단서라도 충분해요. 거기서부터 이어갈게요.",
+  "지금 필요한 맥락을 한곳에 모아봐요.",
+  "작업의 첫 문장을 편하게 던져주세요.",
+  "잠깐 멈춘 흐름을 다시 이어볼까요?",
+  "오늘의 실마리는 이미 가까이에 있을지도 몰라요.",
+  "작은 질문으로 큰 구조를 열어봐요.",
+  "어떤 가지를 뻗고, 어떤 가지를 합칠까요?",
+  "잘 정리되지 않은 생각도 좋은 출발점이에요.",
+  "오늘의 작업을 덜 외롭게 만들어볼게요.",
+  "가장 먼저 확인하고 싶은 걸 말해주세요.",
+  "프로젝트의 결을 살피며 천천히 시작해봐요.",
+  "지금 떠오른 걸 그대로 적어도 괜찮아요.",
+  "좋은 답은 종종 작은 맥락 정리에서 나와요.",
+  "오늘은 어떤 흐름을 저장하고 싶나요?",
+  "대화의 실을 하나씩 고르게 펴볼까요?",
+  "작은 자동화 하나로 하루가 가벼워질 수 있어요.",
+  "막연한 계획을 실행 가능한 순서로 바꿔봐요.",
+  "오늘의 작업 나무에 새 가지를 내볼까요?",
+  "바로 만들지 않아도 좋아요. 먼저 살펴볼 수 있어요.",
+  "이 프로젝트가 지금 어디에 서 있는지 같이 볼까요?",
+  "복잡한 선택지를 차분히 비교해봐요.",
+  "지금 가장 중요한 한 가지를 찾아볼까요?",
+  "작업의 온도를 낮추고, 흐름을 정리해봐요.",
+  "오늘의 질문을 내일의 도구로 엮어봐요.",
+  "조금 느려도 단단하게 가면 돼요.",
+  "흐트러진 세션들을 한 장의 지도로 만들어봐요.",
+  "지금 가진 재료로 충분히 시작할 수 있어요.",
+  "작업을 나누고, 필요한 곳에서 다시 합쳐봐요.",
+  "오늘은 어떤 맥락을 잃어버리지 않게 할까요?",
+  "작은 확인부터 시작하면 길이 보일 거예요.",
+  "생각이 많을수록 첫 줄은 짧아도 좋아요.",
+  "필요한 도구와 모델을 골라 작업을 열어봐요.",
+  "오늘의 대화를 작업의 기억으로 남겨봐요.",
+  "브랜치처럼 갈라진 생각을 함께 정리해요.",
+  "다시 돌아올 수 있는 맥락을 만들어둘게요.",
+  "가볍게 던진 요청도 충분히 좋은 시작이에요.",
+  "지금 프로젝트에 필요한 다음 움직임은 뭘까요?",
+  "오늘은 덜 헤매고 더 잘 이어가봐요.",
+  "작업의 실밥을 하나씩 다듬어볼까요?",
+  "세션과 지식을 한곳에서 차분히 엮어봐요.",
+  "무엇을 만들지 아직 몰라도, 함께 찾을 수 있어요.",
+  "작은 불편을 좋은 기능으로 바꿔봐요.",
+  "현재 맥락을 기준으로 다음 행동을 골라봐요.",
+  "오늘의 작업을 조금 더 부드럽게 시작해요.",
+  "아이디어가 가지를 치면, 필요한 만큼 잡아둘게요.",
+  "지금 필요한 답보다 필요한 흐름을 먼저 볼 수도 있어요.",
+  "작업이 흩어지기 전에 여기서 붙잡아봐요.",
+  "오늘은 어떤 반복을 줄여볼까요?",
+  "문제의 모서리를 천천히 만져봐요.",
+  "대화 하나가 좋은 작업 단위가 될 수 있어요.",
+  "필요한 모델들을 고르고 같은 맥락에서 시작해봐요.",
+  "오늘의 빌드는 조용한 정리에서 출발해도 좋아요.",
+  "어떤 파일, 어떤 지침, 어떤 모델로 시작할까요?",
+  "작업의 뿌리를 확인하고 가지를 뻗어봐요.",
+  "한 번에 완성하지 않아도 괜찮아요. 이어가면 돼요.",
+  "좋은 컨텍스트는 좋은 답을 부릅니다.",
+  "작업의 다음 매듭을 여기서 묶어봐요.",
+  "지금 생각나는 이름 없는 일을 맡겨주세요.",
+  "작고 정확한 진전 하나를 만들어봐요.",
+  "프로젝트의 오늘 기분을 살펴볼까요?",
+  "어제의 맥락과 오늘의 선택을 이어봐요.",
+  "작업의 길을 잃지 않도록 표시를 남겨둘게요.",
+  "지금은 초안이어도 괜찮아요. 함께 다듬으면 돼요.",
+  "좋은 질문은 이미 반쯤 만들어진 도구예요.",
+  "오늘의 흐름을 가볍게 열어봅시다.",
+  "무거운 작업도 작은 조각으로 나눠볼게요.",
+  "당장 필요한 것과 나중에 필요한 것을 구분해봐요.",
+  "한 프로젝트 안의 여러 AI를 한 자리에서 조율해봐요.",
+  "오늘은 어떤 세션을 합치고, 어떤 세션을 나눌까요?",
+  "작업의 중심을 다시 잡아볼까요?",
+  "좋은 시작은 대개 부담 없는 한 문장이에요.",
+  "지금 여기 있는 맥락만으로도 충분히 시작할 수 있어요.",
+  "오늘의 문제를 내일의 지식으로 남겨봐요.",
+  "작업의 가지가 많아질수록 뿌리를 함께 챙길게요.",
+  "먼저 살펴보고, 그다음 움직여도 늦지 않아요.",
+  "오늘의 작은 선택이 프로젝트의 결을 만듭니다.",
+  "말로 풀어도 좋고, 파일로 시작해도 좋아요.",
+  "여러 모델의 시선을 한 맥락에 모아봐요.",
+  "작업의 실을 끊지 않고 이어갈 준비가 됐어요.",
+  "오늘은 어디부터 가볍게 풀어볼까요?",
+  "느슨한 아이디어를 단단한 다음 행동으로 바꿔봐요.",
+  "프로젝트의 기억을 잃지 않게 함께 엮어둘게요.",
+  "작업을 시작하기 좋은 조용한 순간이에요.",
+  "지금 필요한 만큼만 복잡해져도 괜찮아요.",
+  "오늘의 대화를 오래 쓸 수 있는 맥락으로 만들어봐요.",
+  "작은 불확실성을 하나씩 걷어내볼까요?",
+  "좋아요. 오늘도 천천히, 하지만 분명하게 시작해봐요.",
+];
+
 function q(selector): any {
   const element = document.querySelector(selector);
   if (!element) {
@@ -89,6 +198,9 @@ const els = {
   shell: q("#app-shell"),
   sessions: q("#session-list"),
   messages: q("#messages"),
+  chatQueueRail: q("#chat-queue-rail"),
+  chatQueueList: q("#chat-queue-list"),
+  chatQueueCount: q("#chat-queue-count"),
   title: q("#chat-title"),
   subtitle: q("#chat-subtitle"),
   contextMeter: q("#context-meter"),
@@ -104,6 +216,15 @@ const els = {
   searchBackdrop: q("#search-backdrop"),
   sessionSearch: q("#session-search"),
   searchResults: q("#search-results"),
+  appModal: q("#app-modal"),
+  appModalForm: q("#app-modal-form"),
+  appModalBackdrop: q("#app-modal-backdrop"),
+  appModalTitle: q("#app-modal-title"),
+  appModalMessage: q("#app-modal-message"),
+  appModalInput: q("#app-modal-input"),
+  appModalClose: q("#app-modal-close"),
+  appModalCancel: q("#app-modal-cancel"),
+  appModalConfirm: q("#app-modal-confirm"),
   projectToggle: q("#project-toggle"),
   projectMenuButton: q("#project-menu-button"),
   projectMenu: q("#project-menu"),
@@ -178,17 +299,25 @@ async function request(path, options = {}) {
 
 async function loadState() {
   loadThinkingEffort();
-  const data = await request("/api/state");
+  const projectQuery = state.selectedProjectId ? `?projectId=${encodeURIComponent(state.selectedProjectId)}` : "";
+  const data = await request(`/api/state${projectQuery}`);
   state.sessions = data.sessions || [];
   state.projects = data.projects || [];
   state.routes = data.routes || [];
   state.project = data.project || null;
+  state.moderatorPreference = data.moderatorPreference || null;
   state.projectRoutes = data.projectRoutes || [];
   state.profiles = data.profiles || [];
   state.models = data.models || [];
   state.usage = data.usage || [];
   state.tools = data.tools || [];
   state.authStatuses = data.auth || [];
+  state.selectedProjectId = state.project?.ID || "";
+  saveProjectID(state.selectedProjectId);
+  if (state.selectedSessionId && !state.sessions.some((session) => session.ID === state.selectedSessionId)) {
+    state.selectedSessionId = null;
+  }
+  normalizeSelectedProviders();
   renderProjectName();
   renderProjects();
   renderSessions();
@@ -211,6 +340,24 @@ async function loadState() {
   } else if (!state.selectedSessionId) {
     renderEmptyChat();
   }
+}
+
+function savedProjectID() {
+  return window.localStorage.getItem("ergo-loom:selected-project") || "";
+}
+
+function saveProjectID(projectID) {
+  if (!projectID) return;
+  window.localStorage.setItem("ergo-loom:selected-project", projectID);
+}
+
+async function selectProject(projectID) {
+  if (!projectID || projectID === state.project?.ID) return;
+  state.selectedProjectId = projectID;
+  state.selectedSessionId = null;
+  state.showAllSessions = false;
+  saveProjectID(projectID);
+  await loadState();
 }
 
 function renderProjectName() {
@@ -249,19 +396,27 @@ function routeStatusRank(route) {
 }
 
 async function createProject() {
-  const displayName = window.prompt("Project name")?.trim() || "";
+  const displayName = String(await appPrompt({
+    title: "Create project",
+    placeholder: "Project name",
+    confirmLabel: "Create",
+  }) || "").trim();
   if (!displayName) return;
   const data = await request("/api/projects", {
     method: "POST",
     body: JSON.stringify({ displayName }),
   });
-  state.projects = [data.project, ...state.projects.filter((project) => project.ID !== data.project.ID)];
-  renderProjects();
+  await selectProject(data.project.ID);
 }
 
 async function renameProject() {
   if (!state.project) return;
-  const displayName = window.prompt("Project name", state.project.DisplayName)?.trim() || "";
+  const displayName = String(await appPrompt({
+    title: "Rename project",
+    value: state.project.DisplayName,
+    placeholder: "Project name",
+    confirmLabel: "Rename",
+  }) || "").trim();
   if (!displayName || displayName === state.project.DisplayName) return;
   const data = await request(`/api/projects/${encodeURIComponent(state.project.ID)}`, {
     method: "PATCH",
@@ -308,6 +463,81 @@ function closeSearchModal() {
   renderSearchResults(recentSearchItems());
 }
 
+function appPrompt({ title, message = "", value = "", placeholder = "", confirmLabel = "OK", cancelLabel = "Cancel" }) {
+  return new Promise((resolve) => {
+    els.appModalTitle.textContent = title;
+    els.appModalMessage.textContent = message;
+    els.appModalMessage.hidden = !message;
+    els.appModalInput.hidden = false;
+    els.appModalInput.value = value;
+    els.appModalInput.placeholder = placeholder;
+    els.appModalConfirm.textContent = confirmLabel;
+    els.appModalCancel.textContent = cancelLabel;
+    els.appModal.hidden = false;
+
+    const cleanup = (result) => {
+      els.appModal.hidden = true;
+      els.appModalForm.removeEventListener("submit", onSubmit);
+      els.appModalCancel.removeEventListener("click", onCancel);
+      els.appModalClose.removeEventListener("click", onCancel);
+      els.appModalBackdrop.removeEventListener("click", onCancel);
+      document.removeEventListener("keydown", onKeyDown);
+      resolve(result);
+    };
+    const onSubmit = (event) => {
+      event.preventDefault();
+      cleanup(els.appModalInput.value);
+    };
+    const onCancel = () => cleanup(null);
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") cleanup(null);
+    };
+
+    els.appModalForm.addEventListener("submit", onSubmit);
+    els.appModalCancel.addEventListener("click", onCancel);
+    els.appModalClose.addEventListener("click", onCancel);
+    els.appModalBackdrop.addEventListener("click", onCancel);
+    document.addEventListener("keydown", onKeyDown);
+    requestAnimationFrame(() => els.appModalInput.focus());
+  });
+}
+
+function appAlert({ title = "Ergo Loom", message = "", confirmLabel = "OK" }) {
+  return new Promise((resolve) => {
+    els.appModalTitle.textContent = title;
+    els.appModalMessage.textContent = message;
+    els.appModalMessage.hidden = !message;
+    els.appModalInput.hidden = true;
+    els.appModalConfirm.textContent = confirmLabel;
+    els.appModalCancel.textContent = "Cancel";
+    els.appModalCancel.hidden = true;
+    els.appModal.hidden = false;
+
+    const cleanup = () => {
+      els.appModal.hidden = true;
+      els.appModalCancel.hidden = false;
+      els.appModalForm.removeEventListener("submit", onSubmit);
+      els.appModalClose.removeEventListener("click", onSubmit);
+      els.appModalBackdrop.removeEventListener("click", onSubmit);
+      document.removeEventListener("keydown", onKeyDown);
+      resolve(true);
+    };
+    const onSubmit = (event) => {
+      event?.preventDefault?.();
+      cleanup();
+    };
+    const onKeyDown = (event) => {
+      if (event.key === "Escape" || event.key === "Enter") cleanup();
+    };
+
+    els.appModalForm.addEventListener("submit", onSubmit);
+    els.appModalClose.addEventListener("click", onSubmit);
+    els.appModalBackdrop.addEventListener("click", onSubmit);
+    document.addEventListener("keydown", onKeyDown);
+    requestAnimationFrame(() => els.appModalConfirm.focus());
+  });
+}
+
 function toggleProjectRoutes() {
   const expanded = els.chatAIPanel.hidden;
   els.chatAIPanel.hidden = !expanded;
@@ -333,9 +563,15 @@ function handleComposerKeydown(event) {
 }
 
 async function createSession() {
+  els.projectMenu.hidden = true;
+  normalizeSelectedProviders();
   const data = await request("/api/sessions", {
     method: "POST",
-    body: JSON.stringify({ title: "New chat" }),
+    body: JSON.stringify({
+      title: "New chat",
+      projectId: state.project?.ID || state.selectedProjectId || "default",
+      providerGroupIds: state.selectedProviderIds,
+    }),
   });
   state.selectedSessionId = data.session.ID;
   await loadState();
@@ -355,8 +591,12 @@ async function selectSession(sessionId, options: { resetActivity?: boolean } = {
   els.title.textContent = data.session.Title;
   els.subtitle.textContent = state.project?.DisplayName || "Default Project";
   state.contextUsage = data.context || null;
+  state.selectedProviderIds = Array.isArray(data.providerGroupIds) ? data.providerGroupIds : [];
+  saveSelectedProviderIDs(state.selectedProviderIds);
   renderContextMeter();
+  renderModelPicker();
   renderMessages(data.messages || []);
+  renderChatQueue();
   closeSearchModal();
 }
 
@@ -365,7 +605,10 @@ async function sendMessage(event) {
   const content = els.input.value.trim();
   if (!content) return;
   if (!selectedModelOption()) {
-    window.alert("Select an available model for this project first.");
+    await appAlert({
+      title: "No model selected",
+      message: "Select an available model for this project first.",
+    });
     return;
   }
   if (!state.selectedSessionId) {
@@ -373,6 +616,14 @@ async function sendMessage(event) {
   }
 
   els.input.value = "";
+  if (isChatRunning()) {
+    enqueueChat(content);
+    return;
+  }
+  await runChatInput(content);
+}
+
+async function runChatInput(content) {
   setComposerBusy(true);
   state.runningSessionId = state.selectedSessionId;
   renderSessions();
@@ -386,7 +637,21 @@ async function sendMessage(event) {
     state.runningSessionId = "";
     renderSessions();
     setComposerBusy(false);
+    drainChatQueue();
   }
+}
+
+async function submitChatText(content) {
+  const text = String(content || "").trim();
+  if (!text) return;
+  if (!state.selectedSessionId) {
+    await createSession();
+  }
+  if (isChatRunning()) {
+    enqueueChat(text);
+    return;
+  }
+  await runChatInput(text);
 }
 
 function setComposerBusy(busy) {
@@ -394,8 +659,104 @@ function setComposerBusy(busy) {
     state.runningSessionId = "";
     renderSessions();
   }
-  els.input.disabled = busy;
-  els.sendButton.disabled = busy || !selectedModelOption();
+  els.input.disabled = false;
+  els.sendButton.disabled = !selectedModelOption();
+}
+
+function renderChatQueue() {
+  const items = state.chatQueue.filter((item) => item.sessionId === state.selectedSessionId);
+  els.chatQueueRail.hidden = items.length === 0;
+  els.chatQueueCount.textContent = String(items.length);
+  els.chatQueueList.replaceChildren();
+  for (const item of items) {
+    const row = document.createElement("article");
+    row.className = `chat-queue-item mode-${item.mode}`;
+    row.draggable = true;
+    row.dataset.queueId = item.id;
+    row.innerHTML = `
+      <div class="chat-queue-grip" aria-hidden="true">⋮⋮</div>
+      <div class="chat-queue-body">
+        <div class="chat-queue-text">${escapeHTML(item.content)}</div>
+        <div class="chat-queue-meta">${escapeHTML(queueModeLabel(item.mode))} · ${escapeHTML(item.modelLabel)}</div>
+        <div class="chat-queue-actions">
+          <button type="button" data-queue-action="steer" title="현재 답변 완료 전에 이어지는 입력으로 밀어넣기">${item.mode === "steer" ? "Steering" : "Steer"}</button>
+          <button type="button" data-queue-action="parallel" title="다른 모델이 같은 컨텍스트로 미리 준비하는 후보로 표시">${item.mode === "parallel" ? "Parallel" : "Parallel"}</button>
+          <button type="button" data-queue-action="remove">Remove</button>
+        </div>
+      </div>
+    `;
+    row.addEventListener("dragstart", () => {
+      state.queueDragId = item.id;
+      row.classList.add("dragging");
+    });
+    row.addEventListener("dragend", () => {
+      state.queueDragId = "";
+      row.classList.remove("dragging");
+    });
+    row.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      reorderQueuedChat(state.queueDragId, item.id);
+    });
+    row.querySelectorAll("[data-queue-action]").forEach((button) => {
+      const actionButton = button as HTMLButtonElement;
+      actionButton.addEventListener("click", () => updateQueuedChat(item.id, actionButton.dataset.queueAction));
+    });
+    els.chatQueueList.append(row);
+  }
+}
+
+function updateQueuedChat(id, action) {
+  if (action === "remove") {
+    state.chatQueue = state.chatQueue.filter((item) => item.id !== id);
+  } else if (action === "steer" || action === "parallel") {
+    state.chatQueue = state.chatQueue.map((item) => item.id === id ? { ...item, mode: action } : item);
+  }
+  renderChatQueue();
+}
+
+function reorderQueuedChat(sourceId, targetId) {
+  if (!sourceId || !targetId || sourceId === targetId) return;
+  const sourceIndex = state.chatQueue.findIndex((item) => item.id === sourceId);
+  const targetIndex = state.chatQueue.findIndex((item) => item.id === targetId);
+  if (sourceIndex < 0 || targetIndex < 0) return;
+  if (state.chatQueue[sourceIndex].sessionId !== state.selectedSessionId || state.chatQueue[targetIndex].sessionId !== state.selectedSessionId) return;
+  const [source] = state.chatQueue.splice(sourceIndex, 1);
+  state.chatQueue.splice(targetIndex, 0, source);
+  renderChatQueue();
+}
+
+function queueModeLabel(mode) {
+  return mode === "parallel" ? "Parallel prep" : "Steering";
+}
+
+function isChatRunning() {
+  return Boolean(state.runningSessionId && state.runningSessionId === state.selectedSessionId);
+}
+
+function enqueueChat(content, mode = "steer") {
+  const selected = selectedModelOption();
+  state.chatQueue.push({
+    id: `queue-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    sessionId: state.selectedSessionId,
+    content,
+    mode,
+    modelId: selected?.model.ID || "",
+    modelLabel: selected ? `${providerLabel(selected.model.ProviderPluginID)} · ${modelDisplayName(selected.model)}` : "No model",
+    createdAt: new Date(),
+  });
+  renderChatQueue();
+}
+
+async function drainChatQueue() {
+  if (isChatRunning()) return;
+  const nextIndex = state.chatQueue.findIndex((item) => item.sessionId === state.selectedSessionId);
+  if (nextIndex < 0) {
+    renderChatQueue();
+    return;
+  }
+  const [next] = state.chatQueue.splice(nextIndex, 1);
+  renderChatQueue();
+  await runChatInput(next.content);
 }
 
 function queueTerminalCommand(event) {
@@ -485,6 +846,7 @@ async function streamMessage(sessionId, content) {
   let assistantNode = null;
   let assistantContent = "";
   let lastStatus = "";
+  let assistantActivity = null;
   resetReasoningStream();
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -504,6 +866,7 @@ async function streamMessage(sessionId, content) {
       }
       if (event.type === "assistant_start") {
         assistantNode = appendMessage("assistant", "");
+        assistantActivity = ensureMessageActivity(assistantNode);
       }
       if (event.type === "assistant_delta" && assistantNode) {
         assistantContent += event.payload.text;
@@ -513,22 +876,31 @@ async function streamMessage(sessionId, content) {
       if (event.type === "assistant_status" && event.payload.text !== lastStatus) {
         lastStatus = event.payload.text;
         appendReasoning(event.payload.text);
+        appendMessageActivity(assistantActivity, "status", event.payload);
       }
       if (event.type === "tool_start") {
         appendActivityEvent("tool", event.payload);
+        appendMessageActivity(assistantActivity, "tool", event.payload);
       }
       if (event.type === "tool_result") {
         appendActivityEvent("result", event.payload);
+        appendMessageActivity(assistantActivity, "result", event.payload);
       }
       if (event.type === "approval_request") {
         appendActivityEvent("approval", event.payload);
+        appendMessageActivity(assistantActivity, "approval", event.payload);
         addToolApproval(event.payload);
       }
       if (event.type === "tool_error" || event.type === "turn_aborted") {
+        if (event.payload.approvalId) {
+          removeToolApproval(event.payload.approvalId);
+        }
         appendActivityEvent("error", event.payload);
+        appendMessageActivity(assistantActivity, "error", event.payload);
       }
       if (event.type === "error") {
         appendActivityEvent("error", { text: event.payload.message, toolName: "chat" });
+        appendMessageActivity(assistantActivity, "error", { text: event.payload.message, toolName: "chat" });
         return;
       }
     }
@@ -596,7 +968,12 @@ function renderSessions() {
 async function renameSession(sessionID) {
   const session = state.sessions.find((item) => item.ID === sessionID);
   if (!session) return;
-  const title = window.prompt("채팅 이름", session.Title)?.trim();
+  const title = String(await appPrompt({
+    title: "Rename chat",
+    value: session.Title,
+    placeholder: "Chat name",
+    confirmLabel: "Rename",
+  }) || "").trim();
   if (!title || title === session.Title) return;
   const data = await request(`/api/sessions/${encodeURIComponent(sessionID)}`, {
     method: "PATCH",
@@ -628,6 +1005,7 @@ function renderProjects() {
       <strong>${escapeHTML(project.DisplayName)}</strong>
       <span class="project-arrow">›</span>
     `;
+    row.addEventListener("click", () => selectProject(project.ID));
     els.projects.append(row);
   }
 }
@@ -667,7 +1045,10 @@ function renderSearchResults(results) {
     if (item.type === "chat") {
       row.addEventListener("click", () => selectSession(item.id));
     } else {
-      row.addEventListener("click", closeSearchModal);
+      row.addEventListener("click", () => {
+        closeSearchModal();
+        selectProject(item.id);
+      });
     }
     els.searchResults.append(row);
   }
@@ -720,6 +1101,76 @@ function appendMessage(roleName, text) {
   els.messages.append(item);
   els.messages.scrollTop = els.messages.scrollHeight;
   return item;
+}
+
+function ensureMessageActivity(messageNode) {
+  if (!messageNode) return null;
+  let activity = messageNode.querySelector(".message-activity");
+  if (!activity) {
+    activity = document.createElement("div");
+    activity.className = "message-activity";
+    messageNode.append(activity);
+  }
+  return activity;
+}
+
+function appendMessageActivity(activity, kind, payload: any = {}) {
+  if (!activity) return;
+  const row = kind === "status"
+    ? messageActivityStatus(payload)
+    : messageActivityDetails(kind, payload);
+  activity.append(row);
+  els.messages.scrollTop = els.messages.scrollHeight;
+}
+
+function messageActivityStatus(payload) {
+  const row = document.createElement("div");
+  row.className = "message-activity-status";
+  row.textContent = payload.text || "Thinking...";
+  return row;
+}
+
+function messageActivityDetails(kind, payload: any) {
+  const details = document.createElement("details");
+  details.className = `message-activity-details activity-${kind}`;
+  details.open = kind === "approval" || kind === "error";
+
+  const summary = document.createElement("summary");
+  const icon = document.createElement("span");
+  icon.className = "message-activity-icon";
+  icon.textContent = activityIcon(kind);
+  const label = document.createElement("span");
+  label.className = "message-activity-label";
+  label.textContent = messageActivityTitle(kind, payload);
+  summary.append(icon, label);
+  details.append(summary);
+
+  const detailText = [payload.command, payload.text].filter(Boolean).join("\n").trim();
+  if (detailText) {
+    const detail = document.createElement("pre");
+    detail.className = "message-activity-detail";
+    detail.textContent = detailText;
+    details.append(detail);
+  }
+
+  return details;
+}
+
+function messageActivityTitle(kind, payload: any) {
+  const tool = payload.toolName || "tool";
+  const command = payload.command ? ` ${payload.command}` : "";
+  if (kind === "tool") return `실행 중인 ${tool}${command}`;
+  if (kind === "result") return `완료한 ${tool}${command}`;
+  if (kind === "approval") return `승인 대기 ${tool}${command}`;
+  if (kind === "error") return `중단됨 ${tool}${command}`;
+  return activityTitle(kind, payload);
+}
+
+function activityIcon(kind) {
+  if (kind === "result") return "✓";
+  if (kind === "approval") return "?";
+  if (kind === "error") return "!";
+  return ">";
 }
 
 function renderMarkdown(container, text) {
@@ -943,7 +1394,7 @@ function renderAuthStatuses() {
     row.innerHTML = `
       <div>
         <strong>${escapeHTML(item.label)}</strong>
-        <span>${escapeHTML(item.detail || item.status || "")}</span>
+        <span>${escapeHTML(item.accountLabel || item.detail || item.status || "")}</span>
       </div>
       <span>${item.connected ? "Ready" : "Needs setup"}</span>
     `;
@@ -1013,13 +1464,21 @@ function renderWorkspaceApprovals() {
 
 function addToolApproval(payload) {
   if (!payload.approvalId) return;
-  state.pendingApprovals = state.pendingApprovals.filter((item) => item.approvalId !== payload.approvalId);
+  removeToolApproval(payload.approvalId, false);
   state.pendingApprovals.push({
     ...payload,
     directInput: "",
     suggestions: approvalSuggestions(payload),
   });
   renderToolApprovals();
+}
+
+function removeToolApproval(approvalId, shouldRender = true) {
+  const before = state.pendingApprovals.length;
+  state.pendingApprovals = state.pendingApprovals.filter((item) => item.approvalId !== approvalId);
+  if (shouldRender && state.pendingApprovals.length !== before) {
+    renderToolApprovals();
+  }
 }
 
 function renderToolApprovals() {
@@ -1040,7 +1499,8 @@ function toolApprovalCard(approval) {
   title.textContent = "도구 실행 승인 필요";
 
   const approve = approvalLineButton(1, "승인", approval.command || approval.text || "요청된 동작 실행", "accept", approval);
-  const deny = approvalLineButton(2, "거절", "실행하지 않음", "decline", approval);
+  const approveForSession = approvalLineButton(2, "승인", "다음부터 유사 명령어에 대해 허용", "accept_for_session", approval);
+  const deny = approvalLineButton(3, "거절", "실행하지 않음", "decline", approval);
 
   const direct = document.createElement("label");
   direct.className = "tool-approval-direct";
@@ -1052,16 +1512,16 @@ function toolApprovalCard(approval) {
   input.addEventListener("input", () => {
     approval.directInput = input.value;
   });
-  const directButton = approvalActionButton("적용", "decline", approval, input);
+  const directButton = approvalActionButton("전송", approval, input);
   direct.append(input, directButton);
 
   const suggestions = document.createElement("div");
   suggestions.className = "tool-approval-suggestions";
   approval.suggestions.forEach((suggestion, index) => {
-    suggestions.append(approvalLineButton(index + 3, `제안${index + 1}`, suggestion, "decline", approval));
+    suggestions.append(approvalSuggestionButton(index + 4, `제안${index + 1}`, suggestion, approval));
   });
 
-  card.append(title, approve, deny, suggestions, direct);
+  card.append(title, approve, approveForSession, deny, suggestions, direct);
   return card;
 }
 
@@ -1078,18 +1538,42 @@ function approvalLineButton(index, label, value, decision, payload) {
   return button;
 }
 
-function approvalActionButton(label, decision, payload, input) {
+function approvalSuggestionButton(index, label, value, payload) {
+  const button = document.createElement("button");
+  button.className = "tool-approval-line";
+  button.type = "button";
+  button.innerHTML = `
+    <span class="tool-approval-marker">${index}</span>
+    <strong>${escapeHTML(label)}:</strong>
+    <span>${escapeHTML(value)}</span>
+  `;
+  button.addEventListener("click", () => sendApprovalAlternative(payload, value, button));
+  return button;
+}
+
+function approvalActionButton(label, payload, input) {
   const button = document.createElement("button");
   button.type = "button";
   button.textContent = label;
   button.addEventListener("click", () => {
     payload.directInput = input.value;
-    resolveApproval(payload, decision, button);
+    sendApprovalAlternative(payload, payload.directInput, button);
   });
   return button;
 }
 
-async function resolveApproval(payload, decision, sourceButton) {
+async function sendApprovalAlternative(payload, text, sourceButton) {
+  const content = String(text || "").trim();
+  if (!content) return;
+  const resolved = await resolveApproval(payload, "decline", sourceButton, {
+    workspaceKind: "approval",
+    workspaceText: "Declined tool execution and sent alternative instruction",
+  });
+  if (!resolved) return;
+  await submitChatText(content);
+}
+
+async function resolveApproval(payload, decision, sourceButton, options: any = {}) {
   if (!payload.approvalId) return;
   const card = sourceButton.closest(".tool-approval-card");
   for (const item of card.querySelectorAll("button, input")) item.disabled = true;
@@ -1101,19 +1585,42 @@ async function resolveApproval(payload, decision, sourceButton) {
         directInput: payload.directInput || "",
       }),
     });
-    state.pendingApprovals = state.pendingApprovals.filter((item) => item.approvalId !== payload.approvalId);
-    appendWorkspaceEvent(decision === "accept" ? "approval" : "error", {
+    removeToolApproval(payload.approvalId, false);
+    const approved = decision === "accept" || decision === "accept_for_session";
+    appendWorkspaceEvent(options.workspaceKind || (approved ? "approval" : "error"), {
       ...payload,
       status: decision,
-      text: decision === "accept" ? "Approved by user" : "Declined by user",
+      text: options.workspaceText || approvalDecisionText(decision),
     });
     renderToolApprovals();
+    return true;
   } catch (error) {
+    if (isStaleApprovalError(error)) {
+      removeToolApproval(payload.approvalId);
+      appendWorkspaceEvent("error", {
+        ...payload,
+        status: "expired",
+        text: "Approval request expired",
+      });
+      return true;
+    }
     const status = document.createElement("span");
     status.className = "activity-status error";
     status.textContent = error.message || "Approval failed";
     card.append(status);
+    for (const item of card.querySelectorAll("button, input")) item.disabled = false;
+    return false;
   }
+}
+
+function approvalDecisionText(decision) {
+  if (decision === "accept") return "Approved by user";
+  if (decision === "accept_for_session") return "Approved similar commands for this session";
+  return "Declined by user";
+}
+
+function isStaleApprovalError(error) {
+  return String(error?.message || "").includes("approval request is no longer pending");
 }
 
 function approvalSuggestions(payload) {
@@ -1151,13 +1658,225 @@ function renderEmptyChat() {
   state.contextUsage = null;
   renderContextMeter();
   els.messages.replaceChildren();
-  const empty = document.createElement("div");
-  empty.className = "empty-state";
-  empty.innerHTML = `
-    <img src="/icon.svg" alt="" aria-hidden="true">
-    <span>Start a local chat</span>
+  renderChatQueue();
+  const providerOptions = availableProviderOptions();
+  const moderator = effectiveModerator(providerOptions);
+  const home = document.createElement("section");
+  home.className = "new-chat-home";
+  home.innerHTML = `
+    <div class="new-chat-main">
+      <h2>${escapeHTML(randomWarmBuildPrompt())}</h2>
+      <section class="new-chat-setup">
+        <div class="new-chat-setup-head">
+          <div>
+            <strong>프로젝트</strong>
+            <span>${escapeHTML(state.project?.DisplayName || "Default Project")}</span>
+          </div>
+          <span>${providerOptions.length} providers ready</span>
+        </div>
+        <div class="new-chat-setup-grid">
+          <div class="new-chat-setup-block">
+            <h3>프로젝트 경로</h3>
+            <select class="project-context-select" aria-label="Project context">
+              ${state.projects.map((project) => `
+                <option value="${escapeHTML(project.ID)}" ${project.ID === state.project?.ID ? "selected" : ""}>
+                  ${escapeHTML(project.DisplayName)}
+                </option>
+              `).join("")}
+            </select>
+            <div class="path-picker-row">
+              <p>${escapeHTML(state.project?.RootPath || "~/.ergo-loom")}</p>
+              <button type="button" class="path-picker-button">경로 선택</button>
+            </div>
+          </div>
+          <div class="new-chat-setup-block">
+            <h3>AI Provider</h3>
+            <div class="provider-checks">
+              ${providerOptions.length > 0 ? providerOptions.map((item, index) => `
+                <label class="context-check">
+                  <input type="checkbox" value="${escapeHTML(item.groupID)}" ${state.selectedProviderIds.includes(item.groupID) || index === 0 ? "checked" : ""}>
+                  <span>
+                    <strong>${escapeHTML(providerLabel(item.providerID))}${moderatorTagMarkup(moderator, item.groupID)}</strong>
+                    <small>${item.models.length} available model${item.models.length === 1 ? "" : "s"}</small>
+                  </span>
+                </label>
+              `).join("") : `<p>사용 가능한 provider가 없어요. 좌측 AI Usage에서 provider를 연결해주세요.</p>`}
+            </div>
+          </div>
+          <div class="new-chat-setup-block moderator-setup-block">
+            <h3>Moderator</h3>
+            <div class="moderator-controls">
+              <label>
+                <span>Mode</span>
+                <select class="moderator-mode">
+                  <option value="auto" ${moderator.mode === "auto" ? "selected" : ""}>Auto · registered order</option>
+                  <option value="manual" ${moderator.mode === "manual" ? "selected" : ""}>Manual</option>
+                </select>
+              </label>
+              <label>
+                <span>1순위</span>
+                <select class="moderator-primary" ${moderator.mode === "auto" ? "disabled" : ""}>
+                  ${moderatorProviderOptions(providerOptions, moderator.primary)}
+                </select>
+              </label>
+              <label>
+                <span>2순위</span>
+                <select class="moderator-secondary" ${moderator.mode === "auto" ? "disabled" : ""}>
+                  ${moderatorProviderOptions(providerOptions, moderator.secondary, true)}
+                </select>
+              </label>
+            </div>
+            <p>${escapeHTML(moderatorHint(moderator))}</p>
+          </div>
+        </div>
+      </section>
+      <section class="new-chat-context">
+        <section>
+          <div>
+            <strong>지침</strong>
+            <span>＋</span>
+          </div>
+          <p>Ergo Loom의 응답을 맞춤화하는 지침 추가</p>
+        </section>
+        <section>
+          <div>
+            <strong>파일</strong>
+            <span>＋</span>
+          </div>
+          <div class="new-chat-file-drop">
+            <span>문서, 로그, 코드 파일을 이 프로젝트 컨텍스트로 추가하세요.</span>
+          </div>
+        </section>
+      </section>
+    </div>
   `;
-  els.messages.append(empty);
+  els.messages.append(home);
+  home.querySelector(".project-context-select")?.addEventListener("change", (event) => {
+    const projectID = (event.target as HTMLSelectElement).value;
+    selectProject(projectID);
+  });
+  home.querySelector(".path-picker-button")?.addEventListener("click", chooseProjectPath);
+  home.querySelectorAll(".moderator-mode, .moderator-primary, .moderator-secondary").forEach((input) => {
+    input.addEventListener("change", () => saveModeratorFromHome(home));
+  });
+  home.querySelectorAll(".provider-checks input[type='checkbox']").forEach((input) => {
+    input.addEventListener("change", () => {
+      const selected = [...home.querySelectorAll(".provider-checks input[type='checkbox']:checked")]
+        .map((node) => (node as HTMLInputElement).value);
+      state.selectedProviderIds = selected;
+      saveSelectedProviderIDs(selected);
+    });
+  });
+}
+
+function randomWarmBuildPrompt() {
+  return warmBuildPrompts[Math.floor(Math.random() * warmBuildPrompts.length)];
+}
+
+function moderatorTagMarkup(moderator, groupID) {
+  if (moderator.primary === groupID) {
+    return ` <em class="moderator-tag">moderator<span class="moderator-help" tabindex="0" aria-label="Moderator provider tooltip">?</span><span class="moderator-tooltip" role="tooltip">여러 AI provider가 같은 채팅에서 함께 답할 때 흐름과 순서를 중재하는 provider입니다.</span></em>`;
+  }
+  if (moderator.secondary === groupID) {
+    return ` <em class="moderator-tag secondary">secondary<span class="moderator-help" tabindex="0" aria-label="Secondary moderator tooltip">?</span><span class="moderator-tooltip" role="tooltip">Primary moderator에 장애가 생기면 이어받는 보조 moderator provider입니다.</span></em>`;
+  }
+  return "";
+}
+
+function effectiveModerator(providerOptions = availableProviderOptions()) {
+  const pref = state.moderatorPreference || {};
+  const mode = pref.Mode === "manual" ? "manual" : "auto";
+  const ordered = providerOptions.map((item) => item.groupID);
+  const primary = mode === "manual" && ordered.includes(pref.PrimaryProviderGroupID)
+    ? pref.PrimaryProviderGroupID
+    : ordered[0] || "";
+  const secondary = mode === "manual" && ordered.includes(pref.SecondaryProviderGroupID) && pref.SecondaryProviderGroupID !== primary
+    ? pref.SecondaryProviderGroupID
+    : ordered.find((id) => id !== primary) || "";
+  return {
+    mode,
+    source: pref.Source || "default",
+    primary,
+    secondary,
+  };
+}
+
+function moderatorProviderOptions(providerOptions, selected, includeNone = false) {
+  const rows = [];
+  if (includeNone) {
+    rows.push(`<option value="" ${selected ? "" : "selected"}>None</option>`);
+  }
+  for (const item of providerOptions) {
+    rows.push(`<option value="${escapeHTML(item.groupID)}" ${item.groupID === selected ? "selected" : ""}>${escapeHTML(providerGroupLabel(item.groupID))}</option>`);
+  }
+  return rows.join("");
+}
+
+function moderatorHint(moderator) {
+  const primary = moderator.primary ? providerGroupLabel(moderator.primary) : "none";
+  const secondary = moderator.secondary ? providerGroupLabel(moderator.secondary) : "none";
+  if (moderator.mode === "auto") {
+    return `Auto: ${primary} 이후 장애 시 ${secondary} 순서로 중재합니다.`;
+  }
+  return `Manual: ${primary}를 우선 사용하고, 장애 시 ${secondary}로 전환합니다.`;
+}
+
+async function saveModeratorFromHome(home) {
+  if (!state.project?.ID) return;
+  const mode = (home.querySelector(".moderator-mode") as HTMLSelectElement)?.value || "auto";
+  const primary = (home.querySelector(".moderator-primary") as HTMLSelectElement)?.value || "";
+  const secondary = (home.querySelector(".moderator-secondary") as HTMLSelectElement)?.value || "";
+  const data = await request(`/api/projects/${encodeURIComponent(state.project.ID)}/moderator`, {
+    method: "POST",
+    body: JSON.stringify({
+      mode,
+      primaryProviderGroupId: primary,
+      secondaryProviderGroupId: secondary,
+    }),
+  });
+  state.moderatorPreference = data.moderatorPreference || state.moderatorPreference;
+  renderEmptyChat();
+}
+
+async function chooseProjectPath() {
+  let selectedPath = "";
+  const bridge = (window as any).ergoLoom;
+  if (bridge?.chooseDirectory) {
+    const result = await bridge.chooseDirectory();
+    if (result?.canceled) return;
+    selectedPath = String(result?.path || "").trim();
+  } else {
+    selectedPath = String(await appPrompt({
+      title: "프로젝트 경로 선택",
+      message: "브라우저 개발 모드에서는 파일 탐색기 대신 경로를 직접 입력합니다. 경로가 바뀌면 현재 프로젝트 수정이 아니라 해당 경로의 프로젝트로 전환됩니다.",
+      value: state.project?.RootPath || "~/.ergo-loom",
+      placeholder: "/Users/name/project",
+      confirmLabel: "Use path",
+    }) || "").trim();
+  }
+  if (!selectedPath) return;
+
+  const existing = state.projects.find((project) => normalizePath(project.RootPath) === normalizePath(selectedPath));
+  if (existing) {
+    await selectProject(existing.ID);
+    return;
+  }
+  const displayName = projectNameFromPath(selectedPath);
+  const data = await request("/api/projects", {
+    method: "POST",
+    body: JSON.stringify({ displayName, rootPath: selectedPath }),
+  });
+  await selectProject(data.project.ID);
+}
+
+function normalizePath(value) {
+  return String(value || "").trim().replace(/\/+$/, "");
+}
+
+function projectNameFromPath(value) {
+  const normalized = normalizePath(value);
+  const name = normalized.split("/").filter(Boolean).pop();
+  return name || "Local project";
 }
 
 function renderContextMeter() {
@@ -1449,27 +2168,28 @@ function groupedProviderRegistry(items) {
 
 function renderUsage(items) {
   els.usage.replaceChildren();
-  const providerRows = usageRowsForProviders(allProviderIDsForUsage(items));
+  const providerRows = usageRowsForProviders(connectedProviderIDsForUsage(items));
   renderAIUsageList(els.usage, providerRows);
 }
 
 function renderNavUsage() {
   els.navUsage.replaceChildren();
-  if (state.projectRoutes.length === 0) {
+  const rows = usageRowsForProviders(connectedProviderIDsForUsage());
+  if (rows.length === 0) {
     const empty = document.createElement("div");
     empty.className = "meta";
-    empty.textContent = "No AI selected";
+    empty.textContent = "No provider connected";
     els.navUsage.append(empty);
     els.usageGaugeFill.style.width = "0%";
     return;
   }
 
-  const providerRoutes = uniqueProjectProviderRoutes();
-  const totalUsed = providerRoutes.reduce((sum, item) => sum + usageTotalForProvider(item.Route.ProviderPluginID), 0);
-  const softCap = Math.max(50000, providerRoutes.length * 50000);
-  els.usageGaugeFill.style.width = `${Math.min(100, Math.round((totalUsed / softCap) * 100))}%`;
+  const totalUsed = rows.reduce((sum, item) => sum + item.used, 0);
+  const softCap = Math.max(50000, rows.length * 50000);
+  const remaining = Math.max(0, softCap - totalUsed);
+  els.usageGaugeFill.style.width = `${Math.min(100, Math.round((remaining / softCap) * 100))}%`;
 
-  renderAIUsageList(els.navUsage, usageRowsForProviders(providerRoutes.map((item) => item.Route.ProviderPluginID)));
+  renderAIUsageList(els.navUsage, rows);
 }
 
 function renderAIUsageList(target, rows) {
@@ -1500,14 +2220,14 @@ function renderAIUsageList(target, rows) {
       </div>
       <div class="ai-usage-remaining">
         <span>${escapeHTML(item.remainingLabel)}</span>
-        ${item.connected ? "" : `<button class="ai-connect-button" type="button" data-provider-id="${escapeHTML(item.providerID)}">Connect</button>`}
+        <button class="ai-connect-button" type="button" data-provider-id="${escapeHTML(item.providerID)}" data-account-label="${escapeHTML(item.rawAccountLabel)}">${item.connected ? "Edit" : "Connect"}</button>
       </div>
     `;
     list.append(row);
   }
   target.append(list);
   for (const button of target.querySelectorAll(".ai-connect-button")) {
-    button.addEventListener("click", () => connectProvider(button.dataset.providerId));
+    button.addEventListener("click", () => connectProvider(button.dataset.providerId, button.dataset.accountLabel || ""));
   }
 }
 
@@ -1519,30 +2239,72 @@ function usageRowsForProviders(providerIDs) {
     const used = providerIDsInGroup.reduce((sum, providerID) => sum + usageTotalForProvider(providerID), 0);
     const providerCap = 50000;
     const profiles = providerIDsInGroup.map(profileForProvider).filter(Boolean);
+    const auth = providerIDsInGroup.map(authForProvider).find((item) => item?.connected) || null;
+    const profileLabels = profiles.map((profile) => profile.DisplayName).filter((label) => !isGenericAccountLabel(label));
+    const rawAccountLabel = profileLabels.length > 0 ? profileLabels.join(" / ") : auth?.accountLabel || profiles[0]?.DisplayName || "";
+    const remaining = Math.max(0, providerCap - used);
     return {
       providerID: providerIDsInGroup[0],
       providerName: providerGroupLabel(groupID),
-      connected: profiles.length > 0,
-      accountLabel: profiles.length > 0 ? profiles.map((profile) => profile.DisplayName).join(" / ") : "account not connected",
+      connected: providerIDsInGroup.some(providerIsConnected),
+      used,
+      rawAccountLabel,
+      accountLabel: rawAccountLabel ? `account: ${rawAccountLabel}` : "account not connected",
       remainingLabel: remainingUsageLabel(route, used, providerCap),
-      percent: Math.min(100, Math.round((used / providerCap) * 100)),
+      percent: Math.min(100, Math.round((remaining / providerCap) * 100)),
       color: providerColor(providerIDsInGroup[0]),
     };
   });
 }
 
-async function connectProvider(providerID) {
+async function connectProvider(providerID, currentLabel = "") {
   const label = providerLabel(providerID);
-  try {
+  const normalizedCurrentLabel = String(currentLabel || "").trim();
+  if (providerID === "anthropic" && hasDesktopHandoffBridge()) {
+    await openClaudeHandoffSetup();
     await request("/api/provider-profiles/connect", {
+      method: "POST",
+      body: JSON.stringify({ providerPluginId: providerID, displayName: "Claude web account" }),
+    });
+    await addProviderRoute(providerID);
+    await loadState();
+    appendActivityEvent("result", { toolName: "auth.connect", command: label, text: "Claude web handoff is ready. Sign in in the Ergo Loom Claude window if prompted, then retry the chat." });
+    return;
+  }
+  try {
+    if (normalizedCurrentLabel) {
+      const manualName = String(await appPrompt({
+        title: `${label} account label`,
+        value: normalizedCurrentLabel,
+        placeholder: "Email or nickname",
+        confirmLabel: "Save",
+      }) || "").trim();
+      if (!manualName) return;
+      await request("/api/provider-profiles/connect", {
+        method: "POST",
+        body: JSON.stringify({ providerPluginId: providerID, displayName: manualName }),
+      });
+      await addProviderRoute(providerID);
+      await loadState();
+      return;
+    }
+    const data = await request("/api/provider-profiles/connect", {
       method: "POST",
       body: JSON.stringify({ providerPluginId: providerID }),
     });
     await addProviderRoute(providerID);
     await loadState();
+    const account = data.profile?.DisplayName || label;
+    appendActivityEvent("result", { toolName: "auth.connect", command: label, text: `Connected account: ${account}` });
   } catch (error) {
     const message = error?.message || `${label} account bridge is not available`;
-    const manualName = window.prompt(`${label} 자동 연결 실패\n${message}\n\n수동으로 표시할 계정명을 입력하면 프로필만 저장합니다.`, `${label} account`)?.trim() || "";
+    const manualName = String(await appPrompt({
+      title: `${label} account label`,
+      message: `자동 탐지: ${message}\n현재 로컬 라이선스/웹 계정으로 사용할 닉네임이나 이메일을 입력하세요.`,
+      value: `${label} account`,
+      placeholder: "Email or nickname",
+      confirmLabel: "Save",
+    }) || "").trim();
     if (!manualName) return;
     await request("/api/provider-profiles/connect", {
       method: "POST",
@@ -1553,9 +2315,40 @@ async function connectProvider(providerID) {
   }
 }
 
+async function openClaudeHandoffSetup() {
+  const bridge = (window as any).ergoLoom;
+  if (!bridge?.openClaudeWorker) return;
+  await bridge.openClaudeWorker();
+}
+
 function allProviderIDsForUsage(items) {
-  const ids = new Set(state.projectRoutes.filter((item) => item.Enabled).map((item) => item.Route.ProviderPluginID));
+  const ids = new Set(state.routes.map((route) => route.ProviderPluginID));
+  for (const profile of state.profiles) ids.add(profile.ProviderPluginID);
+  for (const item of state.projectRoutes.filter((item) => item.Enabled)) ids.add(item.Route.ProviderPluginID);
   for (const item of items) ids.add(item.ProviderPluginID);
+  return [...ids];
+}
+
+function connectedProviderIDsForUsage(items = []) {
+  const ids = new Set();
+  for (const profile of state.profiles) {
+    if (providerIsConnected(profile.ProviderPluginID)) ids.add(profile.ProviderPluginID);
+  }
+  for (const item of state.projectRoutes.filter((item) => item.Enabled)) {
+    if (providerIsConnected(item.Route.ProviderPluginID)) {
+      ids.add(item.Route.ProviderPluginID);
+    }
+  }
+  for (const item of state.usage) {
+    if (item.ProviderPluginID && providerIsConnected(item.ProviderPluginID)) {
+      ids.add(item.ProviderPluginID);
+    }
+  }
+  for (const item of items) {
+    if (item.ProviderPluginID && providerIsConnected(item.ProviderPluginID)) {
+      ids.add(item.ProviderPluginID);
+    }
+  }
   return [...ids];
 }
 
@@ -1577,6 +2370,47 @@ function profileForProvider(providerID) {
     || null;
 }
 
+function authForProvider(providerID) {
+  const authID = {
+    anthropic: "claude",
+    codex: "codex",
+    copilot: "copilot",
+    gemini: "gemini",
+    ollama: "ollama",
+    openai: "codex",
+  }[providerID] || providerID;
+  return state.authStatuses.find((item) => item.id === authID) || null;
+}
+
+function providerIsConnected(providerID) {
+  const auth = authForProvider(providerID);
+  if (auth?.connected) return true;
+  if (providerID === "anthropic" && hasDesktopHandoffBridge()) {
+    return Boolean(profileForProvider(providerID));
+  }
+  if (auth) return false;
+  if (providerRequiresLiveAuth(providerID)) return false;
+  return Boolean(profileForProvider(providerID));
+}
+
+function hasDesktopHandoffBridge() {
+  return Boolean((window as any).ergoLoom?.handoffBridge);
+}
+
+function providerRequiresLiveAuth(providerID) {
+  return ["anthropic", "codex", "copilot", "gemini", "ollama", "openai"].includes(providerID);
+}
+
+function isGenericAccountLabel(label) {
+  return [
+    "Codex local account",
+    "GitHub Copilot account",
+    "Claude local account",
+    "Gemini local account",
+    "Ollama local runtime",
+  ].includes(String(label || "").trim());
+}
+
 function remainingUsageLabel(route, used, cap) {
   const remaining = Math.max(0, cap - used);
   const method = route ? limitLabel(route.CostModel) : "tracked quota";
@@ -1588,9 +2422,8 @@ function providerColor(providerID) {
     anthropic: "#9b5e3f",
     codex: "#47685d",
     copilot: "#5b6f9f",
-    cursor: "#5c5c58",
     gemini: "#c08a45",
-    local: "#6f7b5a",
+    ollama: "#6f7b5a",
     openai: "#283f36",
   };
   return colors[providerID] || "#746f65";
@@ -1703,27 +2536,100 @@ function modelDisplayName(model) {
 function modelDescription(model) {
   const provider = providerLabel(model.ProviderPluginID);
   if (model.ProviderPluginID === "codex") return `${provider} · local subscription route`;
-  if (model.ProviderPluginID === "anthropic") return `${provider} · web handoff / account route`;
+  if (model.ProviderPluginID === "anthropic") return `${provider} · CLI or free web handoff`;
   if (model.ProviderPluginID === "copilot") return `${provider} · SDK or VS Code bridge`;
   if (model.ProviderPluginID === "gemini") return `${provider} · CLI or web handoff`;
+  if (model.ProviderPluginID === "ollama") return `${provider} · local runtime`;
   if (model.ProviderPluginID === "openai") return `${provider} · web handoff`;
   return `${provider} model`;
 }
 
-function modelOptions() {
+function modelOptions(options: any = {}) {
+  const respectSessionProviders = options.respectSessionProviders !== false;
+  const allowedGroups = respectSessionProviders ? activeProviderGroupSet() : null;
   const enabledProviders = new Map();
   for (const item of state.projectRoutes) {
     if (item.Enabled) {
-      enabledProviders.set(item.Route.ProviderPluginID, item.Route);
+      const current = enabledProviders.get(item.Route.ProviderPluginID);
+      if (!current || routePreference(item.Route) < routePreference(current)) {
+        enabledProviders.set(item.Route.ProviderPluginID, item.Route);
+      }
     }
   }
   return state.models
+    .filter((model) => !allowedGroups || allowedGroups.has(providerGroupID(model.ProviderPluginID)))
     .map((model) => ({
       model,
       route: enabledProviders.get(model.ProviderPluginID) || null,
       routeId: enabledProviders.get(model.ProviderPluginID)?.ID || "",
-      connected: Boolean(profileForProvider(model.ProviderPluginID)),
+      connected: providerIsConnected(model.ProviderPluginID) || isFreeHandoffRoute(enabledProviders.get(model.ProviderPluginID)),
     }));
+}
+
+function availableProviderOptions() {
+  const groups = new Map();
+  for (const item of modelOptions({ respectSessionProviders: false }).filter(isModelSelectable).sort(compareModelOptions)) {
+    const groupID = providerGroupID(item.model.ProviderPluginID);
+    const existing = groups.get(groupID);
+    if (existing) {
+      existing.models.push(item.model);
+      continue;
+    }
+    groups.set(groupID, {
+      groupID,
+      providerID: item.model.ProviderPluginID,
+      route: item.route,
+      models: [item.model],
+    });
+  }
+  return [...groups.values()];
+}
+
+function activeProviderGroupSet() {
+  if (!state.selectedSessionId || state.selectedProviderIds.length === 0) return null;
+  return new Set(state.selectedProviderIds);
+}
+
+function normalizeSelectedProviders() {
+  const available = availableProviderOptions();
+  const availableIDs = new Set(available.map((item) => item.groupID));
+  const saved = savedSelectedProviderIDs().filter((id) => availableIDs.has(id));
+  if (saved.length > 0) {
+    state.selectedProviderIds = saved;
+    return;
+  }
+  const selected = selectedModelOption();
+  const selectedGroup = selected ? providerGroupID(selected.model.ProviderPluginID) : "";
+  state.selectedProviderIds = selectedGroup && availableIDs.has(selectedGroup)
+    ? [selectedGroup]
+    : available.slice(0, 1).map((item) => item.groupID);
+  saveSelectedProviderIDs(state.selectedProviderIds);
+}
+
+function selectedProviderStorageKey() {
+  return `ergo-loom:selected-providers:${state.project?.ID || "default"}`;
+}
+
+function savedSelectedProviderIDs() {
+  const raw = window.localStorage.getItem(selectedProviderStorageKey()) || "";
+  return raw.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function saveSelectedProviderIDs(providerIDs) {
+  window.localStorage.setItem(selectedProviderStorageKey(), providerIDs.filter(Boolean).join(","));
+}
+
+function routePreference(route) {
+  if (!route) return 999;
+  if (route.ProviderPluginID === "anthropic") {
+    if (route.Transport === "claude_cli" && providerIsConnected("anthropic")) return 0;
+    if (isFreeHandoffRoute(route)) return 1;
+    if (route.Transport === "manual") return 2;
+  }
+  if (isExecutableRoute(route) && providerIsConnected(route.ProviderPluginID)) return 0;
+  if (isFreeHandoffRoute(route)) return 1;
+  if (route.SupportsHandoff) return 2;
+  return 3;
 }
 
 function compareModelOptions(a, b) {
@@ -1755,19 +2661,31 @@ function saveSelectedModelID(modelID) {
 
 function isModelSelectable(item) {
   if (!item.routeId || item.route?.Status !== "available") return false;
-  if (item.model.Status === "available") return true;
-  if (item.model.Status === "handoff" || item.model.Status === "bridge_required") return item.connected;
-  return false;
+  if (item.model.Status !== "available") return false;
+  return (item.connected && isExecutableRoute(item.route)) || isFreeHandoffRoute(item.route);
 }
 
 function modelBadge(item) {
   if (!item.routeId) return "Add";
   if (item.route?.Status !== "available") return "Planned";
-  if (item.model.Status === "available") return "";
-  if (item.model.Status === "handoff") return item.connected ? "Handoff" : "Connect";
-  if (item.model.Status === "bridge_required") return item.connected ? "Bridge" : "Connect";
   if (item.model.Status === "upgrade") return "Upgrade";
+  if (isFreeHandoffRoute(item.route)) return "Handoff";
+  if (!item.connected) return "Connect";
+  if (item.model.Status === "available") return isExecutableRoute(item.route) ? "" : "Not ready";
+  if (item.model.Status === "handoff") return item.connected ? "Not ready" : "Connect";
+  if (item.model.Status === "bridge_required") return item.connected ? "Not ready" : "Connect";
   return "Planned";
+}
+
+function isExecutableRoute(route) {
+  return (route?.ProviderPluginID === "codex" && route?.Transport === "app_server")
+    || (route?.ProviderPluginID === "anthropic" && route?.Transport === "claude_cli");
+}
+
+function isFreeHandoffRoute(route) {
+  if (!(route?.Status === "available" && route?.SupportsHandoff && route?.AccessMode === "free_handoff")) return false;
+  if (route.ProviderPluginID === "anthropic") return hasDesktopHandoffBridge();
+  return true;
 }
 
 function renderThinkingEffort() {
@@ -1819,9 +2737,8 @@ function providerLabel(providerID) {
     anthropic: "Claude",
     codex: "Codex/ChatGPT",
     copilot: "VSCode Copilot",
-    cursor: "Cursor",
     gemini: "Gemini",
-    local: "Local Model",
+    ollama: "Ollama(Local Model)",
     openai: "Codex/ChatGPT",
   };
   return names[providerID] || providerID;
@@ -1859,9 +2776,8 @@ function providerGroupOrder(providerID) {
     "codex-openai": 10,
     anthropic: 20,
     copilot: 30,
-    cursor: 40,
-    gemini: 50,
-    local: 60,
+    gemini: 40,
+    ollama: 50,
   };
   return order[providerGroupID(providerID)] || 999;
 }
@@ -1872,9 +2788,8 @@ function providerOrder(providerID) {
     openai: 20,
     anthropic: 30,
     copilot: 40,
-    cursor: 50,
-    gemini: 60,
-    local: 70,
+    gemini: 50,
+    ollama: 60,
   };
   return order[providerID] || 999;
 }

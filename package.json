@@ -1,6 +1,6 @@
 {
   "name": "ergo-loom",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local AI work context manager for branching, merging, and routing chat sessions.",
   "author": "Floodnut",
   "license": "MIT",
@@ -15,7 +15,7 @@
     "build:web": "tsc -p apps/desktop-or-web/tsconfig.json",
     "check:desktop": "npm run check:web && tsc -p apps/electron/tsconfig.json --noEmit",
     "check:web": "tsc -p apps/desktop-or-web/tsconfig.json --noEmit",
-    "package:mac": "npm run build:desktop && electron-builder --mac dmg dir",
+    "package:mac": "npm run build:desktop && electron-builder --mac pkg dir",
     "start:desktop": "npm run build:desktop && electron ."
   },
   "build": {
@@ -51,15 +51,14 @@
       "category": "public.app-category.developer-tools",
       "icon": "build/icon.icns",
       "target": [
-        "dmg",
+        "pkg",
         "dir"
       ],
       "identity": null
     },
-    "dmg": {
+    "pkg": {
       "artifactName": "Ergo-Loom-${version}-${arch}.${ext}",
-      "backgroundColor": "#fffdf8",
-      "icon": "build/icon.icns"
+      "installLocation": "/Applications"
     },
     "publish": [
       {

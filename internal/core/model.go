@@ -13,6 +13,7 @@ const (
 
 type Session struct {
 	ID           string
+	ProjectID    string
 	SourceTool   SourceTool
 	SourceID     string
 	Title        string

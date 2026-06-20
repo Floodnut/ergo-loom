@@ -4,163 +4,128 @@
 
 # Ergo Loom
 
-Ergo Loom is a local AI work context manager. It is designed to collect chat and task context spread across tools like Codex, Claude, VS Code Copilot, Cursor, and Gemini, then let you branch, merge, inspect, and reuse that context from one local workspace.
+Ergo Loom is a local workspace for AI work context.
 
-The product idea is simple: AI conversations are not disposable chat logs. They are working context. Ergo Loom keeps that context local, structured, branchable, and portable across providers and accounts.
+It helps you keep chat sessions, task history, provider choices, tool approvals, local files, and project context together in one installed app. Instead of treating AI conversations as disposable chat logs, Ergo Loom treats them as working context that can be organized by project, reused, branched, merged, and routed across different AI providers.
 
-## Current Status
+Ergo Loom is designed for people who use more than one AI tool, more than one account, or more than one model while working on the same project.
 
-Ergo Loom is an early local-first prototype. The current app already includes:
+## What Ergo Loom Does
 
-- A lightweight installed desktop shell powered by Electron
-- A Go local core/server with embedded web UI
-- Local SQLite persistence at `~/.ergo-loom/local.db`
-- A TypeScript chat UI with left project/session navigation
-- Provider/model route scaffolding for Codex/ChatGPT, Claude, Copilot, Gemini, Cursor, and local models
-- Codex app-server integration scaffolding
-- Tool approval UI and local terminal execution
-- Right-side workspace tabs for tool activity, terminal tabs, and file viewer tabs
-- macOS `.app` and `.dmg` packaging
-- GitHub Releases update feed wiring through `electron-updater`
+- Organizes chats under local projects
+- Keeps project context and local paths attached to chats
+- Lets you choose which AI providers are available for a project
+- Supports provider/model routing for tools such as Codex/ChatGPT, Claude, VS Code Copilot, Gemini, and local models
+- Tracks local provider usage and account labels
+- Shows tool activity, approvals, terminal activity, and file context beside the chat
+- Supports moderator provider selection for multi-provider chats
+- Stores local data outside the app bundle so updates do not erase your workspace
 
-## Product Direction
+Ergo Loom focuses on local-first usage. API-billed routes are not the default installation path.
 
-Ergo Loom aims to become a local workspace for:
+## Installation
 
-- Managing AI chat sessions across multiple tools
-- Sharing sessions across different accounts, not just one account
-- Branching from a message inside a chat session
-- Merging multiple sessions into one context
-- Routing work across different AI providers and models
-- Tracking token/quota usage by provider, account, model, session, and agent
-- Running local non-AI capabilities such as shell commands, file reads, API calls, SQLite storage, and search
-- Keeping provider integrations plugin-shaped so new AI tools can be added later
+Install Ergo Loom with the official macOS `.pkg` installer only.
 
-API-billed provider routes are intentionally not the default focus. The project currently prioritizes existing subscriptions, free tiers, handoff routes, local bridges, and local compute.
+1. Download the latest `Ergo Loom.pkg` from the project release page.
+2. Open the package installer.
+3. Follow the macOS installation steps.
+4. Launch **Ergo Loom** from Applications.
 
-## Repository Layout
+Do not install Ergo Loom by manually copying app bundles from build folders. The package installer is the supported installation method because it installs the desktop app and companion local runtime together.
+
+## Minimum Requirements
+
+- macOS 13 Ventura or later
+- Apple Silicon Mac is recommended
+- Local disk space for the app and workspace database
+- Existing accounts or local tools for the providers you want to use
+
+Some provider routes may require their own desktop app, CLI, browser sign-in, subscription, or free-tier account. Ergo Loom does not replace provider licensing.
+
+## First Run
+
+When you open Ergo Loom, it creates a local workspace in:
 
 ```text
-apps/
-  cli/                 Go CLI entrypoint
-  desktop-or-web/      TypeScript web UI served by the Go app
-  electron/            Desktop shell that launches the Go backend
-internal/
-  chatfilter/          Input filter chain for future policy/tool routing
-  core/                Shared domain model
-  provider/            AI provider integration scaffolding
-  storage/sqlitecli/   SQLite schema and store
-  toolruntime/         Local tool execution interfaces
-  web/                 Local HTTP/streaming server
-proto/
-  ergo/loom/v1/        Realtime protocol draft
-docs/                  Architecture and design notes
+~/.ergo-loom
 ```
 
-## Local Data
-
-Installed desktop builds keep local state outside the app bundle:
+The default local database is:
 
 ```text
 ~/.ergo-loom/local.db
 ```
 
-Replacing or updating `Ergo Loom.app` should not remove the local database. The app also supports:
+Updating Ergo Loom should preserve this directory.
 
-- `ERGO_LOOM_DB_PATH` to override the exact SQLite file
-- `ERGO_LOOM_DATA_DIR` to override the local data directory
-- `ERGO_LOOM_APP_ROOT` for packaged resource lookup
+## Basic Usage
 
-## Development
+1. Open Ergo Loom.
+2. Create or select a project from the left sidebar.
+3. Choose the project path for local context.
+4. Select the AI providers you want available in the chat.
+5. Choose a moderator provider mode if you plan to use multiple providers.
+6. Start chatting from the composer at the bottom.
 
-Requirements:
+Chats are always stored under a project. If you do not create a project, Ergo Loom uses the default project.
 
-- Go
-- Node.js
-- npm
-- macOS for the current packaging flow
+## Projects
 
-Install dependencies:
+A project is the local boundary for chats, provider choices, paths, files, and future context merging.
 
-```bash
-npm install
-```
+Changing the local path means you are effectively moving to another project context. Ergo Loom treats project paths as project-level identity, not as a temporary chat option.
 
-Run type checks:
+## AI Providers
 
-```bash
-npm run check:desktop
-```
+Ergo Loom separates two ideas:
 
-Run Go tests:
+- **Provider**: the account or tool family, such as Codex/ChatGPT, Claude, Copilot, Gemini, or Ollama
+- **Model**: the model available through that provider
 
-```bash
-GOWORK=off GOCACHE="$PWD/.cache/go-build" go test ./...
-```
+A chat can be prepared with multiple providers. The visible model list is limited to models available through the providers selected for that chat.
 
-Start the local web app:
+## Moderator Provider
 
-```bash
-GOWORK=off GOCACHE="$PWD/.cache/go-build" go run ./apps/cli/cmd/ergo app --addr 127.0.0.1:3763
-```
+For multi-provider chats, Ergo Loom can mark one provider as the moderator.
 
-Start the desktop app in development:
+The moderator is not an orchestrator. It is a lightweight coordination role used to keep multi-provider chat flow, ordering, and fallback behavior understandable.
 
-```bash
-npm run start:desktop
-```
+Projects can use:
 
-## Packaging
+- **Auto**: use the registered provider order
+- **Manual**: choose primary and secondary moderator providers
 
-Build the web UI, Go CLI, Electron main process, and icons:
+If a project does not define its own moderator preference, Ergo Loom follows the global preference.
 
-```bash
-npm run build:desktop
-```
+## Tool Approvals
 
-Create a macOS app and installable DMG:
+Some actions, such as shell commands or local tool calls, may require explicit approval.
 
-```bash
-npm run package:mac
-```
+When approval is requested, you can:
 
-Outputs are written to:
+- Approve the requested action
+- Approve similar actions for the current session
+- Reject the action
+- Send an alternative instruction into the chat
+- Type your own replacement instruction
 
-```text
-dist-packaged/mac-arm64/Ergo Loom.app
-dist-packaged/Ergo-Loom-0.1.0-arm64.dmg
-dist-packaged/latest-mac.yml
-```
+This keeps local execution visible and user-controlled.
 
-The GitHub/README brand icon is kept at:
+## Local Data And Updates
 
-```text
-apps/desktop-or-web/static/icon.svg
-```
+Ergo Loom stores user data in `~/.ergo-loom`, outside the installed app.
 
-The installable macOS app icon is generated from:
+That means app updates should replace the app itself while keeping:
 
-```text
-apps/desktop-or-web/static/icon-app.svg
-```
+- local database
+- project records
+- chat history
+- provider account labels
+- local workspace metadata
 
-into:
-
-```text
-build/icon.png
-build/icon.icns
-```
-
-## Updates
-
-Packaged builds are configured to check GitHub Releases for updates:
-
-```text
-Floodnut/ergo-loom
-```
-
-To publish an update, create a new release and upload the generated DMG, blockmap, and `latest-mac.yml`. Code signing and notarization are not yet configured and should be added before broader distribution.
+Back up `~/.ergo-loom` if you want to preserve your workspace manually.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Ergo Loom is released under the MIT License. See [LICENSE](LICENSE).

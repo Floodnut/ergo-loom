@@ -9,7 +9,6 @@ INSERT OR IGNORE INTO source_tools (id, display_name) VALUES
   ('ergo', 'Ergo Loom'),
   ('codex', 'Codex'),
   ('copilot', 'VSCode Copilot'),
-  ('cursor', 'Cursor'),
   ('claude', 'Claude Code'),
   ('gemini', 'Gemini CLI');
 
@@ -26,8 +25,7 @@ INSERT OR IGNORE INTO provider_plugins (id, display_name, kind) VALUES
   ('anthropic', 'Anthropic', 'remote-ai'),
   ('gemini', 'Gemini', 'remote-ai'),
   ('copilot', 'VSCode Copilot', 'remote-ai'),
-  ('cursor', 'Cursor', 'remote-ai'),
-  ('local', 'Local Model', 'local-ai');
+  ('ollama', 'Ollama', 'local-ai');
 
 CREATE TABLE IF NOT EXISTS provider_profiles (
   id TEXT PRIMARY KEY,
@@ -54,9 +52,9 @@ INSERT OR IGNORE INTO provider_models (id, provider_plugin_id, display_name, mod
   ('openai-chatgpt-gpt-5-5', 'openai', 'GPT-5.5', 'gpt-5.5', 'handoff', 1),
   ('openai-chatgpt-gpt-5-5-thinking', 'openai', 'GPT-5.5 Thinking', 'gpt-5.5-thinking', 'handoff', 0),
   ('openai-chatgpt-gpt-5-3-fast', 'openai', 'GPT-5.3 Fast', 'gpt-5.3-fast', 'handoff', 0),
-  ('anthropic-claude-sonnet-4-6', 'anthropic', 'Claude Sonnet 4.6', 'claude-sonnet-4.6', 'handoff', 1),
+  ('anthropic-claude-sonnet-4-6', 'anthropic', 'Claude Sonnet 4.6', 'claude-sonnet-4.6', 'available', 1),
   ('anthropic-claude-opus-4-8', 'anthropic', 'Claude Opus 4.8', 'claude-opus-4.8', 'upgrade', 0),
-  ('anthropic-claude-haiku-4-5', 'anthropic', 'Claude Haiku 4.5', 'claude-haiku-4.5', 'handoff', 0),
+  ('anthropic-claude-haiku-4-5', 'anthropic', 'Claude Haiku 4.5', 'claude-haiku-4.5', 'available', 0),
   ('anthropic-claude-opus-4-7', 'anthropic', 'Claude Opus 4.7', 'claude-opus-4.7', 'upgrade', 0),
   ('anthropic-claude-opus-4-6', 'anthropic', 'Claude Opus 4.6', 'claude-opus-4.6', 'upgrade', 0),
   ('anthropic-claude-opus-3', 'anthropic', 'Claude Opus 3', 'claude-opus-3', 'upgrade', 0),
@@ -64,13 +62,13 @@ INSERT OR IGNORE INTO provider_models (id, provider_plugin_id, display_name, mod
   ('gemini-2-5-pro', 'gemini', 'Gemini 2.5 Pro', 'gemini-2.5-pro', 'planned', 0),
   ('gemini-2-5-flash', 'gemini', 'Gemini 2.5 Flash', 'gemini-2.5-flash', 'planned', 0),
   ('copilot-default', 'copilot', 'Copilot default', 'copilot-default', 'bridge_required', 1),
+  ('copilot-mai-code-1-flash', 'copilot', 'MAI-Code-1-Flash', 'mai-code-1-flash', 'bridge_required', 0),
   ('copilot-gpt-5-5', 'copilot', 'Copilot GPT-5.5', 'gpt-5.5', 'bridge_required', 0),
   ('copilot-claude-sonnet-4-6', 'copilot', 'Copilot Claude Sonnet 4.6', 'claude-sonnet-4.6', 'bridge_required', 0),
   ('copilot-gemini-2-5-pro', 'copilot', 'Copilot Gemini 2.5 Pro', 'gemini-2.5-pro', 'bridge_required', 0),
-  ('cursor-default', 'cursor', 'Cursor Auto', 'cursor-auto', 'planned', 1),
-  ('cursor-claude-sonnet-4-6', 'cursor', 'Cursor Claude Sonnet 4.6', 'claude-sonnet-4.6', 'planned', 0),
-  ('cursor-gpt-5-5', 'cursor', 'Cursor GPT-5.5', 'gpt-5.5', 'planned', 0),
-  ('local-default', 'local', 'Local default', 'local-default', 'planned', 1);
+  ('ollama-default', 'ollama', 'Ollama default', 'ollama-default', 'planned', 1),
+  ('ollama-llama3-2', 'ollama', 'Llama 3.2', 'llama3.2', 'planned', 0),
+  ('ollama-qwen2-5-coder', 'ollama', 'Qwen2.5 Coder', 'qwen2.5-coder', 'planned', 0);
 
 CREATE TABLE IF NOT EXISTS access_routes (
   id TEXT PRIMARY KEY,
@@ -95,6 +93,7 @@ INSERT OR IGNORE INTO access_routes (
 ) VALUES
   ('codex-subscription-cli', 'codex', 'Codex via local CLI or app-server', 'subscription_native', 'cli_or_app_server', 1, 0, 1, 1, 1, 0, 'included_with_license_limits', 'planned'),
   ('chatgpt-web-handoff', 'openai', 'ChatGPT web handoff', 'licensed_handoff', 'manual', 0, 0, 0, 0, 1, 1, 'included_with_chat_subscription_or_free_limits', 'planned'),
+  ('claude-code-cli', 'anthropic', 'Claude Code CLI', 'subscription_native', 'claude_cli', 1, 0, 1, 0, 1, 0, 'included_with_license_or_free_limits', 'available'),
   ('claude-web-free-handoff', 'anthropic', 'Claude web free handoff', 'free_handoff', 'manual', 0, 0, 0, 0, 1, 1, 'included_with_free_limits', 'planned'),
   ('claude-web-licensed-handoff', 'anthropic', 'Claude web licensed handoff', 'licensed_handoff', 'manual', 1, 0, 0, 0, 1, 1, 'included_with_license_limits', 'planned'),
   ('copilot-vscode-bridge', 'copilot', 'VS Code Copilot bridge', 'subscription_native', 'ide_bridge', 1, 0, 1, 1, 0, 0, 'included_with_license_limits', 'planned'),
@@ -102,8 +101,7 @@ INSERT OR IGNORE INTO access_routes (
   ('gemini-cli-free', 'gemini', 'Gemini CLI personal account', 'free_native', 'cli', 0, 0, 1, 1, 1, 0, 'included_with_free_limits', 'planned'),
   ('gemini-cli-code-assist', 'gemini', 'Gemini CLI Code Assist', 'subscription_native', 'cli', 1, 0, 1, 1, 1, 0, 'included_with_license_limits', 'planned'),
   ('gemini-web-handoff', 'gemini', 'Gemini web handoff', 'free_handoff', 'manual', 0, 0, 0, 0, 1, 1, 'included_with_free_or_license_limits', 'planned'),
-  ('cursor-chat-handoff', 'cursor', 'Cursor chat handoff/import', 'licensed_handoff', 'manual', 1, 0, 0, 0, 1, 1, 'included_with_license_limits', 'planned'),
-  ('local-model', 'local', 'Local model runtime', 'local', 'local', 0, 0, 1, 1, 0, 0, 'local_compute', 'planned');
+  ('ollama-local', 'ollama', 'Ollama local runtime', 'local', 'ollama_http', 0, 0, 1, 0, 0, 0, 'local_compute', 'planned');
 
 UPDATE access_routes
 SET display_name = 'Codex SDK/app-server',
@@ -119,13 +117,16 @@ WHERE id IN (
   'claude-web-licensed-handoff',
   'copilot-sdk-cli',
   'copilot-vscode-bridge',
-  'gemini-web-handoff',
-  'cursor-chat-handoff'
+  'gemini-web-handoff'
 );
 
 UPDATE provider_models
 SET status = 'bridge_required'
 WHERE id = 'copilot-default';
+
+UPDATE provider_models
+SET status = 'available'
+WHERE id IN ('anthropic-claude-sonnet-4-6', 'anthropic-claude-haiku-4-5');
 
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
@@ -147,6 +148,19 @@ CREATE TABLE IF NOT EXISTS project_access_routes (
   PRIMARY KEY (project_id, access_route_id)
 );
 
+CREATE TABLE IF NOT EXISTS moderator_preferences (
+  scope TEXT NOT NULL,
+  project_id TEXT NOT NULL DEFAULT '',
+  mode TEXT NOT NULL DEFAULT 'auto',
+  primary_provider_group_id TEXT,
+  secondary_provider_group_id TEXT,
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  PRIMARY KEY (scope, project_id)
+);
+
+INSERT OR IGNORE INTO moderator_preferences (scope, project_id, mode) VALUES
+  ('global', '', 'auto');
+
 CREATE TABLE IF NOT EXISTS command_runs (
   id TEXT PRIMARY KEY,
   project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
@@ -163,10 +177,11 @@ CREATE TABLE IF NOT EXISTS command_runs (
 
 INSERT OR IGNORE INTO project_access_routes (project_id, access_route_id, enabled, priority) VALUES
   ('default', 'codex-subscription-cli', 1, 10),
-  ('default', 'claude-web-free-handoff', 1, 20),
-  ('default', 'claude-web-licensed-handoff', 1, 30),
-  ('default', 'copilot-sdk-cli', 1, 40),
-  ('default', 'copilot-vscode-bridge', 1, 50);
+  ('default', 'claude-code-cli', 1, 20),
+  ('default', 'claude-web-free-handoff', 1, 30),
+  ('default', 'claude-web-licensed-handoff', 1, 40),
+  ('default', 'copilot-sdk-cli', 1, 50),
+  ('default', 'copilot-vscode-bridge', 1, 60);
 
 CREATE TABLE IF NOT EXISTS provider_chats (
   id TEXT PRIMARY KEY,
@@ -197,9 +212,6 @@ INSERT OR IGNORE INTO tool_registry (id, display_name, kind, transport, requires
   ('openstack.cli', 'OpenStack CLI', 'cloud', 'local_process', 1),
   ('kubectl.command', 'kubectl', 'cluster', 'local_process', 1),
   ('docker.command', 'Docker', 'container', 'local_process', 1);
-
-DELETE FROM project_access_routes WHERE access_route_id IN ('openai-api', 'claude-agent-sdk', 'gemini-api');
-DELETE FROM access_routes WHERE id IN ('openai-api', 'claude-agent-sdk', 'gemini-api') OR access_mode = 'api_billed';
 
 CREATE TABLE IF NOT EXISTS agent_plugins (
   id TEXT PRIMARY KEY,
@@ -244,6 +256,7 @@ CREATE TABLE IF NOT EXISTS raw_imports (
 
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
+  project_id TEXT REFERENCES projects(id),
   source_tool TEXT NOT NULL REFERENCES source_tools(id),
   source_id TEXT NOT NULL,
   raw_import_id TEXT REFERENCES raw_imports(id),
@@ -264,6 +277,13 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at TEXT NOT NULL,
   ordinal INTEGER NOT NULL,
   UNIQUE (session_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS session_provider_groups (
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  provider_group_id TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  PRIMARY KEY (session_id, provider_group_id)
 );
 
 CREATE TABLE IF NOT EXISTS branches (
@@ -300,6 +320,16 @@ CREATE TABLE IF NOT EXISTS token_ledger (
   recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
+DELETE FROM project_access_routes WHERE access_route_id IN ('openai-api', 'claude-agent-sdk', 'gemini-api', 'cursor-chat-handoff', 'local-model');
+DELETE FROM provider_chats WHERE provider_plugin_id IN ('cursor', 'local') OR access_route_id IN ('cursor-chat-handoff', 'local-model');
+DELETE FROM token_ledger WHERE provider_plugin_id IN ('cursor', 'local');
+DELETE FROM provider_profiles WHERE provider_plugin_id IN ('cursor', 'local');
+DELETE FROM provider_models WHERE provider_plugin_id IN ('cursor', 'local');
+DELETE FROM access_routes WHERE id IN ('openai-api', 'claude-agent-sdk', 'gemini-api', 'cursor-chat-handoff', 'local-model') OR access_mode = 'api_billed';
+DELETE FROM provider_plugins WHERE id = 'cursor';
+DELETE FROM provider_plugins WHERE id = 'local';
+DELETE FROM source_tools WHERE id = 'cursor';
+
 CREATE TABLE IF NOT EXISTS kb_documents (
   id TEXT PRIMARY KEY,
   path TEXT NOT NULL UNIQUE,
@@ -315,6 +345,7 @@ CREATE TABLE IF NOT EXISTS kb_terms (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
+CREATE INDEX IF NOT EXISTS idx_session_provider_groups_session ON session_provider_groups(session_id);
 CREATE INDEX IF NOT EXISTS idx_messages_session_ordinal ON messages(session_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_kb_terms_term ON kb_terms(term);
 CREATE INDEX IF NOT EXISTS idx_token_ledger_recorded_at ON token_ledger(recorded_at);

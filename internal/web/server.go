@@ -25,6 +25,7 @@ type Server struct {
 	store     sqlitecli.Store
 	approvals *approvalBroker
 	filters   chatfilter.Chain
+	drivers   provider.DriverRegistry
 }
 
 type chatSelection struct {
@@ -34,11 +35,32 @@ type chatSelection struct {
 }
 
 type authStatus struct {
-	ID        string `json:"id"`
-	Label     string `json:"label"`
-	Connected bool   `json:"connected"`
-	Status    string `json:"status"`
-	Detail    string `json:"detail"`
+	ID           string `json:"id"`
+	Label        string `json:"label"`
+	AccountLabel string `json:"accountLabel"`
+	Connected    bool   `json:"connected"`
+	Status       string `json:"status"`
+	Detail       string `json:"detail"`
+}
+
+func (s Server) projectFromRequest(r *http.Request, projects []sqlitecli.Project) (sqlitecli.Project, error) {
+	projectID := strings.TrimSpace(r.URL.Query().Get("projectId"))
+	if projectID != "" {
+		for _, project := range projects {
+			if project.ID == projectID {
+				return project, nil
+			}
+		}
+	}
+	if len(projects) > 0 {
+		for _, project := range projects {
+			if project.IsDefault {
+				return project, nil
+			}
+		}
+		return projects[0], nil
+	}
+	return s.store.DefaultProject()
 }
 
 type approvalBroker struct {
@@ -65,13 +87,9 @@ func (b *approvalBroker) request(ctx context.Context, event toolruntime.Event) (
 		b.mu.Unlock()
 	}()
 
-	timer := time.NewTimer(2 * time.Minute)
-	defer timer.Stop()
 	select {
 	case decision := <-ch:
 		return decision, nil
-	case <-timer.C:
-		return "decline", nil
 	case <-ctx.Done():
 		return "decline", ctx.Err()
 	}
@@ -96,6 +114,14 @@ func NewServer(store sqlitecli.Store) Server {
 		store:     store,
 		approvals: newApprovalBroker(),
 		filters:   chatfilter.NewChain(chatfilter.IdentityFilter{}),
+		drivers: provider.NewDriverRegistry(
+			provider.CodexAppServerDriver{},
+			provider.UnavailableDriver{ProviderID: "openai", Reason: "ChatGPT handoff driver is not implemented yet"},
+			provider.ClaudeCLIDriver{},
+			provider.UnavailableDriver{ProviderID: "copilot", Reason: "Copilot bridge driver is not implemented yet"},
+			provider.UnavailableDriver{ProviderID: "gemini", Reason: "Gemini bridge driver is not implemented yet"},
+			provider.UnavailableDriver{ProviderID: "ollama", Reason: "Ollama local model driver is not implemented yet"},
+		),
 	}
 }
 
@@ -125,12 +151,17 @@ func (s Server) Handler() http.Handler {
 }
 
 func (s Server) state(w http.ResponseWriter, r *http.Request) {
-	sessions, err := s.store.ListSessions()
+	projects, err := s.store.ListProjects()
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
-	projects, err := s.store.ListProjects()
+	project, err := s.projectFromRequest(r, projects)
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	sessions, err := s.store.ListSessionsForProject(project.ID)
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
 		return
@@ -170,30 +201,39 @@ func (s Server) state(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
-	project, err := s.store.DefaultProject()
+	projectRoutes, err := s.store.ListProjectAccessRoutes(project.ID)
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
-	projectRoutes, err := s.store.ListProjectAccessRoutes(project.ID)
+	if len(projectRoutes) == 0 && !project.IsDefault {
+		s.copyDefaultProjectRoutes(project.ID)
+		projectRoutes, err = s.store.ListProjectAccessRoutes(project.ID)
+		if err != nil {
+			writeError(w, err, http.StatusInternalServerError)
+			return
+		}
+	}
+	moderator, err := s.store.ModeratorPreference(project.ID)
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
 
 	writeJSON(w, map[string]any{
-		"sessions":      sessions,
-		"projects":      projects,
-		"providers":     providers,
-		"agents":        agents,
-		"tools":         tools,
-		"profiles":      profiles,
-		"models":        models,
-		"routes":        routes,
-		"project":       project,
-		"projectRoutes": projectRoutes,
-		"usage":         usage,
-		"auth":          detectAuthStatuses(),
+		"sessions":            sessions,
+		"projects":            projects,
+		"providers":           providers,
+		"agents":              agents,
+		"tools":               tools,
+		"profiles":            profiles,
+		"models":              models,
+		"routes":              routes,
+		"project":             project,
+		"projectRoutes":       projectRoutes,
+		"moderatorPreference": moderator,
+		"usage":               usage,
+		"auth":                detectAuthStatuses(),
 	})
 }
 
@@ -215,7 +255,24 @@ func (s Server) createProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
+	s.copyDefaultProjectRoutes(project.ID)
 	writeJSON(w, map[string]any{"project": project})
+}
+
+func (s Server) copyDefaultProjectRoutes(projectID string) {
+	defaultProject, err := s.store.DefaultProject()
+	if err != nil || defaultProject.ID == projectID {
+		return
+	}
+	routes, err := s.store.ListProjectAccessRoutes(defaultProject.ID)
+	if err != nil {
+		return
+	}
+	for _, route := range routes {
+		if route.Enabled {
+			_ = s.store.AddProjectAccessRoute(projectID, route.Route.ID)
+		}
+	}
 }
 
 func (s Server) renameProject(w http.ResponseWriter, r *http.Request) {
@@ -292,6 +349,14 @@ func (s Server) connectProviderProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s Server) projectRoute(w http.ResponseWriter, r *http.Request) {
+	if strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/moderator") {
+		if r.Method == http.MethodPost {
+			s.updateProjectModerator(w, r)
+			return
+		}
+		writeError(w, errors.New("method not allowed"), http.StatusMethodNotAllowed)
+		return
+	}
 	if r.Method == http.MethodPost {
 		s.addProjectRoute(w, r)
 		return
@@ -301,6 +366,34 @@ func (s Server) projectRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeError(w, errors.New("method not allowed"), http.StatusMethodNotAllowed)
+}
+
+func (s Server) updateProjectModerator(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := projectModeratorProjectIDFromPath(r.URL.Path)
+	if !ok {
+		writeError(w, errors.New("project moderator path is invalid"), http.StatusBadRequest)
+		return
+	}
+	var input struct {
+		Mode                     string `json:"mode"`
+		PrimaryProviderGroupID   string `json:"primaryProviderGroupId"`
+		SecondaryProviderGroupID string `json:"secondaryProviderGroupId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	pref, err := s.store.UpsertProjectModeratorPreference(
+		projectID,
+		input.Mode,
+		input.PrimaryProviderGroupID,
+		input.SecondaryProviderGroupID,
+	)
+	if err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"moderatorPreference": pref})
 }
 
 func (s Server) addProjectRoute(w http.ResponseWriter, r *http.Request) {
@@ -338,16 +431,25 @@ func (s Server) removeProjectRoute(w http.ResponseWriter, r *http.Request) {
 
 func (s Server) createSession(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Title string `json:"title"`
+		Title            string   `json:"title"`
+		ProjectID        string   `json:"projectId"`
+		ProviderGroupIDs []string `json:"providerGroupIds"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
-	session, err := s.store.CreateChatSession(input.Title)
+	session, err := s.store.CreateChatSessionForProject(input.ProjectID, input.Title)
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
 		return
+	}
+	providerGroupIDs := compactStrings(input.ProviderGroupIDs)
+	if len(providerGroupIDs) > 0 {
+		if err := s.store.SetSessionProviderGroups(session.ID, providerGroupIDs); err != nil {
+			writeError(w, err, http.StatusInternalServerError)
+			return
+		}
 	}
 	writeJSON(w, map[string]any{"session": session})
 }
@@ -518,10 +620,16 @@ func (s Server) session(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err, http.StatusNotFound)
 		return
 	}
+	providerGroupIDs, err := s.store.ListSessionProviderGroups(sessionID)
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, map[string]any{
-		"session":  session,
-		"messages": messages,
-		"context":  contextUsageOrZero(s.store, sessionID),
+		"session":          session,
+		"messages":         messages,
+		"context":          contextUsageOrZero(s.store, sessionID),
+		"providerGroupIds": providerGroupIDs,
 	})
 }
 
@@ -564,7 +672,7 @@ func (s Server) sessionMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	content = filtered.Content
-	selection, err := s.resolveChatSelection(input.RouteID, input.ModelID)
+	selection, err := s.resolveChatSelection(sessionID, input.RouteID, input.ModelID)
 	if err != nil {
 		writeError(w, err, http.StatusBadRequest)
 		return
@@ -637,7 +745,7 @@ func (s Server) streamSessionMessage(w http.ResponseWriter, r *http.Request, ses
 		return
 	}
 	content = filtered.Content
-	selection, err := s.resolveChatSelection(input.RouteID, input.ModelID)
+	selection, err := s.resolveChatSelection(sessionID, input.RouteID, input.ModelID)
 	if err != nil {
 		writeError(w, err, http.StatusBadRequest)
 		return
@@ -763,19 +871,29 @@ func textChunks(text string) []string {
 }
 
 func (s Server) runAssistant(ctx context.Context, sessionID string, content string, thinkingEffort string, selection chatSelection, onEvent func(provider.Event)) (string, bool, error) {
-	switch selection.Route.ProviderPluginID {
-	case "codex":
-		return s.runCodex(ctx, sessionID, content, thinkingEffort, selection, onEvent)
-	case "anthropic":
-		return handoffPendingMessage(selection), false, nil
-	case "copilot":
-		return bridgePendingMessage(selection), false, nil
-	default:
-		return "", false, fmt.Errorf("%s is not executable from chat yet", selection.Route.DisplayName)
+	driver, ok := s.drivers.Get(selection.Route.ProviderPluginID)
+	if !ok {
+		return "", false, fmt.Errorf("%s has no Ergo Loom chat driver", selection.Route.DisplayName)
 	}
+	request, err := s.providerChatRequest(sessionID, content, thinkingEffort, selection)
+	if err != nil {
+		return "", false, err
+	}
+	if !driver.CanExecute(request) {
+		return "", false, fmt.Errorf("%s is not executable from Ergo Loom chat yet", selection.Route.DisplayName)
+	}
+	response, err := driver.Respond(ctx, request, onEvent)
+	if response.ExternalThreadID != "" {
+		bindingInput := providerChatBindingInput(sessionID, selection)
+		bindingInput.ExternalThreadID = response.ExternalThreadID
+		if _, bindErr := s.store.UpsertProviderChatBinding(bindingInput); bindErr != nil && err == nil {
+			err = bindErr
+		}
+	}
+	return response.Text, response.Streamed, err
 }
 
-func (s Server) resolveChatSelection(routeID string, modelID string) (chatSelection, error) {
+func (s Server) resolveChatSelection(sessionID string, routeID string, modelID string) (chatSelection, error) {
 	routeID = strings.TrimSpace(routeID)
 	modelID = strings.TrimSpace(modelID)
 	if routeID == "" {
@@ -788,6 +906,11 @@ func (s Server) resolveChatSelection(routeID string, modelID string) (chatSelect
 	project, err := s.store.DefaultProject()
 	if err != nil {
 		return chatSelection{}, err
+	}
+	if sessionID != sessionIDForCapabilityCheck {
+		if session, _, sessionErr := s.store.GetSession(sessionID); sessionErr == nil && strings.TrimSpace(session.ProjectID) != "" {
+			project.ID = session.ProjectID
+		}
 	}
 	projectRoutes, err := s.store.ListProjectAccessRoutes(project.ID)
 	if err != nil {
@@ -824,7 +947,7 @@ func (s Server) resolveChatSelection(routeID string, modelID string) (chatSelect
 	if selectedModel.ProviderPluginID != selectedRoute.ProviderPluginID {
 		return chatSelection{}, errors.New("selected model does not belong to the selected route provider")
 	}
-	if selectedModel.Status != "available" && selectedRoute.Transport == "app_server" {
+	if selectedModel.Status != "available" {
 		return chatSelection{}, fmt.Errorf("%s is %s and cannot be executed directly yet", selectedModel.DisplayName, selectedModel.Status)
 	}
 
@@ -848,45 +971,57 @@ func (s Server) resolveChatSelection(routeID string, modelID string) (chatSelect
 		}
 	}
 
-	return chatSelection{
+	selection := chatSelection{
 		Route:   selectedRoute,
 		Model:   selectedModel,
 		Profile: selectedProfile,
-	}, nil
+	}
+	if !s.drivers.CanExecute(chatRequestFromSelection(sessionIDForCapabilityCheck, "", "", selection, "")) {
+		return chatSelection{}, fmt.Errorf("%s is not executable from Ergo Loom chat yet", selectedRoute.DisplayName)
+	}
+	return selection, nil
 }
 
-func (s Server) runCodex(ctx context.Context, sessionID string, content string, thinkingEffort string, selection chatSelection, onEvent func(provider.Event)) (string, bool, error) {
-	var deltas strings.Builder
-	runner := provider.NewCodexAppServerRunner("")
-	runner.Model = selection.Model.ModelRef
-	runner.Effort = thinkingEffort
-	runner.ApprovalHandler = s.approvals.request
+const sessionIDForCapabilityCheck = "__capability_check__"
+
+func (s Server) providerChatRequest(sessionID string, content string, thinkingEffort string, selection chatSelection) (provider.ChatRequest, error) {
 	threadID := ""
-	bindingInput := sqlitecli.ProviderChatBindingInput{
+	bindingInput := providerChatBindingInput(sessionID, selection)
+	if binding, err := s.store.GetProviderChatBinding(bindingInput); err == nil {
+		threadID = binding.ExternalThreadID
+	} else if !errors.Is(err, sqlitecli.ErrNotFound) {
+		return provider.ChatRequest{}, err
+	}
+	request := chatRequestFromSelection(sessionID, content, thinkingEffort, selection, threadID)
+	request.ApprovalHandler = s.approvals.request
+	return request, nil
+}
+
+func providerChatBindingInput(sessionID string, selection chatSelection) sqlitecli.ProviderChatBindingInput {
+	return sqlitecli.ProviderChatBindingInput{
 		SessionID:         sessionID,
 		ProviderPluginID:  selection.Route.ProviderPluginID,
 		ProviderProfileID: selection.Profile.ID,
 		AccessRouteID:     selection.Route.ID,
 		ModelID:           selection.Model.ID,
 	}
-	if binding, err := s.store.GetProviderChatBinding(bindingInput); err == nil {
-		threadID = binding.ExternalThreadID
-	} else if !errors.Is(err, sqlitecli.ErrNotFound) {
-		return "", false, err
+}
+
+func chatRequestFromSelection(sessionID string, content string, thinkingEffort string, selection chatSelection, externalThreadID string) provider.ChatRequest {
+	return provider.ChatRequest{
+		SessionID:         sessionID,
+		RouteID:           selection.Route.ID,
+		RouteDisplayName:  selection.Route.DisplayName,
+		RouteTransport:    selection.Route.Transport,
+		ProviderPluginID:  selection.Route.ProviderPluginID,
+		ProviderProfileID: selection.Profile.ID,
+		ModelID:           selection.Model.ID,
+		ModelDisplayName:  selection.Model.DisplayName,
+		ModelRef:          selection.Model.ModelRef,
+		Input:             content,
+		ThinkingEffort:    thinkingEffort,
+		ExternalThreadID:  externalThreadID,
 	}
-	response, err := runner.RespondInThread(ctx, threadID, content, func(event provider.Event) {
-		if event.Kind == "delta" {
-			deltas.WriteString(event.Text)
-		}
-		onEvent(event)
-	})
-	if response.ThreadID != "" {
-		bindingInput.ExternalThreadID = response.ThreadID
-		if _, bindErr := s.store.UpsertProviderChatBinding(bindingInput); bindErr != nil && err == nil {
-			err = bindErr
-		}
-	}
-	return response.Text, response.Streamed || deltas.Len() > 0, err
 }
 
 func contextUsageOrZero(store sqlitecli.Store, sessionID string) sqlitecli.SessionContextUsage {
@@ -921,42 +1056,34 @@ func detectProviderAccount(providerID string, displayName string) (string, strin
 
 	switch providerID {
 	case "codex", "openai":
-		path, err := exec.LookPath("codex")
-		if err != nil && strings.TrimSpace(os.Getenv("CODEX_EXEC")) != "" {
-			path = strings.TrimSpace(os.Getenv("CODEX_EXEC"))
-			err = nil
+		status := detectCodexAuth()
+		if !status.Connected {
+			return "", "", errors.New(status.Detail)
 		}
-		if err != nil {
-			path = "/Applications/Codex.app/Contents/Resources/codex"
-			if _, statErr := os.Stat(path); statErr != nil {
-				return "", "", errors.New("Codex local runtime was not found")
-			}
-		}
-		return "Codex local account", path, nil
+		return status.AccountLabel, status.Detail, nil
 	case "copilot":
-		if _, err := exec.LookPath("gh"); err != nil {
-			return "", "", errors.New("GitHub CLI was not found; install gh or a Copilot bridge before connecting")
+		status := detectGitHubAuth("copilot", "VSCode Copilot")
+		if !status.Connected {
+			return "", "", errors.New(status.Detail)
 		}
-		if out, err := exec.Command("gh", "auth", "status").CombinedOutput(); err != nil {
-			detail := strings.TrimSpace(string(out))
-			if detail == "" {
-				detail = err.Error()
-			}
-			return "", "", fmt.Errorf("GitHub CLI is installed, but authentication is not ready: %s", detail)
-		}
-		return "GitHub Copilot account", "gh detected; Copilot bridge still required for chat execution", nil
+		return status.AccountLabel, status.Detail, nil
 	case "anthropic":
-		if _, err := exec.LookPath("claude"); err != nil {
-			return "", "", errors.New("Claude CLI was not found; install a Claude bridge or use manual handoff later")
+		status := detectClaudeAuth()
+		if !status.Connected {
+			return "", "", errors.New(status.Detail)
 		}
-		return "Claude local account", "claude CLI detected", nil
+		return status.AccountLabel, status.Detail, nil
 	case "gemini":
 		if _, err := exec.LookPath("gemini"); err != nil {
 			return "", "", errors.New("Gemini CLI was not found; install gemini before connecting")
 		}
 		return "Gemini local account", "gemini CLI detected", nil
-	case "local":
-		return "Local runtime", "local provider", nil
+	case "ollama":
+		status := detectOllamaAuth()
+		if !status.Connected {
+			return "", "", errors.New(status.Detail)
+		}
+		return status.AccountLabel, status.Detail, nil
 	default:
 		return providerID + " account", "generic provider profile", nil
 	}
@@ -964,18 +1091,157 @@ func detectProviderAccount(providerID string, displayName string) (string, strin
 
 func detectAuthStatuses() []authStatus {
 	return []authStatus{
-		detectExecutableAuth("codex", "Codex", "codex", []string{"--version"}, "/Applications/Codex.app/Contents/Resources/codex"),
-		detectExecutableAuth("github", "GitHub", "gh", []string{"auth", "status"}, ""),
-		detectExecutableAuth("claude", "Claude", "claude", []string{"--version"}, ""),
+		detectCodexAuth(),
+		detectGitHubAuth("github", "GitHub"),
+		detectGitHubAuth("copilot", "VSCode Copilot"),
+		detectClaudeAuth(),
 		detectExecutableAuth("gemini", "Gemini", "gemini", []string{"--version"}, ""),
-		{
-			ID:        "local",
-			Label:     "Local runtime",
-			Connected: true,
-			Status:    "ready",
-			Detail:    "SQLite and local tools",
-		},
+		detectOllamaAuth(),
 	}
+}
+
+func detectClaudeAuth() authStatus {
+	path, err := executablePath("claude", "ERGO_CLAUDE_COMMAND", filepath.Join(os.Getenv("HOME"), ".local", "bin", "claude"))
+	if err != nil {
+		return authStatus{ID: "claude", Label: "Claude", AccountLabel: "", Connected: false, Status: "missing", Detail: "Claude CLI was not found"}
+	}
+	out, runErr := exec.Command(path, "auth", "status").CombinedOutput()
+	raw := string(out)
+	detail := compactDetail(raw)
+	if runErr != nil {
+		if strings.Contains(raw, `"loggedIn": false`) || strings.Contains(strings.ToLower(raw), "loggedin") {
+			return authStatus{ID: "claude", Label: "Claude", AccountLabel: "", Connected: false, Status: "signed_out", Detail: "Claude CLI is installed but not logged in"}
+		}
+		if detail == "" {
+			detail = runErr.Error()
+		}
+		return authStatus{ID: "claude", Label: "Claude", AccountLabel: "", Connected: false, Status: "error", Detail: detail}
+	}
+	account := "Claude account"
+	if strings.Contains(detail, `"loggedIn": true`) {
+		account = "Claude local account"
+	}
+	return authStatus{ID: "claude", Label: "Claude", AccountLabel: account, Connected: true, Status: "ready", Detail: detail}
+}
+
+func detectOllamaAuth() authStatus {
+	path, err := executablePath("ollama", "ERGO_OLLAMA_COMMAND")
+	if err != nil {
+		return authStatus{ID: "ollama", Label: "Ollama(Local Model)", AccountLabel: "", Connected: false, Status: "missing", Detail: "ollama not found"}
+	}
+	versionOut, _ := exec.Command(path, "--version").CombinedOutput()
+	listOut, listErr := exec.Command(path, "list").CombinedOutput()
+	detail := compactDetail(string(listOut))
+	if listErr != nil {
+		if detail == "" {
+			detail = compactDetail(string(versionOut))
+		}
+		if detail == "" {
+			detail = listErr.Error()
+		}
+		return authStatus{ID: "ollama", Label: "Ollama(Local Model)", AccountLabel: "", Connected: false, Status: "not_running", Detail: detail}
+	}
+	lines := strings.Split(strings.TrimSpace(string(listOut)), "\n")
+	modelCount := 0
+	if len(lines) > 1 {
+		modelCount = len(lines) - 1
+	}
+	account := "Ollama local runtime"
+	if modelCount == 0 {
+		return authStatus{ID: "ollama", Label: "Ollama(Local Model)", AccountLabel: account, Connected: true, Status: "ready_empty", Detail: "Ollama is running; no local models installed"}
+	}
+	return authStatus{ID: "ollama", Label: "Ollama(Local Model)", AccountLabel: account, Connected: true, Status: "ready", Detail: fmt.Sprintf("Ollama is running; %d local model(s) available", modelCount)}
+}
+
+func executablePathOrName(name string, envVar string, candidates ...string) string {
+	path, err := executablePath(name, envVar, candidates...)
+	if err != nil {
+		return name
+	}
+	return path
+}
+
+func executablePath(name string, envVar string, candidates ...string) (string, error) {
+	all := []string{strings.TrimSpace(os.Getenv(envVar)), name}
+	all = append(all, candidates...)
+	for _, candidate := range all {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if strings.ContainsRune(candidate, filepath.Separator) {
+			if stat, err := os.Stat(candidate); err == nil && !stat.IsDir() {
+				return candidate, nil
+			}
+			continue
+		}
+		if path, err := exec.LookPath(candidate); err == nil {
+			return path, nil
+		}
+	}
+	return "", exec.ErrNotFound
+}
+
+func detectCodexAuth() authStatus {
+	path, err := exec.LookPath("codex")
+	if err != nil && strings.TrimSpace(os.Getenv("CODEX_EXEC")) != "" {
+		path = strings.TrimSpace(os.Getenv("CODEX_EXEC"))
+		err = nil
+	}
+	if err != nil {
+		path = "/Applications/Codex.app/Contents/Resources/codex"
+		if _, statErr := os.Stat(path); statErr != nil {
+			return authStatus{ID: "codex", Label: "Codex/ChatGPT", AccountLabel: "", Connected: false, Status: "missing", Detail: "Codex local runtime was not found"}
+		}
+	}
+	out, runErr := exec.Command(path, "login", "status").CombinedOutput()
+	detail := compactDetail(string(out))
+	if runErr != nil {
+		if detail == "" {
+			detail = runErr.Error()
+		}
+		return authStatus{ID: "codex", Label: "Codex/ChatGPT", AccountLabel: "", Connected: false, Status: "error", Detail: detail}
+	}
+	account := "ChatGPT account"
+	if strings.Contains(strings.ToLower(detail), "api key") {
+		account = "OpenAI API key"
+	}
+	return authStatus{ID: "codex", Label: "Codex/ChatGPT", AccountLabel: account, Connected: true, Status: "ready", Detail: detail}
+}
+
+func detectGitHubAuth(id string, label string) authStatus {
+	path, err := exec.LookPath("gh")
+	if err != nil {
+		return authStatus{ID: id, Label: label, AccountLabel: "", Connected: false, Status: "missing", Detail: "gh not found"}
+	}
+	out, runErr := exec.Command(path, "auth", "status").CombinedOutput()
+	detail := compactDetail(string(out))
+	if runErr != nil {
+		if detail == "" {
+			detail = runErr.Error()
+		}
+		return authStatus{ID: id, Label: label, AccountLabel: "", Connected: false, Status: "error", Detail: detail}
+	}
+	account := githubAccountFromStatus(string(out))
+	if account == "" {
+		account = "GitHub account"
+	}
+	return authStatus{ID: id, Label: label, AccountLabel: account, Connected: true, Status: "ready", Detail: "gh authenticated"}
+}
+
+func githubAccountFromStatus(value string) string {
+	for _, line := range strings.Split(value, "\n") {
+		line = strings.TrimSpace(line)
+		marker := " account "
+		if index := strings.Index(line, marker); index >= 0 {
+			rest := strings.TrimSpace(line[index+len(marker):])
+			if end := strings.Index(rest, " "); end >= 0 {
+				return rest[:end]
+			}
+			return rest
+		}
+	}
+	return ""
 }
 
 func detectExecutableAuth(id string, label string, command string, args []string, fallback string) authStatus {
@@ -988,20 +1254,22 @@ func detectExecutableAuth(id string, label string, command string, args []string
 	}
 	if err != nil {
 		return authStatus{
-			ID:        id,
-			Label:     label,
-			Connected: false,
-			Status:    "missing",
-			Detail:    command + " not found",
+			ID:           id,
+			Label:        label,
+			AccountLabel: "",
+			Connected:    false,
+			Status:       "missing",
+			Detail:       command + " not found",
 		}
 	}
 	if len(args) == 0 {
 		return authStatus{
-			ID:        id,
-			Label:     label,
-			Connected: true,
-			Status:    "ready",
-			Detail:    path,
+			ID:           id,
+			Label:        label,
+			AccountLabel: label + " account",
+			Connected:    true,
+			Status:       "ready",
+			Detail:       path,
 		}
 	}
 
@@ -1015,19 +1283,21 @@ func detectExecutableAuth(id string, label string, command string, args []string
 	}
 	if runErr != nil {
 		return authStatus{
-			ID:        id,
-			Label:     label,
-			Connected: false,
-			Status:    "error",
-			Detail:    detail,
+			ID:           id,
+			Label:        label,
+			AccountLabel: "",
+			Connected:    false,
+			Status:       "error",
+			Detail:       detail,
 		}
 	}
 	return authStatus{
-		ID:        id,
-		Label:     label,
-		Connected: true,
-		Status:    "ready",
-		Detail:    detail,
+		ID:           id,
+		Label:        label,
+		AccountLabel: label + " account",
+		Connected:    true,
+		Status:       "ready",
+		Detail:       detail,
 	}
 }
 
@@ -1075,6 +1345,20 @@ func estimateTokens(text string) int {
 	return max(1, (len([]rune(trimmed))+3)/4)
 }
 
+func compactStrings(values []string) []string {
+	seen := map[string]bool{}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+	}
+	return result
+}
+
 func sessionIDFromPath(path string) (string, bool) {
 	value := strings.TrimPrefix(path, "/api/sessions/")
 	if value == "" || strings.Contains(value, "/") {
@@ -1104,6 +1388,15 @@ func streamSessionIDFromPath(path string) (string, bool) {
 func projectRouteProjectIDFromPath(path string) (string, bool) {
 	value := strings.TrimPrefix(path, "/api/projects/")
 	projectID, suffix, ok := strings.Cut(value, "/routes")
+	if !ok || suffix != "" || projectID == "" {
+		return "", false
+	}
+	return projectID, true
+}
+
+func projectModeratorProjectIDFromPath(path string) (string, bool) {
+	value := strings.TrimPrefix(path, "/api/projects/")
+	projectID, suffix, ok := strings.Cut(value, "/moderator")
 	if !ok || suffix != "" || projectID == "" {
 		return "", false
 	}
