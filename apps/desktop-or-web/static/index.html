@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Ergo Loom</title>
+    <link rel="icon" href="/icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="app-shell" id="app-shell">
+      <aside class="nav-pane">
+        <div class="brand-row">
+          <img class="brand-mark" src="/icon.svg" alt="" aria-hidden="true">
+          <div class="brand-copy">
+            <div class="brand-name">Ergo Loom</div>
+            <div class="brand-meta">Local chat workspace</div>
+          </div>
+          <button class="icon-button" id="nav-toggle" title="Toggle navigation" aria-label="Toggle navigation">‹</button>
+        </div>
+
+        <div class="nav-body">
+          <div class="nav-actions">
+            <button class="nav-action active" type="button">Projects</button>
+            <button class="nav-action" id="open-search" type="button">Search chats</button>
+          </div>
+
+          <div class="nav-section-title">
+            <span>Projects</span>
+            <button class="icon-button small" id="create-project" title="Create project" aria-label="Create project">+</button>
+          </div>
+
+          <section class="project-tree" aria-label="Project chats">
+            <div class="project-row active">
+              <button class="project-main" id="project-toggle" type="button" aria-expanded="true">
+                <span class="project-folder" aria-hidden="true"></span>
+                <span id="project-name">Default Project</span>
+                <span class="fold-chevron">⌄</span>
+              </button>
+              <button class="icon-button small project-menu-button" id="project-menu-button" type="button" aria-label="Project actions">…</button>
+            </div>
+            <div class="project-menu" id="project-menu" hidden>
+              <button id="new-session" type="button">New chat</button>
+              <button id="rename-project" type="button">Rename project</button>
+            </div>
+            <div class="project-chats">
+              <div class="session-list" id="session-list"></div>
+            </div>
+            <div class="project-list" id="project-list"></div>
+          </section>
+        </div>
+
+        <div class="nav-footer">
+          <section class="token-panel" id="ai-usage-panel">
+            <button class="usage-toggle" id="usage-toggle" type="button" aria-expanded="true">
+              <span>AI Usage</span>
+              <span class="usage-gauge" aria-hidden="true"><span id="usage-gauge-fill"></span></span>
+            </button>
+            <div class="usage-details" id="nav-token-usage"></div>
+          </section>
+          <button class="nav-action settings-action" type="button">Settings</button>
+        </div>
+      </aside>
+
+      <section class="conversation-column">
+        <section class="chat-pane" aria-label="Chat transcript">
+          <header class="chat-header">
+            <div>
+              <h1 id="chat-title">New chat</h1>
+              <p id="chat-subtitle">Default Project</p>
+              <p class="context-meter" id="context-meter">0 messages · 0 ctx tokens · 0 provider chats</p>
+            </div>
+            <div class="chat-header-actions">
+              <button class="route-summary" id="active-route" type="button" aria-expanded="false">No AI selected</button>
+              <button class="icon-button small" id="chat-more" type="button" aria-label="Chat actions">…</button>
+            </div>
+            <div class="chat-ai-panel" id="chat-ai-panel" hidden>
+              <div id="project-routes"></div>
+              <div class="route-picker">
+                <select id="route-picker" aria-label="Add AI route"></select>
+                <button id="add-route" type="button">Add</button>
+              </div>
+            </div>
+          </header>
+          <div class="messages" id="messages"></div>
+        </section>
+
+        <section class="reasoning-pane" id="reasoning-pane" aria-label="Agent activity">
+          <button class="reasoning-toggle" id="reasoning-toggle" type="button" aria-expanded="true">
+            <span>Agent activity</span>
+            <span id="reasoning-count">0</span>
+          </button>
+          <div class="reasoning-stream" id="reasoning-stream"></div>
+        </section>
+
+        <section class="tool-approval-panel" id="tool-approval-panel" aria-label="Tool approvals" hidden>
+          <div id="tool-approval-list"></div>
+        </section>
+
+        <section class="composer-pane" aria-label="Chat composer">
+          <form class="composer" id="composer">
+            <textarea id="message-input" rows="1" placeholder="Ask Ergo Loom"></textarea>
+            <div class="composer-actions">
+              <div class="model-picker-wrap">
+                <button class="model-picker-button" id="model-picker" type="button" aria-expanded="false">
+                  <span id="model-picker-label">No model</span>
+                  <span class="model-picker-effort">Medium</span>
+                  <span aria-hidden="true">⌄</span>
+                </button>
+                <div class="model-menu" id="model-menu" hidden>
+                  <input id="model-search" type="search" placeholder="Search models">
+                  <div class="model-menu-list" id="model-menu-list"></div>
+                  <div class="model-menu-footer">
+                    <button id="model-effort" type="button">Thinking effort · Medium</button>
+                  </div>
+                </div>
+              </div>
+              <button id="send-message" type="submit">Send</button>
+            </div>
+          </form>
+        </section>
+      </section>
+
+      <aside class="workspace-pane">
+        <section>
+          <h2>Terminal</h2>
+          <div class="terminal-view">
+            <div id="terminal-output">
+              <div class="terminal-line">$ ergo status</div>
+              <div class="terminal-line muted">Local runtime ready</div>
+            </div>
+          </div>
+          <form class="terminal-form" id="terminal-form">
+            <input id="terminal-command" type="text" placeholder="Type a command">
+            <button type="submit">Queue</button>
+          </form>
+          <div class="terminal-pending" id="terminal-pending" hidden>
+            <div class="meta">Approval required</div>
+            <code id="terminal-pending-command"></code>
+            <div class="terminal-actions">
+              <button id="terminal-run" type="button">Run</button>
+              <button id="terminal-cancel" type="button">Cancel</button>
+            </div>
+          </div>
+        </section>
+        <section>
+          <h2>Current Branch</h2>
+          <div class="branch-card">
+            <strong>main</strong>
+            <div class="meta">No branch session selected</div>
+          </div>
+        </section>
+        <section>
+          <h2>File Viewer</h2>
+          <div class="file-viewer">
+            <div class="meta">No file open</div>
+          </div>
+        </section>
+        <section>
+          <h2>Providers</h2>
+          <div id="providers"></div>
+        </section>
+        <section>
+          <h2>Agents</h2>
+          <div id="agents"></div>
+        </section>
+        <section>
+          <h2>Access Routes</h2>
+          <div id="routes"></div>
+        </section>
+        <section>
+          <h2>Usage</h2>
+          <div id="usage"></div>
+        </section>
+      </aside>
+    </main>
+
+    <div class="search-modal" id="search-modal" hidden>
+      <div class="search-backdrop" id="search-backdrop"></div>
+      <section class="search-dialog" role="dialog" aria-modal="true" aria-label="Search chats and projects">
+        <input class="search-input modal-search-input" id="session-search" type="search" placeholder="Search projects and chats">
+        <div class="search-provider-row">
+          <span>Local workspace</span>
+          <span>Projects + chats</span>
+        </div>
+        <div class="search-results" id="search-results"></div>
+      </section>
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>

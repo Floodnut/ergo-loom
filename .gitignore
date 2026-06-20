@@ -1,0 +1,10 @@
+data/*.db
+data/*.db-*
+bin/
+.cache/
+build/assets/
+build/*.iconset/
+dist/
+dist-packaged/
+node_modules/
+.DS_Store

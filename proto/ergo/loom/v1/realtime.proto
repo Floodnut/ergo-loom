@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package ergo.loom.v1;
+
+option go_package = "github.com/jkj-dev/ergo-loom/proto/ergo/loom/v1;loomv1";
+
+message ClientEnvelope {
+  string request_id = 1;
+  oneof payload {
+    StartChatRun start_chat_run = 2;
+    CancelRun cancel_run = 3;
+  }
+}
+
+message ServerEnvelope {
+  string request_id = 1;
+  oneof payload {
+    RunAccepted run_accepted = 2;
+    MessageStarted message_started = 3;
+    MessageDelta message_delta = 4;
+    MessageFinished message_finished = 5;
+    UsageRecorded usage_recorded = 6;
+    RunFailed run_failed = 7;
+  }
+}
+
+message StartChatRun {
+  string session_id = 1;
+  string provider_profile_id = 2;
+  string agent_plugin_id = 3;
+  string content = 4;
+}
+
+message CancelRun {
+  string run_id = 1;
+}
+
+message RunAccepted {
+  string run_id = 1;
+  string session_id = 2;
+}
+
+message MessageStarted {
+  string run_id = 1;
+  string message_id = 2;
+  string role = 3;
+}
+
+message MessageDelta {
+  string run_id = 1;
+  string message_id = 2;
+  string text = 3;
+}
+
+message MessageFinished {
+  string run_id = 1;
+  string message_id = 2;
+  string content = 3;
+}
+
+message UsageRecorded {
+  string run_id = 1;
+  string provider_plugin_id = 2;
+  string provider_profile_id = 3;
+  string model = 4;
+  int64 prompt_tokens = 5;
+  int64 completion_tokens = 6;
+}
+
+message RunFailed {
+  string run_id = 1;
+  string message = 2;
+}

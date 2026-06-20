@@ -1,0 +1,71 @@
+{
+  "name": "ergo-loom",
+  "version": "0.1.0",
+  "description": "Local AI work context manager for branching, merging, and routing chat sessions.",
+  "author": "Floodnut",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "dist/electron/main.js",
+  "scripts": {
+    "build:cli": "node scripts/build-cli.mjs",
+    "build:desktop": "npm run build:icons && npm run build:web && npm run build:cli && npm run build:electron",
+    "build:electron": "tsc -p apps/electron/tsconfig.json",
+    "build:icons": "node scripts/build-icons.mjs",
+    "build:web": "tsc -p apps/desktop-or-web/tsconfig.json",
+    "check:desktop": "npm run check:web && tsc -p apps/electron/tsconfig.json --noEmit",
+    "check:web": "tsc -p apps/desktop-or-web/tsconfig.json --noEmit",
+    "package:mac": "npm run build:desktop && electron-builder --mac dmg dir",
+    "start:desktop": "npm run build:desktop && electron ."
+  },
+  "build": {
+    "appId": "io.floodnut.ergo-loom",
+    "productName": "Ergo Loom",
+    "asar": true,
+    "directories": {
+      "output": "dist-packaged"
+    },
+    "files": [
+      "dist/electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "bin/ergo",
+        "to": "bin/ergo"
+      },
+      {
+        "from": "build/icon.png",
+        "to": "build/icon.png"
+      },
+      {
+        "from": "build/icon.icns",
+        "to": "build/icon.icns"
+      },
+      {
+        "from": "internal/storage/sqlitecli/schema.sql",
+        "to": "internal/storage/sqlitecli/schema.sql"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.icns",
+      "target": [
+        "dmg",
+        "dir"
+      ],
+      "identity": null
+    },
+    "dmg": {
+      "artifactName": "Ergo-Loom-${version}-${arch}.${ext}",
+      "backgroundColor": "#fffdf8",
+      "icon": "build/icon.icns"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3",
+    "typescript": "^5.9.0"
+  }
+}
