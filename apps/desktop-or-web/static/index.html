@@ -130,6 +130,7 @@
 
         <section class="workspace-panel active" id="workspace-activity-panel" data-workspace-panel="activity">
           <h2>Tool Activity</h2>
+          <div class="auth-status-list" id="auth-status-list"></div>
           <div class="workspace-approvals" id="workspace-approvals"></div>
           <div class="workspace-activity" id="workspace-activity">
             <div class="meta">No tool activity yet</div>
@@ -144,6 +145,13 @@
           <div class="mini-tabs" id="terminal-tabs" role="tablist" aria-label="Terminal tabs"></div>
           <div class="terminal-view">
             <div id="terminal-output"></div>
+          </div>
+          <div class="terminal-meta-row">
+            <input id="terminal-cwd" type="text" placeholder="Working directory">
+            <select id="terminal-history" aria-label="Command history">
+              <option value="">History</option>
+            </select>
+            <button id="terminal-stop" type="button" disabled>Stop</button>
           </div>
           <form class="terminal-form" id="terminal-form">
             <input id="terminal-command" type="text" placeholder="Type a command">
@@ -167,8 +175,15 @@
           <div class="mini-tabs" id="file-tabs" role="tablist" aria-label="File tabs"></div>
           <form class="file-open-form" id="file-open-form">
             <input id="file-path" type="text" placeholder="Open local file path">
+            <select id="file-recent" aria-label="Recent files">
+              <option value="">Recent</option>
+            </select>
             <button type="submit">Open</button>
           </form>
+          <div class="file-actions">
+            <button id="file-reload" type="button">Reload</button>
+            <span id="file-meta" class="meta">No file selected</span>
+          </div>
           <div class="file-viewer">
             <pre id="file-content">No file open</pre>
           </div>

@@ -10,6 +10,7 @@ const state = {
     profiles: [],
     models: [],
     usage: [],
+    authStatuses: [],
     contextUsage: null,
     selectedSessionId: null,
     selectedModelId: "",
@@ -22,6 +23,9 @@ const state = {
             id: "terminal-1",
             title: "zsh 1",
             pendingCommand: "",
+            workingDir: "",
+            history: [],
+            running: false,
             lines: [
                 { text: "$ ergo status", className: "" },
                 { text: "Local runtime ready", className: "muted" },
@@ -36,8 +40,10 @@ const state = {
             path: "",
             content: "No file open",
             status: "idle",
+            size: 0,
         },
     ],
+    recentFiles: [],
     activeFileId: "file-1",
     runningSessionId: "",
     searchTimer: null,
@@ -131,17 +137,25 @@ const els = {
     terminalPendingCommand: q("#terminal-pending-command"),
     terminalRun: q("#terminal-run"),
     terminalCancel: q("#terminal-cancel"),
+    terminalCwd: q("#terminal-cwd"),
+    terminalHistory: q("#terminal-history"),
+    terminalStop: q("#terminal-stop"),
     workspaceTabs: q("#workspace-tabs"),
     workspaceActivity: q("#workspace-activity"),
     workspaceApprovals: q("#workspace-approvals"),
+    authStatusList: q("#auth-status-list"),
     terminalTabs: q("#terminal-tabs"),
     newTerminalTab: q("#new-terminal-tab"),
     fileTabs: q("#file-tabs"),
     newFileTab: q("#new-file-tab"),
     fileOpenForm: q("#file-open-form"),
     filePath: q("#file-path"),
+    fileRecent: q("#file-recent"),
+    fileReload: q("#file-reload"),
+    fileMeta: q("#file-meta"),
     fileContent: q("#file-content"),
 };
+const terminalControllers = new Map();
 async function request(path, options = {}) {
     const response = await fetch(path, {
         headers: { "Content-Type": "application/json" },
@@ -164,6 +178,7 @@ async function loadState() {
     state.profiles = data.profiles || [];
     state.models = data.models || [];
     state.usage = data.usage || [];
+    state.authStatuses = data.auth || [];
     renderProjectName();
     renderProjects();
     renderSessions();
@@ -172,6 +187,7 @@ async function loadState() {
     renderModelPicker();
     renderNavUsage();
     renderWorkspaceActivity();
+    renderAuthStatuses();
     renderTerminalPanel();
     renderFilePanel();
     renderRegistry(els.providers, groupedProviderRegistry(data.providers || []));
@@ -381,16 +397,25 @@ async function runTerminalCommand() {
     const command = tab.pendingCommand;
     if (!command)
         return;
+    const controller = new AbortController();
+    terminalControllers.set(tab.id, controller);
+    tab.running = true;
+    if (!tab.history.includes(command))
+        tab.history.unshift(command);
+    tab.history = tab.history.slice(0, 20);
+    renderTerminalPanel();
     els.terminalRun.disabled = true;
     appendTerminalLine(`$ ${command}`);
     const runningLine = appendTerminalLine("running...", "muted");
-    appendWorkspaceEvent("tool", { toolName: "zsh", command, text: "Queued from terminal tab" });
+    appendWorkspaceEvent("tool", { toolName: "zsh", command, text: tab.workingDir ? `cwd: ${tab.workingDir}` : "Queued from terminal tab" });
     try {
         const data = await request("/api/terminal/run", {
             method: "POST",
+            signal: controller.signal,
             body: JSON.stringify({
                 command,
                 sessionId: state.selectedSessionId || "",
+                workingDir: tab.workingDir || "",
             }),
         });
         runningLine.text = "completed";
@@ -405,14 +430,23 @@ async function runTerminalCommand() {
         cancelTerminalCommand();
     }
     catch (error) {
-        runningLine.text = error.message || String(error);
+        runningLine.text = error.name === "AbortError" ? "cancelled by user" : error.message || String(error);
         runningLine.className = "error";
         appendWorkspaceEvent("error", { toolName: "zsh", command, text: error.message || String(error) });
         renderTerminalPanel();
     }
     finally {
+        tab.running = false;
+        terminalControllers.delete(tab.id);
+        renderTerminalPanel();
         els.terminalRun.disabled = false;
     }
+}
+function stopTerminalCommand() {
+    const tab = activeTerminalTab();
+    const controller = terminalControllers.get(tab.id);
+    if (controller)
+        controller.abort();
 }
 async function streamMessage(sessionId, content) {
     const selected = selectedModelOption();
@@ -794,6 +828,7 @@ function appendReasoning(text) {
 }
 function appendActivityEvent(kind, payload = {}) {
     appendWorkspaceEvent(kind, payload);
+    mirrorToolEventToTerminal(kind, payload);
     const item = document.createElement("div");
     item.className = `reasoning-item activity-${kind}`;
     const title = document.createElement("div");
@@ -823,6 +858,31 @@ function appendActivityEvent(kind, payload = {}) {
     els.reasoningCount.textContent = String(els.reasoningStream.children.length);
     return item;
 }
+function mirrorToolEventToTerminal(kind, payload = {}) {
+    const command = payload.command || "";
+    const text = payload.text || "";
+    const toolName = String(payload.toolName || payload.toolId || "");
+    const looksLikeCommand = command || /command|shell|zsh|exec/i.test(toolName);
+    if (!looksLikeCommand)
+        return;
+    if (kind === "tool") {
+        appendTerminalLine(command ? `$ ${command}` : `tool started · ${toolName}`, "muted");
+        switchWorkspaceTab("terminals");
+    }
+    else if (kind === "result") {
+        if (text) {
+            for (const line of text.trimEnd().split("\n").slice(-80)) {
+                appendTerminalLine(line);
+            }
+        }
+    }
+    else if (kind === "error") {
+        appendTerminalLine(text || `tool interrupted · ${toolName}`, "error");
+    }
+    else if (kind === "approval") {
+        switchWorkspaceTab("activity");
+    }
+}
 function appendWorkspaceEvent(kind, payload = {}) {
     state.workspaceEvents.unshift({
         id: `event-${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -832,6 +892,23 @@ function appendWorkspaceEvent(kind, payload = {}) {
     });
     state.workspaceEvents = state.workspaceEvents.slice(0, 80);
     renderWorkspaceActivity();
+}
+function renderAuthStatuses() {
+    els.authStatusList.replaceChildren();
+    if (!state.authStatuses.length)
+        return;
+    for (const item of state.authStatuses) {
+        const row = document.createElement("div");
+        row.className = `auth-status-row ${item.connected ? "connected" : "missing"}`;
+        row.innerHTML = `
+      <div>
+        <strong>${escapeHTML(item.label)}</strong>
+        <span>${escapeHTML(item.detail || item.status || "")}</span>
+      </div>
+      <span>${item.connected ? "Ready" : "Needs setup"}</span>
+    `;
+        els.authStatusList.append(row);
+    }
 }
 function renderWorkspaceActivity() {
     els.workspaceActivity.replaceChildren();
@@ -1081,6 +1158,19 @@ function renderTerminalPanel() {
     }
     els.terminalPending.hidden = !active.pendingCommand;
     els.terminalPendingCommand.textContent = active.pendingCommand || "";
+    els.terminalCwd.value = active.workingDir || "";
+    els.terminalStop.disabled = !active.running;
+    els.terminalHistory.replaceChildren();
+    const historyPlaceholder = document.createElement("option");
+    historyPlaceholder.value = "";
+    historyPlaceholder.textContent = "History";
+    els.terminalHistory.append(historyPlaceholder);
+    for (const command of active.history || []) {
+        const option = document.createElement("option");
+        option.value = command;
+        option.textContent = command;
+        els.terminalHistory.append(option);
+    }
     els.terminalOutput.parentElement.scrollTop = els.terminalOutput.parentElement.scrollHeight;
 }
 function newTerminalTab() {
@@ -1089,6 +1179,9 @@ function newTerminalTab() {
         id: `terminal-${Date.now()}`,
         title: `zsh ${next}`,
         pendingCommand: "",
+        workingDir: activeTerminalTab()?.workingDir || "",
+        history: [],
+        running: false,
         lines: [{ text: "$ ergo status", className: "" }, { text: "Local runtime ready", className: "muted" }],
     };
     state.terminalTabs.push(tab);
@@ -1129,6 +1222,20 @@ function renderFilePanel() {
     els.filePath.value = active.path || "";
     els.fileContent.textContent = active.content || "No file open";
     els.fileContent.className = active.status === "error" ? "error" : "";
+    els.fileMeta.textContent = active.path
+        ? `${active.path}${active.size ? ` · ${active.size.toLocaleString()} bytes` : ""}`
+        : "No file selected";
+    els.fileRecent.replaceChildren();
+    const recentPlaceholder = document.createElement("option");
+    recentPlaceholder.value = "";
+    recentPlaceholder.textContent = "Recent";
+    els.fileRecent.append(recentPlaceholder);
+    for (const filePath of state.recentFiles) {
+        const option = document.createElement("option");
+        option.value = filePath;
+        option.textContent = filePath.split("/").filter(Boolean).pop() || filePath;
+        els.fileRecent.append(option);
+    }
 }
 function newFileTab() {
     const next = state.fileTabs.length + 1;
@@ -1138,6 +1245,7 @@ function newFileTab() {
         path: "",
         content: "No file open",
         status: "idle",
+        size: 0,
     };
     state.fileTabs.push(tab);
     state.activeFileId = tab.id;
@@ -1146,8 +1254,10 @@ function newFileTab() {
 }
 async function openFileInActiveTab(event) {
     event.preventDefault();
+    await openFilePath(els.filePath.value.trim());
+}
+async function openFilePath(filePath) {
     const tab = activeFileTab();
-    const filePath = els.filePath.value.trim();
     if (!filePath)
         return;
     tab.path = filePath;
@@ -1164,14 +1274,23 @@ async function openFileInActiveTab(event) {
         tab.title = tab.path.split("/").filter(Boolean).pop() || tab.path;
         tab.content = data.content || "";
         tab.status = "loaded";
+        tab.size = data.size || 0;
+        state.recentFiles = [tab.path, ...state.recentFiles.filter((item) => item !== tab.path)].slice(0, 12);
         appendWorkspaceEvent("tool", { toolName: "file.read", command: tab.path, text: "Opened in file viewer" });
     }
     catch (error) {
         tab.content = error.message || String(error);
         tab.status = "error";
+        tab.size = 0;
         appendWorkspaceEvent("error", { toolName: "file.read", command: filePath, text: tab.content });
     }
     renderFilePanel();
+}
+function reloadActiveFile() {
+    const tab = activeFileTab();
+    if (!tab.path)
+        return;
+    openFilePath(tab.path);
 }
 function renderRegistry(target, items) {
     target.replaceChildren();
@@ -1753,11 +1872,24 @@ els.workspaceTabs.addEventListener("click", (event) => {
     switchWorkspaceTab(button.dataset.workspaceTab);
 });
 els.newTerminalTab.addEventListener("click", newTerminalTab);
+els.terminalCwd.addEventListener("change", () => {
+    activeTerminalTab().workingDir = els.terminalCwd.value.trim();
+});
+els.terminalHistory.addEventListener("change", () => {
+    if (els.terminalHistory.value)
+        els.terminalCommand.value = els.terminalHistory.value;
+});
+els.terminalStop.addEventListener("click", stopTerminalCommand);
 els.terminalForm.addEventListener("submit", queueTerminalCommand);
 els.terminalRun.addEventListener("click", runTerminalCommand);
 els.terminalCancel.addEventListener("click", cancelTerminalCommand);
 els.newFileTab.addEventListener("click", newFileTab);
 els.fileOpenForm.addEventListener("submit", openFileInActiveTab);
+els.fileRecent.addEventListener("change", () => {
+    if (els.fileRecent.value)
+        openFilePath(els.fileRecent.value);
+});
+els.fileReload.addEventListener("click", reloadActiveFile);
 switchWorkspaceTab(state.activeWorkspaceTab);
 renderTerminalPanel();
 renderFilePanel();

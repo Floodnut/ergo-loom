@@ -33,6 +33,14 @@ type chatSelection struct {
 	Profile sqlitecli.ProviderProfile
 }
 
+type authStatus struct {
+	ID        string `json:"id"`
+	Label     string `json:"label"`
+	Connected bool   `json:"connected"`
+	Status    string `json:"status"`
+	Detail    string `json:"detail"`
+}
+
 type approvalBroker struct {
 	mu      sync.Mutex
 	pending map[string]chan string
@@ -94,6 +102,7 @@ func NewServer(store sqlitecli.Store) Server {
 func (s Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", s.state)
+	mux.HandleFunc("GET /api/auth/status", s.authStatus)
 	mux.HandleFunc("POST /api/projects", s.createProject)
 	mux.HandleFunc("PATCH /api/projects/", s.renameProject)
 	mux.HandleFunc("POST /api/projects/", s.projectRoute)
@@ -178,7 +187,12 @@ func (s Server) state(w http.ResponseWriter, r *http.Request) {
 		"project":       project,
 		"projectRoutes": projectRoutes,
 		"usage":         usage,
+		"auth":          detectAuthStatuses(),
 	})
+}
+
+func (s Server) authStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]any{"auth": detectAuthStatuses()})
 }
 
 func (s Server) createProject(w http.ResponseWriter, r *http.Request) {
@@ -334,8 +348,9 @@ func (s Server) createSession(w http.ResponseWriter, r *http.Request) {
 
 func (s Server) runTerminalCommand(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Command   string `json:"command"`
-		SessionID string `json:"sessionId"`
+		Command    string `json:"command"`
+		SessionID  string `json:"sessionId"`
+		WorkingDir string `json:"workingDir"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		writeError(w, err, http.StatusBadRequest)
@@ -353,12 +368,25 @@ func (s Server) runTerminalCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	workingDir := project.RootPath
+	if strings.TrimSpace(input.WorkingDir) != "" {
+		workingDir = expandPath(input.WorkingDir)
+	}
 	if strings.TrimSpace(workingDir) == "" {
 		workingDir, err = os.Getwd()
 		if err != nil {
 			writeError(w, err, http.StatusInternalServerError)
 			return
 		}
+	}
+	workingDir = filepath.Clean(workingDir)
+	info, err := os.Stat(workingDir)
+	if err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	if !info.IsDir() {
+		writeError(w, errors.New("working directory is not a directory"), http.StatusBadRequest)
+		return
 	}
 
 	startedAt := time.Now().UTC().Format(time.RFC3339Nano)
@@ -404,14 +432,7 @@ func (s Server) readFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, errors.New("path is required"), http.StatusBadRequest)
 		return
 	}
-	if strings.HasPrefix(filePath, "~") {
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			writeError(w, err, http.StatusInternalServerError)
-			return
-		}
-		filePath = filepath.Join(homeDir, strings.TrimPrefix(filePath, "~"))
-	}
+	filePath = expandPath(filePath)
 	if !filepath.IsAbs(filePath) {
 		project, err := s.store.DefaultProject()
 		if err != nil {
@@ -933,6 +954,111 @@ func detectProviderAccount(providerID string, displayName string) (string, strin
 	default:
 		return providerID + " account", "generic provider profile", nil
 	}
+}
+
+func detectAuthStatuses() []authStatus {
+	return []authStatus{
+		detectExecutableAuth("codex", "Codex", "codex", []string{"--version"}, "/Applications/Codex.app/Contents/Resources/codex"),
+		detectExecutableAuth("github", "GitHub", "gh", []string{"auth", "status"}, ""),
+		detectExecutableAuth("claude", "Claude", "claude", []string{"--version"}, ""),
+		detectExecutableAuth("gemini", "Gemini", "gemini", []string{"--version"}, ""),
+		{
+			ID:        "local",
+			Label:     "Local runtime",
+			Connected: true,
+			Status:    "ready",
+			Detail:    "SQLite and local tools",
+		},
+	}
+}
+
+func detectExecutableAuth(id string, label string, command string, args []string, fallback string) authStatus {
+	path, err := exec.LookPath(command)
+	if err != nil && fallback != "" {
+		if _, statErr := os.Stat(fallback); statErr == nil {
+			path = fallback
+			err = nil
+		}
+	}
+	if err != nil {
+		return authStatus{
+			ID:        id,
+			Label:     label,
+			Connected: false,
+			Status:    "missing",
+			Detail:    command + " not found",
+		}
+	}
+	if len(args) == 0 {
+		return authStatus{
+			ID:        id,
+			Label:     label,
+			Connected: true,
+			Status:    "ready",
+			Detail:    path,
+		}
+	}
+
+	out, runErr := exec.Command(path, args...).CombinedOutput()
+	detail := compactDetail(string(out))
+	if detail == "" {
+		detail = path
+	}
+	if id == "github" && runErr == nil {
+		detail = "gh authenticated"
+	}
+	if runErr != nil {
+		return authStatus{
+			ID:        id,
+			Label:     label,
+			Connected: false,
+			Status:    "error",
+			Detail:    detail,
+		}
+	}
+	return authStatus{
+		ID:        id,
+		Label:     label,
+		Connected: true,
+		Status:    "ready",
+		Detail:    detail,
+	}
+}
+
+func compactDetail(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	for _, line := range strings.Split(value, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			if len([]rune(line)) > 180 {
+				return string([]rune(line)[:180]) + "..."
+			}
+			return line
+		}
+	}
+	return ""
+}
+
+func expandPath(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if value == "~" {
+		if homeDir, err := os.UserHomeDir(); err == nil {
+			return homeDir
+		}
+		return value
+	}
+	if strings.HasPrefix(value, "~/") {
+		if homeDir, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(homeDir, strings.TrimPrefix(value, "~/"))
+		}
+	}
+	return value
 }
 
 func estimateTokens(text string) int {

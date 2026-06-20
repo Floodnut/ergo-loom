@@ -1,7 +1,7 @@
 import { app, BrowserWindow, Menu, dialog, shell, type MenuItemConstructorOptions } from "electron";
-import { autoUpdater } from "electron-updater";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -12,6 +12,16 @@ let backend: ChildProcessWithoutNullStreams | null = null;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const require = createRequire(import.meta.url);
+const { autoUpdater } = require("electron-updater") as {
+  autoUpdater: {
+    autoDownload: boolean;
+    autoInstallOnAppQuit: boolean;
+    on: (event: string, listener: (...args: any[]) => void) => void;
+    checkForUpdatesAndNotify: () => Promise<unknown>;
+    quitAndInstall: (isSilent?: boolean, isForceRunAfter?: boolean) => void;
+  };
+};
 
 function appRoot(): string {
   if (app.isPackaged) {

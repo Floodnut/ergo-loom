@@ -1594,6 +1594,55 @@ h2 {
   overflow: auto;
 }
 
+.auth-status-list {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.auth-status-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  border-radius: 6px;
+  background: var(--soft);
+  padding: 8px 9px;
+}
+
+.auth-status-row strong,
+.auth-status-row span {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auth-status-row strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.auth-status-row span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.auth-status-row > span:last-child {
+  border-radius: 999px;
+  background: rgb(155 94 63 / 0.11);
+  color: var(--cedar);
+  font-weight: 700;
+  padding: 3px 7px;
+}
+
+.auth-status-row.connected > span:last-child {
+  background: rgb(71 104 93 / 0.12);
+  color: var(--moss);
+}
+
 .terminal-view,
 .branch-card,
 .file-viewer {
@@ -1614,9 +1663,46 @@ h2 {
   overflow: auto;
 }
 
+.terminal-meta-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 90px auto;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.terminal-meta-row input,
+.terminal-meta-row select,
+.terminal-meta-row button,
+.file-open-form select,
+.file-actions button {
+  min-width: 0;
+  border: 0;
+  border-radius: 6px;
+  background: var(--soft);
+  color: var(--text);
+  font-size: 11px;
+  padding: 7px 8px;
+}
+
+.terminal-meta-row button,
+.file-actions button {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.terminal-meta-row button:not(:disabled):hover,
+.file-actions button:hover {
+  background: var(--soft-hover);
+}
+
+.terminal-meta-row button:disabled {
+  cursor: default;
+  opacity: 0.48;
+}
+
 .file-open-form {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) 92px auto;
   gap: 6px;
   margin-bottom: 8px;
 }
@@ -1638,6 +1724,21 @@ h2 {
   cursor: pointer;
   font-weight: 700;
   padding: 0 12px;
+}
+
+.file-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  min-width: 0;
+}
+
+.file-actions .meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .terminal-line {
