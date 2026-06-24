@@ -3,6 +3,7 @@ if (new URLSearchParams(window.location.search).get("desktop") === "1" || (windo
 }
 
 let sessionPushSource: EventSource | null = null;
+let sessionPushSessionId: string | null = null;
 
 function installDesktopWindowChrome() {
   const bridge = (window as any).ergoLoom;
@@ -904,7 +905,6 @@ async function runChatInput(content, options: any = {}) {
     state.runningSessionId = "";
     renderSessions();
     setComposerBusy(false);
-    drainChatQueue();
   }
 }
 
@@ -1238,16 +1238,36 @@ function handleRunEvent(event: { type: string; payload: any }, ctx: ReturnType<t
     const co = event.payload.candidateOutput;
     appendActivityEvent("candidate", { candidateId: co.ID, text: "Parallel candidate ready" });
   }
-  if (event.type === "run_completed") {
-    selectSession(state.selectedSessionId, { resetActivity: false }).catch(() => {});
+  if (event.type === "queue_item_consumed") {
+    const consumedId = event.payload.queueItemId;
+    const idx = state.chatQueue.findIndex((item) => item.id === consumedId);
+    if (idx >= 0) state.chatQueue.splice(idx, 1);
+    renderChatQueue();
+  }
+  if (event.type === "run_completed" || event.type === "assistant_done") {
+    refreshSessionMessages().catch(() => {});
   }
 }
 
+async function refreshSessionMessages() {
+  const sessionId = state.selectedSessionId;
+  if (!sessionId) return;
+  const data = await request(`/api/sessions/${encodeURIComponent(sessionId)}`);
+  if (state.selectedSessionId !== sessionId) return; // session changed while fetching
+  state.contextUsage = data.context || null;
+  renderMessages(data.messages || [], data.events || []);
+  renderContextMeter();
+}
+
 function connectSessionPush(sessionId: string) {
+  if (sessionPushSessionId === sessionId && sessionPushSource && sessionPushSource.readyState !== EventSource.CLOSED) {
+    return; // already connected to this session
+  }
   if (sessionPushSource) {
     sessionPushSource.close();
     sessionPushSource = null;
   }
+  sessionPushSessionId = sessionId;
   if (!sessionId) return;
   const src = new EventSource(`/api/sessions/${encodeURIComponent(sessionId)}/push`);
   sessionPushSource = src;
@@ -1261,6 +1281,7 @@ function connectSessionPush(sessionId: string) {
   });
   src.onerror = () => {
     if (sessionPushSource === src) {
+      sessionPushSessionId = null;
       setTimeout(() => connectSessionPush(sessionId), 3000);
     }
   };

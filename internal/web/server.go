@@ -1747,6 +1747,7 @@ func (s *Server) executeMainRun(ctx context.Context, req RunRequest, onEvent fun
 	s.completeChatRun(chatRun.ID, core.ChatRunCompleted, outputEventID)
 	s.recordTokenUsage(sessionID, selection, assistantInput, assistantContent, "success")
 	onEvent("assistant_done", assistantMessage)
+	onEvent("run_completed", map[string]any{"sessionId": sessionID, "chatRunId": chatRun.ID})
 	s.maybeConsumeQueue(sessionID)
 	return nil
 }
@@ -1843,6 +1844,7 @@ func (s *Server) maybeConsumeQueue(sessionID string) {
 	if err != nil {
 		return
 	}
+	s.push.publish(sessionID, "queue_item_consumed", map[string]any{"queueItemId": item.ID, "mode": string(item.Mode)})
 	onEvent := func(kind string, payload any) {
 		s.push.publish(sessionID, kind, payload)
 	}
