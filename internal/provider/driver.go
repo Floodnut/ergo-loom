@@ -218,11 +218,11 @@ func (d ClaudeCLIDriver) Respond(ctx context.Context, request ChatRequest, onEve
 		if event.Kind == "" {
 			continue
 		}
-		if event.Kind == "delta" {
+		if event.Kind == EventKindDelta {
 			assistant.WriteString(event.Text)
 			streamed = true
 		}
-		if event.Kind == "final" {
+		if event.Kind == EventKindFinal {
 			assistant.Reset()
 			assistant.WriteString(event.Text)
 			continue
@@ -280,7 +280,7 @@ func (d CopilotBridgeDriver) Respond(ctx context.Context, request ChatRequest, o
 		return ChatResponse{}, driverError(ErrKindUnavailable, "Copilot bridge is not configured. Start an Ergo Loom Copilot bridge worker and set ERGO_COPILOT_BRIDGE_URL.")
 	}
 	bridgeURL := strings.TrimRight(strings.TrimSpace(firstNonEmpty(d.BridgeURL, os.Getenv("ERGO_COPILOT_BRIDGE_URL"))), "/")
-	onEvent(Event{Kind: "status", Text: "Sending request to Ergo Loom Copilot bridge"})
+	onEvent(Event{Kind: EventKindStatus, Text: "Sending request to Ergo Loom Copilot bridge"})
 	payload := map[string]string{
 		"provider":         request.ProviderPluginID,
 		"sessionId":        request.SessionID,
@@ -322,7 +322,7 @@ func (d CopilotBridgeDriver) Respond(ctx context.Context, request ChatRequest, o
 	if strings.TrimSpace(result.Text) == "" {
 		return ChatResponse{}, driverError(ErrKindTransient, "Copilot bridge returned an empty response")
 	}
-	onEvent(Event{Kind: "status", Text: "Received Copilot bridge response"})
+	onEvent(Event{Kind: EventKindStatus, Text: "Received Copilot bridge response"})
 	return ChatResponse{Text: result.Text, ExternalThreadID: result.ExternalThreadID, Streamed: false}, nil
 }
 
@@ -349,7 +349,7 @@ func (d CopilotBridgeDriver) Ping(ctx context.Context) error {
 func (d ClaudeCLIDriver) respondWithBrowserHandoff(ctx context.Context, request ChatRequest, onEvent func(Event)) (ChatResponse, error) {
 	bridgeURL := strings.TrimRight(strings.TrimSpace(os.Getenv("ERGO_LOOM_HANDOFF_BRIDGE_URL")), "/")
 	if bridgeURL == "" {
-		onEvent(Event{Kind: "status", Text: "Claude web handoff requires the Ergo Loom desktop browser worker"})
+		onEvent(Event{Kind: EventKindStatus, Text: "Claude web handoff requires the Ergo Loom desktop browser worker"})
 		text := strings.Join([]string{
 			"Claude Code CLI를 사용할 수 없는 상태라 Claude 무료/웹 계정 handoff 경로로 내려왔습니다.",
 			"",
@@ -359,7 +359,7 @@ func (d ClaudeCLIDriver) respondWithBrowserHandoff(ctx context.Context, request 
 		return ChatResponse{Text: text, Streamed: false}, nil
 	}
 
-	onEvent(Event{Kind: "status", Text: "Sending request to Ergo Loom Claude web worker"})
+	onEvent(Event{Kind: EventKindStatus, Text: "Sending request to Ergo Loom Claude web worker"})
 	payload := map[string]string{
 		"provider":         request.ProviderPluginID,
 		"sessionId":        request.SessionID,
@@ -403,7 +403,7 @@ func (d ClaudeCLIDriver) respondWithBrowserHandoff(ctx context.Context, request 
 	if strings.TrimSpace(result.Text) == "" {
 		return ChatResponse{}, driverError(ErrKindTransient, "Claude web handoff worker returned an empty response")
 	}
-	onEvent(Event{Kind: "status", Text: "Received Claude web response inside Ergo Loom"})
+	onEvent(Event{Kind: EventKindStatus, Text: "Received Claude web response inside Ergo Loom"})
 	return ChatResponse{
 		Text:             result.Text,
 		ExternalThreadID: firstNonEmpty(result.ExternalThreadID, request.ExternalThreadID),
@@ -479,7 +479,7 @@ func claudeStreamEvent(line []byte) Event {
 	subtype := firstString(message, "subtype")
 	if eventType == "system" {
 		if subtype == "init" {
-			return Event{Kind: "status", Text: "Attached Claude CLI session"}
+			return Event{Kind: EventKindStatus, Text: "Attached Claude CLI session"}
 		}
 		return Event{}
 	}
@@ -502,17 +502,17 @@ func claudeStreamEvent(line []byte) Event {
 	switch eventType {
 	case "assistant", "result":
 		if text != "" {
-			return Event{Kind: "final", Text: text}
+			return Event{Kind: EventKindFinal, Text: text}
 		}
 	case "content_block_delta", "message_delta", "partial":
 		if text != "" {
-			return Event{Kind: "delta", Text: text}
+			return Event{Kind: EventKindDelta, Text: text}
 		}
 	case "system", "user":
 		return Event{}
 	}
 	if text != "" {
-		return Event{Kind: "delta", Text: text}
+		return Event{Kind: EventKindDelta, Text: text}
 	}
 	return Event{}
 }
@@ -525,7 +525,7 @@ func claudeToolEvent(message map[string]any) Event {
 		case "tool_use":
 			name := firstNonEmpty(firstString(block, "name"), "tool")
 			return Event{
-				Kind: "tool_start",
+				Kind: EventKindToolStart,
 				Tool: &toolruntime.Event{
 					Type:         "claude_tool",
 					ToolID:       firstNonEmpty(firstString(block, "id"), name),
@@ -540,7 +540,7 @@ func claudeToolEvent(message map[string]any) Event {
 		case "tool_result":
 			toolID := firstString(block, "tool_use_id")
 			return Event{
-				Kind: "tool_result",
+				Kind: EventKindToolResult,
 				Tool: &toolruntime.Event{
 					Type:         "claude_tool",
 					ToolID:       firstNonEmpty(toolID, "tool"),
@@ -554,7 +554,7 @@ func claudeToolEvent(message map[string]any) Event {
 		}
 	}
 	if eventType == "error" {
-		return Event{Kind: "tool_error", Text: firstNonEmpty(firstString(message, "error.message", "message"), "Claude CLI stream error")}
+		return Event{Kind: EventKindToolError, Text: firstNonEmpty(firstString(message, "error.message", "message"), "Claude CLI stream error")}
 	}
 	return Event{}
 }

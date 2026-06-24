@@ -775,6 +775,217 @@ re-enters the same execution core.
 - Implement failover using `resolveChatSelectionExcluding` and the shared run core
 - Confirm `queue_items.thinking_effort` column exists — done
 
+## Provider Streaming Contract
+
+### EventKind Constants
+
+`provider.Event.Kind` must use the constants below. Raw string literals are
+not allowed in driver or server code.
+
+```go
+// internal/provider/event.go
+
+type EventKind string
+
+const (
+    // Sent by any driver. Server must handle both.
+    EventKindDelta  EventKind = "delta"   // streaming text chunk
+    EventKindStatus EventKind = "status"  // progress message shown in UI
+
+    // Sent by ClaudeCLIDriver. Other drivers may add support later.
+    EventKindToolStart       EventKind = "tool_start"
+    EventKindToolResult      EventKind = "tool_result"
+    EventKindToolError       EventKind = "tool_error"
+    EventKindApprovalRequest EventKind = "approval_request"
+    EventKindTurnAborted     EventKind = "turn_aborted"
+
+    // Driver-internal only. Must not be passed to the onEvent callback.
+    EventKindFinal EventKind = "final"
+)
+```
+
+`Event.Kind` field type changes from `string` to `EventKind`. Callers use
+`event.Kind == provider.EventKindDelta`, not `event.Kind == "delta"`.
+
+### Driver Obligations
+
+| Driver | Required | Optional |
+|---|---|---|
+| `ClaudeCLIDriver` | `delta` or `status` | tool_*, approval_request, turn_aborted |
+| `CopilotBridgeDriver` | `status` (start + done) | `delta` when streaming is supported |
+| `CodexAppServerDriver` | `status` (start + done) | `delta` when Codex runner emits it |
+| `UnavailableDriver` | none | — |
+
+If a driver produces no `delta` events, it must set `ChatResponse.Streamed =
+false`. The server then calls `streamTextChunks` to simulate streaming from the
+final text.
+
+`EventKindFinal` is produced by `ClaudeCLIDriver` internally to collect the
+full text before returning. It must not be forwarded to `onEvent`. Drivers
+that accumulate text internally should follow the same pattern.
+
+### Server Receive Contract
+
+The `onEvent` handler inside `executeMainRun` must handle all public kinds and
+include a `default` case:
+
+```go
+switch event.Kind {
+case provider.EventKindDelta:
+    onEvent("assistant_delta", map[string]string{"text": event.Text})
+case provider.EventKindStatus:
+    payload := map[string]string{"text": event.Text}
+    onEvent("assistant_status", payload)
+    s.recordMessageEvent(...)
+case provider.EventKindToolStart,
+     provider.EventKindToolResult,
+     provider.EventKindApprovalRequest,
+     provider.EventKindToolError,
+     provider.EventKindTurnAborted:
+    payload := toolEventPayloadForSession(sessionID, event)
+    onEvent(string(event.Kind), payload)
+    s.recordProviderToolEvent(...)
+default:
+    // unknown kind: log and ignore; do not error
+}
+```
+
+The `default` case is mandatory. A new driver adding a new kind must not
+crash the server.
+
+### Implementation Checklist
+
+- Create `internal/provider/event.go` with `EventKind` type and constants
+- Change `Event.Kind` from `string` to `EventKind`
+- Replace all `event.Kind == "..."` comparisons with `EventKind` constants
+- Add `default` case to `onEvent` handler in `executeMainRun`
+- Ensure `EventKindFinal` is never passed to `onEvent` in `ClaudeCLIDriver`
+
+## Context Packet Budget Allocation
+
+`SegmentChainPolicy` assembles four sections: system lines, summaries,
+conversation context, and knowledge. Without per-section caps, a long summary
+or knowledge block can consume most of the budget and cause `trimPacket` to
+silently drop earlier sections from the front.
+
+### Section Budget Ratios
+
+```
+total budget B
+├── system lines     ~300 chars fixed; always included, not trimmed
+├── summary          cap B × 0.25  — most-recent summary only if multiple
+├── knowledge        cap B × 0.10  — title-only lines stay small
+├── user input       cap B × 0.15  — never truncated
+└── conversation ctx remainder = B − system(300) − summary − knowledge − user
+```
+
+Ratios as constants in `packetpolicy/policy.go`:
+
+```go
+const (
+    summaryBudgetRatio   = 0.25
+    knowledgeBudgetRatio = 0.10
+    userInputBudgetRatio = 0.15
+    systemLinesBudget    = 300
+)
+```
+
+### Trim Order (highest priority last, preserved longest)
+
+```
+trimmed first  →  conversation context (oldest messages drop first)
+               →  summary (capped, not trimmed mid-text; drop oldest summaries)
+               →  knowledge (capped)
+never trimmed  →  system lines, user input
+```
+
+`trimPacket` still applies as a final hard cap on the assembled string.
+Per-section caps prevent any single section from crowding out others before
+that final trim.
+
+### FlatTrimPolicy
+
+`FlatTrimPolicy` is a fixed-budget baseline. It does not use section ratios
+and must not be changed to do so — it exists to have predictable, stable
+behaviour for comparison and fallback.
+
+### Implementation Checklist
+
+- Add ratio constants to `packetpolicy/policy.go`
+- In `SegmentChainPolicy.Build`: compute per-section budgets from ratios
+- Apply `trimLines(summaryLines, summaryBudget)` before appending
+- Apply `trimLines(kbLines, knowledgeBudget)` inside `knowledgeSection`
+- Compute `ctxBudget = budget - systemLinesBudget - summaryBudget - knowledgeBudget - userBudget`
+  and pass to `trimLines(contextLines, ctxBudget)`
+
+## Chained Failover
+
+The current `executeMainRun` attempts failover once. If the second route also
+fails, the error is returned immediately. With three or more enabled routes,
+only the first two are ever tried.
+
+### Design
+
+Extract retry logic into `executeMainRunWithFailover`. `executeMainRun`
+becomes a single-attempt function with no retry awareness.
+
+```go
+func (s Server) executeMainRunWithFailover(
+    ctx context.Context,
+    req RunRequest,
+    onEvent func(string, any),
+) error {
+    const maxAttempts = 3
+    excluded := map[string]bool{}
+
+    for attempt := range maxAttempts {
+        sel, err := s.resolveChatSelectionWithExclusions(
+            req.SessionID, req.Selection.Route.ID, req.Selection.Model.ID, excluded,
+        )
+        if err != nil {
+            return err // no routes left
+        }
+        req.Selection = sel
+
+        err = s.executeMainRun(ctx, req, onEvent)
+        if err == nil {
+            return nil
+        }
+
+        reason := segmentEndReason(err)
+        decision := s.moderationDecision(req.SessionID, core.ProviderSegment{}, reason)
+        if decision.Action != core.ActionFailover {
+            return err // suspend / terminate — stop immediately
+        }
+
+        excluded[sel.Route.ID] = true
+        if attempt < maxAttempts-1 {
+            onEvent("assistant_status", map[string]string{
+                "text": "Route " + sel.Route.DisplayName + " failed, trying next...",
+            })
+        }
+    }
+    return fmt.Errorf("all %d routes failed", maxAttempts)
+}
+```
+
+### Invariants
+
+- `maxAttempts = 3` is a hard cap. Do not make it configurable yet.
+- Each failed route is added to `excluded` before the next attempt.
+- Only `ActionFailover` continues the loop. Any other decision exits immediately.
+- `executeMainRun` must not contain its own retry loop after this refactor.
+- `streamSessionMessage` calls `executeMainRunWithFailover`, not `executeMainRun`.
+
+### Implementation Checklist
+
+- Add `executeMainRunWithFailover` to `server.go`
+- Remove the inline failover block from `executeMainRun`
+- Replace `executeMainRun` call in `streamSessionMessage` with
+  `executeMainRunWithFailover`
+- `maybeConsumeQueue` continues to call `executeMainRun` directly (single
+  attempt; queue items retry on the next queue drain cycle)
+
 ## Team Rule
 
 When adding a new plugin or policy, first answer:

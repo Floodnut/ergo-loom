@@ -1407,17 +1407,19 @@ func (s Server) executeMainRun(ctx context.Context, req RunRequest, onEvent func
 	}
 	onAssistantEvent := func(event provider.Event) {
 		switch event.Kind {
-		case "delta":
+		case provider.EventKindDelta:
 			onEvent("assistant_delta", map[string]string{"text": event.Text})
-		case "status":
+		case provider.EventKindStatus:
 			payload := map[string]string{"text": event.Text}
 			onEvent("assistant_status", payload)
 			s.recordMessageEvent(sessionID, assistantActivityIndex, "status", payload)
-		case "tool_start", "tool_result", "approval_request", "tool_error", "turn_aborted":
+		case provider.EventKindToolStart, provider.EventKindToolResult, provider.EventKindApprovalRequest, provider.EventKindToolError, provider.EventKindTurnAborted:
 			payload := toolEventPayloadForSession(sessionID, event)
-			onEvent(event.Kind, payload)
+			onEvent(string(event.Kind), payload)
 			messageEvent := s.recordMessageEvent(sessionID, assistantActivityIndex, streamEventKindToActivityKind(event.Kind), payload)
 			s.recordProviderToolEvent(sessionID, event, messageEvent.ID)
+		default:
+			return
 		}
 	}
 
@@ -1629,18 +1631,18 @@ func streamTextChunks(ctx context.Context, w http.ResponseWriter, flusher http.F
 	}
 }
 
-func streamEventKindToActivityKind(kind string) string {
+func streamEventKindToActivityKind(kind provider.EventKind) string {
 	switch kind {
-	case "tool_start":
+	case provider.EventKindToolStart:
 		return "tool"
-	case "tool_result":
+	case provider.EventKindToolResult:
 		return "result"
-	case "approval_request":
+	case provider.EventKindApprovalRequest:
 		return "approval"
-	case "tool_error", "turn_aborted":
+	case provider.EventKindToolError, provider.EventKindTurnAborted:
 		return "error"
 	default:
-		return kind
+		return string(kind)
 	}
 }
 
@@ -1680,7 +1682,7 @@ func (s Server) recordProviderToolEvent(sessionID string, event provider.Event, 
 	if !ok {
 		return
 	}
-	payloadRef := "provider_event:" + event.Kind
+	payloadRef := "provider_event:" + string(event.Kind)
 	if strings.TrimSpace(messageEventID) != "" {
 		payloadRef = "message_event:" + messageEventID
 	}
@@ -1776,15 +1778,15 @@ func (s Server) latestUserTriggerEventID(sessionID string) string {
 	return ""
 }
 
-func contextEventTypeForProviderEvent(kind string) (core.EventType, bool) {
+func contextEventTypeForProviderEvent(kind provider.EventKind) (core.EventType, bool) {
 	switch kind {
-	case "tool_start", "approval_request":
+	case provider.EventKindToolStart, provider.EventKindApprovalRequest:
 		return core.EventToolRequested, true
-	case "tool_result":
+	case provider.EventKindToolResult:
 		return core.EventToolCompleted, true
-	case "tool_error":
+	case provider.EventKindToolError:
 		return core.EventToolFailed, true
-	case "turn_aborted":
+	case provider.EventKindTurnAborted:
 		return core.EventTurnAborted, true
 	default:
 		return "", false

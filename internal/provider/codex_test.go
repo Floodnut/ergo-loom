@@ -31,7 +31,7 @@ printf '{"payload":{"text":"world"}}\n'
 		WorkDir: dir,
 	}
 	response, err := runner.Respond(context.Background(), "Say hello", func(event Event) {
-		if event.Kind == "delta" {
+		if event.Kind == EventKindDelta {
 			streamed.WriteString(event.Text)
 		}
 	})
@@ -66,7 +66,7 @@ printf '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","t
 		WorkDir: dir,
 	}
 	response, err := runner.Respond(context.Background(), "Say hello", func(event Event) {
-		if event.Kind == "delta" {
+		if event.Kind == EventKindDelta {
 			streamed.WriteString(event.Text)
 		}
 	})
@@ -88,7 +88,7 @@ func TestAppServerEventParsesAgentMessageDelta(t *testing.T) {
 			"delta": "hello",
 		},
 	})
-	if event.Kind != "delta" || event.Text != "hello" {
+	if event.Kind != EventKindDelta || event.Text != "hello" {
 		t.Fatalf("event = %#v, want delta hello", event)
 	}
 }
@@ -100,7 +100,7 @@ func TestAppServerEventDoesNotExposeReasoningText(t *testing.T) {
 			"item": map[string]any{"type": "reasoning"},
 		},
 	})
-	if event.Kind != "status" || event.Text != "Started reasoning summary" {
+	if event.Kind != EventKindStatus || event.Text != "Started reasoning summary" {
 		t.Fatalf("event = %#v, want reasoning summary status", event)
 	}
 }
@@ -115,7 +115,7 @@ func TestAppServerEventParsesCommandToolLifecycle(t *testing.T) {
 			},
 		},
 	})
-	if started.Kind != "tool_start" || started.Tool == nil || started.Tool.ToolName != "command" || started.Tool.Command != "curl www.example.com" {
+	if started.Kind != EventKindToolStart || started.Tool == nil || started.Tool.ToolName != "command" || started.Tool.Command != "curl www.example.com" {
 		t.Fatalf("started = %#v, want command tool_start", started)
 	}
 
@@ -128,7 +128,7 @@ func TestAppServerEventParsesCommandToolLifecycle(t *testing.T) {
 			},
 		},
 	})
-	if completed.Kind != "tool_result" || completed.Tool == nil || completed.Tool.Text != "<html>example</html>" {
+	if completed.Kind != EventKindToolResult || completed.Tool == nil || completed.Tool.Text != "<html>example</html>" {
 		t.Fatalf("completed = %#v, want command tool_result", completed)
 	}
 }
@@ -142,7 +142,7 @@ func TestAppServerEventParsesApprovalRequest(t *testing.T) {
 			"reason":  "Network command requested",
 		},
 	})
-	if event.Kind != "approval_request" || event.Tool == nil || event.Tool.ApprovalID != "approval_1" || event.Tool.Command != "curl www.example.com" {
+	if event.Kind != EventKindApprovalRequest || event.Tool == nil || event.Tool.ApprovalID != "approval_1" || event.Tool.Command != "curl www.example.com" {
 		t.Fatalf("event = %#v, want approval_request", event)
 	}
 }
@@ -181,7 +181,7 @@ func TestCodexAppServerRunnerHandlesCommandApprovalRequest(t *testing.T) {
 	if sent["id"] != float64(7) || result["decision"] != "accept" {
 		t.Fatalf("sent = %#v, want accept response", sent)
 	}
-	if emitted.Kind != "approval_request" || emitted.Tool == nil || emitted.Tool.Command != "curl www.example.com" || emitted.Tool.Status != "pending" {
+	if emitted.Kind != EventKindApprovalRequest || emitted.Tool == nil || emitted.Tool.Command != "curl www.example.com" || emitted.Tool.Status != "pending" {
 		t.Fatalf("emitted = %#v, want pending approval event", emitted)
 	}
 }
@@ -193,7 +193,7 @@ func TestAppServerEventParsesTurnAbortAndError(t *testing.T) {
 			"reason": "stopped after 0s",
 		},
 	})
-	if aborted.Kind != "turn_aborted" || aborted.Tool == nil || aborted.Tool.Text != "stopped after 0s" {
+	if aborted.Kind != EventKindTurnAborted || aborted.Tool == nil || aborted.Tool.Text != "stopped after 0s" {
 		t.Fatalf("aborted = %#v, want aborted event", aborted)
 	}
 
@@ -202,7 +202,7 @@ func TestAppServerEventParsesTurnAbortAndError(t *testing.T) {
 			"message": "network approval denied",
 		},
 	})
-	if failed.Kind != "tool_error" || failed.Tool == nil || failed.Tool.Text != "network approval denied" {
+	if failed.Kind != EventKindToolError || failed.Tool == nil || failed.Tool.Text != "network approval denied" {
 		t.Fatalf("failed = %#v, want provider error", failed)
 	}
 }

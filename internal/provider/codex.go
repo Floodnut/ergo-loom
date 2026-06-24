@@ -16,12 +16,6 @@ import (
 	"github.com/Floodnut/ergo-loom/internal/toolruntime"
 )
 
-type Event struct {
-	Kind string
-	Text string
-	Tool *toolruntime.Event
-}
-
 type Runner interface {
 	Respond(ctx context.Context, prompt string, onEvent func(Event)) (string, error)
 }
@@ -78,7 +72,7 @@ func (r CodexRunner) Respond(ctx context.Context, prompt string, onEvent func(Ev
 		}
 		if event.Delta {
 			assistant.WriteString(event.Text)
-			onEvent(Event{Kind: "delta", Text: event.Text})
+			onEvent(Event{Kind: EventKindDelta, Text: event.Text})
 			continue
 		}
 		assistant.Reset()
@@ -276,7 +270,7 @@ func (r CodexAppServerRunner) RespondInThread(ctx context.Context, threadID stri
 			if currentThreadID == "" {
 				return CodexAppServerResponse{}, fmt.Errorf("codex app-server %s returned no thread id: %s", threadMethod, scanner.Text())
 			}
-			onEvent(Event{Kind: "status", Text: "Attached Codex thread"})
+			onEvent(Event{Kind: EventKindStatus, Text: "Attached Codex thread"})
 			turnParams := map[string]any{
 				"method": "turn/start",
 				"id":     2,
@@ -308,26 +302,26 @@ func (r CodexAppServerRunner) RespondInThread(ctx context.Context, threadID stri
 			continue
 		}
 		switch event.Kind {
-		case "delta":
+		case EventKindDelta:
 			assistant.WriteString(event.Text)
 			streamed = true
 			onEvent(event)
-		case "final":
+		case EventKindFinal:
 			assistant.Reset()
 			assistant.WriteString(event.Text)
-		case "done":
+		case eventKindDone:
 			if event.Text != "" {
-				onEvent(Event{Kind: "status", Text: event.Text})
+				onEvent(Event{Kind: EventKindStatus, Text: event.Text})
 			}
 			final := strings.TrimSpace(assistant.String())
 			if final == "" {
 				return CodexAppServerResponse{}, errors.New("codex app-server returned an empty response")
 			}
 			return CodexAppServerResponse{Text: final, ThreadID: currentThreadID, Streamed: streamed}, nil
-		case string(toolruntime.EventToolError):
+		case EventKind(toolruntime.EventToolError):
 			onEvent(event)
 			return CodexAppServerResponse{ThreadID: currentThreadID, Streamed: streamed}, errors.New(firstNonEmpty(event.Text, "codex app-server error"))
-		case string(toolruntime.EventTurnAborted):
+		case EventKind(toolruntime.EventTurnAborted):
 			onEvent(event)
 			return CodexAppServerResponse{ThreadID: currentThreadID, Streamed: streamed}, errors.New(firstNonEmpty(event.Text, "codex turn aborted"))
 		default:
@@ -381,7 +375,7 @@ func (r CodexAppServerRunner) handleServerRequest(ctx context.Context, message m
 			Status:     "pending",
 			Payload:    params,
 		}
-		onEvent(Event{Kind: string(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent})
+		onEvent(Event{Kind: EventKind(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent})
 		decision := "decline"
 		if r.ApprovalHandler != nil {
 			result, err := r.ApprovalHandler(ctx, toolEvent)
@@ -406,7 +400,7 @@ func (r CodexAppServerRunner) handleServerRequest(ctx context.Context, message m
 			Status:     "declined",
 			Payload:    params,
 		}
-		onEvent(Event{Kind: string(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent})
+		onEvent(Event{Kind: EventKind(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent})
 		select {
 		case <-ctx.Done():
 			return true, ctx.Err()
@@ -512,14 +506,14 @@ func appServerEvent(message map[string]any) Event {
 			Status:   "error",
 			Payload:  message,
 		}
-		return Event{Kind: string(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
+		return Event{Kind: EventKind(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
 	}
 
 	method, _ := message["method"].(string)
 	params, _ := message["params"].(map[string]any)
 	switch method {
 	case "turn/started":
-		return Event{Kind: "status", Text: "Thinking..."}
+		return Event{Kind: EventKindStatus, Text: "Thinking..."}
 	case "turn/aborted", "turn/cancelled", "turn/canceled":
 		toolEvent := toolruntime.Event{
 			Type:     toolruntime.EventTurnAborted,
@@ -529,7 +523,7 @@ func appServerEvent(message map[string]any) Event {
 			Status:   "aborted",
 			Payload:  params,
 		}
-		return Event{Kind: string(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
+		return Event{Kind: EventKind(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
 	case "turn/failed", "turn/error":
 		toolEvent := toolruntime.Event{
 			Type:     toolruntime.EventToolError,
@@ -539,7 +533,7 @@ func appServerEvent(message map[string]any) Event {
 			Status:   "error",
 			Payload:  params,
 		}
-		return Event{Kind: string(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
+		return Event{Kind: EventKind(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
 	case "exec/approval/requested", "approval/requested", "tool/approval/requested":
 		toolEvent := toolruntime.Event{
 			Type:       toolruntime.EventApprovalRequest,
@@ -551,7 +545,7 @@ func appServerEvent(message map[string]any) Event {
 			Status:     "pending",
 			Payload:    params,
 		}
-		return Event{Kind: string(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
+		return Event{Kind: EventKind(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
 	case "exec/started", "command/started", "tool/started", "item/commandExecution/started":
 		toolName := firstNonEmpty(firstString(params, "toolName", "tool.name", "item.toolName"), toolNameFromMethod(method))
 		toolEvent := toolruntime.Event{
@@ -563,7 +557,7 @@ func appServerEvent(message map[string]any) Event {
 			Status:   "running",
 			Payload:  params,
 		}
-		return Event{Kind: string(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
+		return Event{Kind: EventKind(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
 	case "exec/completed", "command/completed", "tool/completed", "item/commandExecution/completed":
 		toolName := firstNonEmpty(firstString(params, "toolName", "tool.name", "item.toolName"), toolNameFromMethod(method))
 		toolEvent := toolruntime.Event{
@@ -575,11 +569,11 @@ func appServerEvent(message map[string]any) Event {
 			Status:   "completed",
 			Payload:  params,
 		}
-		return Event{Kind: string(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
+		return Event{Kind: EventKind(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
 	case "item/started":
 		itemType := firstString(params, "item.type")
 		if itemType == "" {
-			return Event{Kind: "status", Text: "Working..."}
+			return Event{Kind: EventKindStatus, Text: "Working..."}
 		}
 		if itemType == "command" || itemType == "toolCall" || itemType == "commandExecution" {
 			toolName := firstNonEmpty(firstString(params, "item.toolName", "item.name"), itemType)
@@ -592,7 +586,7 @@ func appServerEvent(message map[string]any) Event {
 				Status:   "running",
 				Payload:  params,
 			}
-			return Event{Kind: string(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
+			return Event{Kind: EventKind(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
 		}
 		if itemType == "approval" {
 			toolEvent := toolruntime.Event{
@@ -605,15 +599,15 @@ func appServerEvent(message map[string]any) Event {
 				Status:     "pending",
 				Payload:    params,
 			}
-			return Event{Kind: string(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
+			return Event{Kind: EventKind(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
 		}
-		return Event{Kind: "status", Text: activityLabel("started", itemType)}
+		return Event{Kind: EventKindStatus, Text: activityLabel("started", itemType)}
 	case "item/agentMessage/delta":
 		text := firstString(params, "delta", "text", "content")
 		if text == "" {
 			return Event{}
 		}
-		return Event{Kind: "delta", Text: text}
+		return Event{Kind: EventKindDelta, Text: text}
 	case "item/completed":
 		itemType := firstString(params, "item.type")
 		if itemType == "agent_message" {
@@ -621,7 +615,7 @@ func appServerEvent(message map[string]any) Event {
 			if text == "" {
 				return Event{}
 			}
-			return Event{Kind: "final", Text: text}
+			return Event{Kind: EventKindFinal, Text: text}
 		}
 		if itemType == "command" || itemType == "toolCall" || itemType == "commandExecution" {
 			toolName := firstNonEmpty(firstString(params, "item.toolName", "item.name"), itemType)
@@ -634,12 +628,12 @@ func appServerEvent(message map[string]any) Event {
 				Status:   "completed",
 				Payload:  params,
 			}
-			return Event{Kind: string(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
+			return Event{Kind: EventKind(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
 		}
 		if itemType == "" {
 			return Event{}
 		}
-		return Event{Kind: "status", Text: activityLabel("completed", itemType)}
+		return Event{Kind: EventKindStatus, Text: activityLabel("completed", itemType)}
 	case "item/commandExecution/outputDelta", "command/exec/outputDelta":
 		toolEvent := toolruntime.Event{
 			Type:     toolruntime.EventToolResult,
@@ -649,9 +643,9 @@ func appServerEvent(message map[string]any) Event {
 			Status:   "running",
 			Payload:  params,
 		}
-		return Event{Kind: string(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
+		return Event{Kind: EventKind(toolEvent.Type), Text: toolEvent.Text, Tool: &toolEvent}
 	case "turn/completed":
-		return Event{Kind: "done", Text: "Turn completed"}
+		return Event{Kind: eventKindDone, Text: "Turn completed"}
 	default:
 		return Event{}
 	}
