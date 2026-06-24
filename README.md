@@ -12,13 +12,16 @@ Ergo Loom is designed for people who use more than one AI tool, more than one ac
 
 ## What Ergo Loom Does
 
-- Organizes chats under local projects
+- Organizes chats under local projects with per-project behavior policies
 - Keeps project context and local paths attached to chats
 - Lets you choose which AI providers are available for a project
 - Supports provider/model routing for tools such as Codex/ChatGPT, Claude, VS Code Copilot, Gemini, and local models
-- Tracks local provider usage and account labels
+- Routes messages through a queue when a response is in progress — messages run in order automatically
+- Supports steering: a message sent mid-response interrupts the current reply and redirects it
+- Supports parallel runs: a request sent to a different provider simultaneously, returned as a candidate output to accept or discard
+- Tracks local provider usage and account labels, including budget warnings before token limits are reached
 - Shows tool activity, approvals, terminal activity, and file context beside the chat
-- Supports moderator provider selection for multi-provider chats
+- Supports moderator provider selection and automatic failover when a provider route is exhausted
 - Stores local data outside the app bundle so updates do not erase your workspace
 
 Ergo Loom focuses on local-first usage. API-billed routes are not the default installation path.
@@ -125,6 +128,26 @@ That means app updates should replace the app itself while keeping:
 - local workspace metadata
 
 Back up `~/.ergo-loom` if you want to preserve your workspace manually.
+
+## Project Policies
+
+Each project can configure behavior policies for tool approval and knowledge base scope.
+
+Policies are chosen from the registered plugin list and apply to all sessions under the project. The available options are shown in the Project Policies panel inside the app.
+
+- **Tool approval**: controls when tool calls require explicit user approval (`safe-only`, `ask-per-command`, `allow-all`)
+- **Knowledge base scope**: controls which knowledge items are included in context (`project-only`, `project-and-global`, `disabled`)
+
+## For Developers
+
+See [docs/architecture.md](docs/architecture.md) for an overview of the system architecture, data flow, and repository layout.
+
+Additional design documents:
+
+- [docs/context-graph.md](docs/context-graph.md) — context graph model and event types
+- [docs/plugin-policy-contract.md](docs/plugin-policy-contract.md) — plugin registry and policy contracts
+- [docs/project-settings.md](docs/project-settings.md) — project settings API
+- [docs/realtime-protocol.md](docs/realtime-protocol.md) — SSE streaming protocol
 
 ## License
 
