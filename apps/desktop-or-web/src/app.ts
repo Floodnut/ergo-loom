@@ -778,6 +778,10 @@ async function selectSession(sessionId, options: { resetActivity?: boolean } = {
   state.contextUsage = data.context || null;
   state.providerChats = data.providerChats || [];
   state.selectedProviderIds = Array.isArray(data.providerGroupIds) ? data.providerGroupIds : [];
+  // Restore session-specific active model (server-persisted, falls back to localStorage).
+  if (data.session?.ActiveModelID) {
+    state.selectedModelId = data.session.ActiveModelID;
+  }
   saveSelectedProviderIDs(state.selectedProviderIds);
   // Sync queue from server: replace items for this session with server items
   const otherSessionItems = state.chatQueue.filter((item) => item.sessionId !== sessionId);
@@ -3093,6 +3097,12 @@ function selectModel(modelID) {
   renderActiveRouteSummary();
   closeModelMenu();
   renderModelMenu(modelOptions());
+  if (state.selectedSessionId && selected) {
+    request(`/api/sessions/${encodeURIComponent(state.selectedSessionId)}/route`, {
+      method: "PATCH",
+      body: JSON.stringify({ routeId: selected.routeId, modelId: selected.model.ID }),
+    }).catch(() => {});
+  }
 }
 
 function modelDisplayName(model) {

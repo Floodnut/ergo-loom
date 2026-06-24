@@ -17,18 +17,22 @@ import (
 	webapp "github.com/Floodnut/ergo-loom/apps/desktop-or-web"
 	"github.com/Floodnut/ergo-loom/internal/chatfilter"
 	"github.com/Floodnut/ergo-loom/internal/core"
+	"github.com/Floodnut/ergo-loom/internal/handoffpolicy"
 	"github.com/Floodnut/ergo-loom/internal/packetpolicy"
 	"github.com/Floodnut/ergo-loom/internal/provider"
+	"github.com/Floodnut/ergo-loom/internal/routepolicy"
 	"github.com/Floodnut/ergo-loom/internal/storage/sqlitecli"
 	"github.com/Floodnut/ergo-loom/internal/toolruntime"
 )
 
 type Server struct {
-	store         sqlitecli.Store
-	approvals     *approvalBroker
-	filters       chatfilter.Chain
-	drivers       provider.DriverRegistry
-	packetPolicies packetpolicy.Registry
+	store           sqlitecli.Store
+	approvals       *approvalBroker
+	filters         chatfilter.Chain
+	drivers         provider.DriverRegistry
+	packetPolicies  packetpolicy.Registry
+	handoffPolicies handoffpolicy.Registry
+	routePolicies   routepolicy.Registry
 }
 
 const providerSoftTokenCap = 50000
@@ -139,10 +143,12 @@ func (b *approvalBroker) resolve(id string, decision string) bool {
 
 func NewServer(store sqlitecli.Store) Server {
 	return Server{
-		store:          store,
-		approvals:      newApprovalBroker(),
-		filters:        chatfilter.NewChain(chatfilter.IdentityFilter{}),
-		packetPolicies: packetpolicy.NewRegistry(),
+		store:           store,
+		approvals:       newApprovalBroker(),
+		filters:         chatfilter.NewChain(chatfilter.IdentityFilter{}),
+		packetPolicies:  packetpolicy.NewRegistry(),
+		handoffPolicies: handoffpolicy.NewRegistry(),
+		routePolicies:   routepolicy.NewRegistry(),
 		drivers: provider.NewDriverRegistry(
 			provider.CodexAppServerDriver{},
 			provider.UnavailableDriver{ProviderID: "openai", Reason: "ChatGPT handoff driver is not implemented yet"},
@@ -157,6 +163,7 @@ func NewServer(store sqlitecli.Store) Server {
 func (s Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", s.state)
+	mux.HandleFunc("GET /api/plugins", s.plugins)
 	mux.HandleFunc("GET /api/auth/status", s.authStatus)
 	mux.HandleFunc("POST /api/projects", s.createProject)
 	mux.HandleFunc("PATCH /api/projects/", s.renameProject)
@@ -165,11 +172,13 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/provider-profiles/connect", s.connectProviderProfile)
 	mux.HandleFunc("GET /api/sessions/search", s.searchSessions)
 	mux.HandleFunc("PATCH /api/sessions/{sessionID}/providers", s.updateSessionProviders)
+	mux.HandleFunc("PATCH /api/sessions/{sessionID}/route", s.setSessionActiveRoute)
 	mux.HandleFunc("POST /api/sessions/{sessionID}/steering", s.recordSteering)
 	mux.HandleFunc("GET /api/sessions/{sessionID}/queue", s.sessionQueue)
 	mux.HandleFunc("POST /api/sessions/{sessionID}/queue", s.sessionQueue)
 	mux.HandleFunc("PATCH /api/sessions/{sessionID}/queue", s.sessionQueue)
 	mux.HandleFunc("POST /api/sessions/{sessionID}/parallel", s.startParallelRun)
+	mux.HandleFunc("PATCH /api/candidates/{candidateID}", s.updateCandidateOutput)
 	mux.HandleFunc("GET /api/sessions/", s.session)
 	mux.HandleFunc("PATCH /api/sessions/", s.renameSession)
 	mux.HandleFunc("DELETE /api/sessions/", s.deleteSession)
@@ -186,6 +195,53 @@ func (s Server) Handler() http.Handler {
 	}
 	mux.Handle("GET /", http.FileServer(http.FS(staticFiles)))
 	return mux
+}
+
+func (s Server) plugins(w http.ResponseWriter, r *http.Request) {
+	providers, err := s.store.ListProviderPlugins()
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	agents, err := s.store.ListAgentPlugins()
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	capabilities, err := s.store.ListCapabilities()
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	tools, err := s.store.ListTools()
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	routes, err := s.store.ListAccessRoutes()
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	models, err := s.store.ListProviderModels()
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, map[string]any{
+		"providers":    providers,
+		"agents":       agents,
+		"capabilities": capabilities,
+		"tools":        tools,
+		"routes":       routes,
+		"models":       models,
+		"policies": map[string]any{
+			"contextPackets": s.packetPolicies.List(),
+			"handoffs":       s.handoffPolicies.List(),
+			"routeSelection": s.routePolicies.List(),
+		},
+	})
 }
 
 func (s Server) state(w http.ResponseWriter, r *http.Request) {
@@ -372,6 +428,35 @@ func (s Server) renameSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"session": session})
+}
+
+func (s Server) setSessionActiveRoute(w http.ResponseWriter, r *http.Request) {
+	sessionID := strings.TrimSpace(r.PathValue("sessionID"))
+	if sessionID == "" {
+		writeError(w, errors.New("session id is required"), http.StatusBadRequest)
+		return
+	}
+	var input struct {
+		RouteID string `json:"routeId"`
+		ModelID string `json:"modelId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	if err := s.store.SetSessionActiveRoute(sessionID, input.RouteID, input.ModelID); err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	session, _, err := s.store.GetSession(sessionID)
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"activeRouteId": session.ActiveRouteID,
+		"activeModelId": session.ActiveModelID,
+	})
 }
 
 func (s Server) updateSessionProviders(w http.ResponseWriter, r *http.Request) {
@@ -568,6 +653,34 @@ func (s Server) startParallelRun(w http.ResponseWriter, r *http.Request) {
 		s.store.CompleteChatRun(run.ID, runStatus, "")
 	}()
 	writeJSON(w, map[string]any{"candidateId": candidate.ID, "chatRunId": run.ID})
+}
+
+func (s Server) updateCandidateOutput(w http.ResponseWriter, r *http.Request) {
+	candidateID := strings.TrimSpace(r.PathValue("candidateID"))
+	if candidateID == "" {
+		writeError(w, errors.New("candidate id is required"), http.StatusBadRequest)
+		return
+	}
+	var input struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	status := core.CandidateOutputStatus(strings.TrimSpace(input.Status))
+	switch status {
+	case core.CandidateOutputAccepted, core.CandidateOutputRejected:
+	default:
+		writeError(w, errors.New("candidate status must be accepted or rejected"), http.StatusBadRequest)
+		return
+	}
+	candidate, err := s.store.UpdateCandidateOutputStatus(candidateID, status)
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"candidate": candidate})
 }
 
 func (s Server) deleteSession(w http.ResponseWriter, r *http.Request) {
@@ -1181,6 +1294,7 @@ func (s Server) streamSessionMessage(w http.ResponseWriter, r *http.Request, ses
 		s.recordMessageEvent(sessionID, assistantActivityIndex, "status", payload)
 		flusher.Flush()
 	}
+	s.maybeGenerateHandoffSummary(sessionID, selection)
 	contextPacket := s.buildContextPacket(sessionID, content, selection, contextNote)
 	if _, err := s.store.SaveContextPacket(contextPacket); err != nil {
 		payload := map[string]string{"text": "Context packet persistence failed: " + err.Error()}
@@ -1669,6 +1783,82 @@ func moderatorGroupOrder(pref sqlitecli.ModeratorPreference, routes []sqlitecli.
 	return compactStrings(ordered)
 }
 
+// maybeGenerateHandoffSummary checks if the incoming selection represents a
+// provider switch and, if so, generates and saves a handoff summary event.
+func (s Server) maybeGenerateHandoffSummary(sessionID string, selection chatSelection) {
+	lastSegment, err := s.store.LastCompletedSegment(sessionID)
+	if err != nil {
+		return // no prior segment — first message in session
+	}
+
+	session, _, err := s.store.GetSession(sessionID)
+	if err != nil {
+		return
+	}
+
+	policyName := "route-change"
+	if proj, err := s.store.GetProject(session.ProjectID); err == nil && proj.HandoffPolicy != "" {
+		policyName = proj.HandoffPolicy
+	}
+	policy := s.handoffPolicies.GetOrDefault(policyName)
+
+	if !policy.DetectSwitch(lastSegment, core.HandoffCandidate{RouteID: selection.Route.ID, ModelID: selection.Model.ID}) {
+		return
+	}
+
+	msgs, err := s.store.MessagesSince(sessionID, lastSegment.StartedAt)
+	if err != nil || len(msgs) == 0 {
+		return
+	}
+
+	// Build a single-shot CallProvider using the previous segment's route/driver.
+	// This lets AI policies call the outgoing provider to generate the summary.
+	var callProvider func(prompt string) (string, error)
+	if prevSelection, err := s.resolveChatSelection(sessionID, lastSegment.RouteID, lastSegment.ModelID); err == nil {
+		if driver, ok := s.drivers.Get(prevSelection.Route.ProviderPluginID); ok {
+			callProvider = func(prompt string) (string, error) {
+				resp, err := driver.Respond(context.Background(), provider.ChatRequest{
+					SessionID:        sessionID,
+					RouteID:          prevSelection.Route.ID,
+					RouteDisplayName: prevSelection.Route.DisplayName,
+					RouteTransport:   prevSelection.Route.Transport,
+					ProviderPluginID: prevSelection.Route.ProviderPluginID,
+					ModelID:          prevSelection.Model.ID,
+					ModelDisplayName: prevSelection.Model.DisplayName,
+					ModelRef:         prevSelection.Model.ModelRef,
+					Input:            prompt,
+				}, func(provider.Event) {})
+				if err != nil {
+					return "", err
+				}
+				return resp.Text, nil
+			}
+		}
+	}
+
+	payload, err := policy.Summarize(core.HandoffContext{
+		Session:      session,
+		Segment:      lastSegment,
+		Messages:     msgs,
+		CallProvider: callProvider,
+	})
+	if err != nil || strings.TrimSpace(payload.Text) == "" {
+		return
+	}
+
+	summaryID, err := s.store.SaveSummary(payload)
+	if err != nil {
+		return
+	}
+
+	_, _ = s.store.AppendEvent(core.EventInput{
+		Type:       core.EventSummaryCreated,
+		SessionID:  sessionID,
+		BranchID:   "main",
+		PayloadRef: "summary:" + summaryID,
+	})
+}
+
 func (s Server) buildContextPacket(sessionID string, latestUserInput string, selection chatSelection, note string) core.ContextPacket {
 	session, messages, err := s.store.GetSession(sessionID)
 	if err != nil {
@@ -1692,7 +1882,7 @@ func (s Server) buildContextPacket(sessionID string, latestUserInput string, sel
 	}
 
 	// Determine context budget from route. 0 means policy default.
-	contextBudget := routeContextBudget(selection.Route.ID)
+	contextBudget := selection.Route.ContextBudgetChars
 
 	// Look up policy from project; fall back to flat-trim.
 	policyName := "flat-trim"
@@ -1710,6 +1900,7 @@ func (s Server) buildContextPacket(sessionID string, latestUserInput string, sel
 		Note:          note,
 		ContextBudget: contextBudget,
 		RouteLabel:    selection.Route.DisplayName + " / " + selection.Model.DisplayName,
+		LoadSummary:   s.store.GetSummary,
 	}
 	packet := policy.Build(pbc)
 
@@ -1738,21 +1929,6 @@ func (s Server) buildContextPacket(sessionID string, latestUserInput string, sel
 	}
 
 	return packet
-}
-
-// routeContextBudget returns the character budget for a given access route ID.
-// Returns 0 to indicate policy default should apply.
-func routeContextBudget(routeID string) int {
-	switch routeID {
-	case "claude-code-cli":
-		return 80000
-	case "codex-subscription-cli":
-		return 60000
-	case "ollama-local":
-		return 4000
-	default:
-		return 0
-	}
 }
 
 func (s Server) moderatorHandoffPrompt(sessionID string, latestUserInput string, handoff moderatorHandoff) string {
@@ -1818,26 +1994,62 @@ func providerGroupLabel(groupID string) string {
 func (s Server) resolveChatSelection(sessionID string, routeID string, modelID string) (chatSelection, error) {
 	routeID = strings.TrimSpace(routeID)
 	modelID = strings.TrimSpace(modelID)
-	if routeID == "" {
-		return chatSelection{}, errors.New("chat route is required")
-	}
-	if modelID == "" {
-		return chatSelection{}, errors.New("chat model is required")
-	}
 
 	project, err := s.store.DefaultProject()
 	if err != nil {
 		return chatSelection{}, err
 	}
+	var session core.Session
 	if sessionID != sessionIDForCapabilityCheck {
-		if session, _, sessionErr := s.store.GetSession(sessionID); sessionErr == nil && strings.TrimSpace(session.ProjectID) != "" {
-			project.ID = session.ProjectID
+		if sess, _, sessionErr := s.store.GetSession(sessionID); sessionErr == nil {
+			session = sess
+			if strings.TrimSpace(sess.ProjectID) != "" {
+				project.ID = sess.ProjectID
+			}
 		}
 	}
+
 	projectRoutes, err := s.store.ListProjectAccessRoutes(project.ID)
 	if err != nil {
 		return chatSelection{}, err
 	}
+
+	// Build candidates sorted by priority for route selection policy.
+	candidates := make([]core.RouteCandidate, 0, len(projectRoutes))
+	for _, r := range projectRoutes {
+		if r.Enabled && r.Route.Status == "available" {
+			candidates = append(candidates, core.RouteCandidate{
+				RouteID:  r.Route.ID,
+				Priority: r.Priority,
+			})
+		}
+	}
+
+	// Route selection policy resolves the final routeID/modelID.
+	policyName := "manual"
+	if proj, err := s.store.GetProject(session.ProjectID); err == nil && proj.RoutePolicy != "" {
+		policyName = proj.RoutePolicy
+	}
+	selectedRouteID, selectedModelID, err := s.routePolicies.GetOrDefault(policyName).Select(core.RouteSelectionContext{
+		Session:          session,
+		Candidates:       candidates,
+		RequestedRouteID: routeID,
+		RequestedModelID: modelID,
+	})
+	if err != nil {
+		return chatSelection{}, err
+	}
+	if selectedRouteID == "" {
+		return chatSelection{}, errors.New("chat route is required")
+	}
+	routeID = selectedRouteID
+	if selectedModelID != "" {
+		modelID = selectedModelID
+	}
+	if modelID == "" {
+		return chatSelection{}, errors.New("chat model is required")
+	}
+
 	var selectedRoute sqlitecli.AccessRoute
 	for _, route := range projectRoutes {
 		if route.Enabled && route.Route.ID == routeID {

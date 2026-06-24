@@ -211,6 +211,39 @@ type KnowledgeItem struct {
 	UpdatedAt     time.Time
 }
 
+// SummaryPayload is stored as objects/summaries/<id>.json and referenced
+// by a summary.created event via PayloadRef = "summary:<id>".
+type SummaryPayload struct {
+	ProviderSegmentID string   `json:"provider_segment_id"`
+	CoveredMessageIDs []string `json:"covered_message_ids"`
+	Text              string   `json:"text"`
+}
+
+// HandoffCandidate describes the incoming provider selection for a new message.
+type HandoffCandidate struct {
+	RouteID string
+	ModelID string
+}
+
+// HandoffContext is the input to HandoffPolicy.Summarize.
+type HandoffContext struct {
+	Session  Session
+	Segment  ProviderSegment
+	Messages []Message // messages recorded during the segment's lifetime
+	// CallProvider performs a single-shot text generation for summary purposes.
+	// May be nil; implementations must fall back gracefully.
+	CallProvider func(prompt string) (string, error)
+}
+
+// HandoffPolicy detects provider switches and generates handoff summaries.
+// New strategies (AI-generated, structured, rule-based) can be registered
+// without changing core logic.
+type HandoffPolicy interface {
+	Name() string
+	DetectSwitch(last ProviderSegment, incoming HandoffCandidate) bool
+	Summarize(ctx HandoffContext) (SummaryPayload, error)
+}
+
 // PacketBuildContext is the input to a ContextPacketPolicy.
 type PacketBuildContext struct {
 	Session       Session
@@ -221,6 +254,9 @@ type PacketBuildContext struct {
 	Note          string
 	ContextBudget int    // max chars; 0 = policy default
 	RouteLabel    string // e.g. "Claude Code CLI / Claude Sonnet 4.6"
+	// LoadSummary retrieves a SummaryPayload by ID (from a summary.created event PayloadRef).
+	// May be nil if no summary loader is available.
+	LoadSummary func(id string) (SummaryPayload, error)
 }
 
 // ContextPacketPolicy builds a ContextPacket from a PacketBuildContext.

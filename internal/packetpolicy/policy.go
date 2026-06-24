@@ -2,6 +2,7 @@ package packetpolicy
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -29,6 +30,15 @@ func (r Registry) Register(p core.ContextPacketPolicy) {
 func (r Registry) Get(name string) (core.ContextPacketPolicy, bool) {
 	p, ok := r.policies[name]
 	return p, ok
+}
+
+func (r Registry) List() []string {
+	names := make([]string, 0, len(r.policies))
+	for name := range r.policies {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func (r Registry) GetOrDefault(name string) core.ContextPacketPolicy {
@@ -72,24 +82,37 @@ func (SegmentChainPolicy) Build(ctx core.PacketBuildContext) core.ContextPacket 
 	packet := newPacket(ctx)
 	latest := strings.TrimSpace(ctx.UserInput)
 
-	// Section: summaries from summary.created events (populated when summaries exist).
+	// Section: summaries from summary.created events.
 	var summaryLines []string
-	var coveredEventIDs map[string]bool
-	for _, event := range ctx.Ancestors {
-		if event.Type != core.EventSummaryCreated {
-			continue
+	coveredMessageIDs := map[string]bool{}
+	if ctx.LoadSummary != nil {
+		for _, event := range ctx.Ancestors {
+			if event.Type != core.EventSummaryCreated {
+				continue
+			}
+			summaryID := strings.TrimPrefix(event.PayloadRef, "summary:")
+			if summaryID == "" {
+				continue
+			}
+			payload, err := ctx.LoadSummary(summaryID)
+			if err != nil {
+				continue
+			}
+			if strings.TrimSpace(payload.Text) != "" {
+				summaryLines = append(summaryLines, payload.Text)
+			}
+			for _, msgID := range payload.CoveredMessageIDs {
+				coveredMessageIDs[msgID] = true
+			}
 		}
-		// Future: parse event payload for summary text and covered event range.
-		// For now this slot is a no-op until summary generation is wired.
-		_ = event
 	}
 
-	// Section: messages — skip events covered by a summary.
-	contextLines := messageLinesFiltered(ctx.Ancestors, ctx.Messages, latest, coveredEventIDs)
+	// Section: messages — skip messages already covered by a summary.
+	contextLines := messageLinesFilteredByMsgID(ctx.Ancestors, ctx.Messages, latest, coveredMessageIDs)
 
 	assembled := systemLines(ctx)
 	if len(summaryLines) > 0 {
-		assembled = append(assembled, "")
+		assembled = append(assembled, "", "Previous provider context:")
 		assembled = append(assembled, summaryLines...)
 	}
 	assembled = append(assembled, "", "Conversation context:")
@@ -130,6 +153,33 @@ func systemLines(ctx core.PacketBuildContext) []string {
 
 func messageLines(ancestors []core.Event, messages []core.Message, skipContent string) []string {
 	return messageLinesFiltered(ancestors, messages, skipContent, nil)
+}
+
+func messageLinesFilteredByMsgID(ancestors []core.Event, messages []core.Message, skipContent string, skipMsgIDs map[string]bool) []string {
+	msgByID := make(map[string]core.Message, len(messages))
+	for _, m := range messages {
+		msgByID[m.ID] = m
+	}
+	lines := make([]string, 0, len(ancestors))
+	for _, event := range ancestors {
+		if event.Type != core.EventMessageUser && event.Type != core.EventMessageAssistant {
+			continue
+		}
+		messageID := strings.TrimPrefix(event.PayloadRef, "message:")
+		if skipMsgIDs[messageID] {
+			continue
+		}
+		msg, ok := msgByID[messageID]
+		if !ok {
+			continue
+		}
+		content := strings.TrimSpace(msg.Content)
+		if content == "" || (msg.Role == "user" && content == skipContent) {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%s: %s", msg.Role, content))
+	}
+	return lines
 }
 
 func messageLinesFiltered(ancestors []core.Event, messages []core.Message, skipContent string, skipEventIDs map[string]bool) []string {

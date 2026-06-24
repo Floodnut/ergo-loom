@@ -135,6 +135,9 @@ CREATE TABLE IF NOT EXISTS projects (
   display_name TEXT NOT NULL,
   root_path TEXT,
   is_default INTEGER NOT NULL DEFAULT 0,
+  context_policy TEXT NOT NULL DEFAULT 'flat-trim',
+  handoff_policy TEXT NOT NULL DEFAULT 'route-change',
+  route_policy TEXT NOT NULL DEFAULT 'manual',
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 

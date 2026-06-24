@@ -47,19 +47,20 @@ type ProviderModel struct {
 }
 
 type AccessRoute struct {
-	ID                string
-	ProviderPluginID  string
-	DisplayName       string
-	AccessMode        string
-	Transport         string
-	RequiresLicense   bool
-	RequiresAPIKey    bool
-	SupportsStreaming bool
-	SupportsTools     bool
-	SupportsImport    bool
-	SupportsHandoff   bool
-	CostModel         string
-	Status            string
+	ID                 string
+	ProviderPluginID   string
+	DisplayName        string
+	AccessMode         string
+	Transport          string
+	RequiresLicense    bool
+	RequiresAPIKey     bool
+	SupportsStreaming  bool
+	SupportsTools      bool
+	SupportsImport     bool
+	SupportsHandoff    bool
+	CostModel          string
+	Status             string
+	ContextBudgetChars int // 0 = policy default
 }
 
 type Project struct {
@@ -68,6 +69,8 @@ type Project struct {
 	RootPath      string
 	IsDefault     bool
 	ContextPolicy string
+	HandoffPolicy string
+	RoutePolicy   string
 }
 
 type CommandRun struct {
@@ -265,7 +268,19 @@ func (s Store) Init() error {
 	if err := s.ensureSessionProjectColumn(); err != nil {
 		return err
 	}
-	return s.ensureProjectContextPolicyColumn()
+	if err := s.ensureSessionActiveRouteColumns(); err != nil {
+		return err
+	}
+	if err := s.ensureAccessRouteContextBudgetColumn(); err != nil {
+		return err
+	}
+	if err := s.ensureProjectContextPolicyColumn(); err != nil {
+		return err
+	}
+	if err := s.ensureProjectHandoffPolicyColumn(); err != nil {
+		return err
+	}
+	return s.ensureProjectRoutePolicyColumn()
 }
 
 func (s Store) ListSessions() ([]core.Session, error) {
@@ -281,7 +296,9 @@ func (s Store) ListSessionsForProject(projectID string) ([]core.Session, error) 
 	out, err := s.queryJSON(`
 SELECT id, COALESCE(project_id, 'default') AS project_id, source_tool, source_id, title, created_at, updated_at,
        COALESCE(parent_session_id, '') AS parent_id,
-       COALESCE(branch_from_message_id, '') AS branch_from_id
+       COALESCE(branch_from_message_id, '') AS branch_from_id,
+       COALESCE(active_route_id, '') AS active_route_id,
+       COALESCE(active_model_id, '') AS active_model_id
 FROM sessions
 ` + where + `
 ORDER BY updated_at DESC, id ASC;
@@ -313,7 +330,9 @@ func (s Store) GetSession(id string) (core.Session, []core.Message, error) {
 	sessionOut, err := s.queryJSON(fmt.Sprintf(`
 SELECT id, COALESCE(project_id, 'default') AS project_id, source_tool, source_id, title, created_at, updated_at,
        COALESCE(parent_session_id, '') AS parent_id,
-       COALESCE(branch_from_message_id, '') AS branch_from_id
+       COALESCE(branch_from_message_id, '') AS branch_from_id,
+       COALESCE(active_route_id, '') AS active_route_id,
+       COALESCE(active_model_id, '') AS active_model_id
 FROM sessions
 WHERE id = %s;
 `, quote(id)))
@@ -1055,6 +1074,98 @@ WHERE id = %s;
 	return s.getProviderSegment(id)
 }
 
+func (s Store) LastCompletedSegment(sessionID string) (core.ProviderSegment, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return core.ProviderSegment{}, errors.New("session id is required")
+	}
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT ps.id, ps.chat_run_id, ps.provider_id, ps.route_id, ps.model_id,
+       ps.external_thread_id, ps.status, ps.handoff_reason,
+       ps.started_at, COALESCE(ps.completed_at, '') AS completed_at
+FROM provider_segments ps
+JOIN chat_runs cr ON ps.chat_run_id = cr.id
+WHERE cr.session_id = %s AND cr.role = 'main' AND ps.status = 'completed'
+ORDER BY ps.completed_at DESC, ps.id DESC
+LIMIT 1;
+`, quote(sessionID)))
+	if err != nil {
+		return core.ProviderSegment{}, err
+	}
+	var rows []providerSegmentRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return core.ProviderSegment{}, err
+	}
+	if len(rows) == 0 {
+		return core.ProviderSegment{}, ErrNotFound
+	}
+	return rows[0].toCore()
+}
+
+func (s Store) MessagesSince(sessionID string, since time.Time) ([]core.Message, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, errors.New("session id is required")
+	}
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id, session_id, COALESCE(source_id, '') AS source_id, role, content, created_at, ordinal
+FROM messages
+WHERE session_id = %s AND created_at >= %s
+ORDER BY ordinal ASC;
+`, quote(sessionID), quote(since.UTC().Format(time.RFC3339Nano))))
+	if err != nil {
+		return nil, err
+	}
+	var rows []messageRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return nil, err
+	}
+	msgs := make([]core.Message, 0, len(rows))
+	for _, row := range rows {
+		m, err := row.toCore()
+		if err != nil {
+			continue
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs, nil
+}
+
+func (s Store) SaveSummary(payload core.SummaryPayload) (string, error) {
+	id := "summary_" + randomHex(12)
+	contentRef := filepath.ToSlash(filepath.Join("objects", "summaries", id+".json"))
+	path := filepath.Join(filepath.Dir(s.DBPath), filepath.FromSlash(contentRef))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func (s Store) GetSummary(id string) (core.SummaryPayload, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return core.SummaryPayload{}, errors.New("summary id is required")
+	}
+	contentRef := filepath.ToSlash(filepath.Join("objects", "summaries", id+".json"))
+	path := filepath.Join(filepath.Dir(s.DBPath), filepath.FromSlash(contentRef))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return core.SummaryPayload{}, err
+	}
+	var payload core.SummaryPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return core.SummaryPayload{}, err
+	}
+	return payload, nil
+}
+
 func (s Store) ActiveProviderSegment(chatRunID string) (core.ProviderSegment, error) {
 	chatRunID = strings.TrimSpace(chatRunID)
 	if chatRunID == "" {
@@ -1737,7 +1848,8 @@ func (s Store) ListAccessRoutes() ([]AccessRoute, error) {
 	out, err := s.queryJSON(`
 SELECT id, provider_plugin_id, display_name, access_mode, transport,
        requires_license, requires_api_key, supports_streaming, supports_tools,
-       supports_import, supports_handoff, cost_model, status
+       supports_import, supports_handoff, cost_model, status,
+       COALESCE(context_budget_chars, 0) AS context_budget_chars
 FROM access_routes
 ORDER BY provider_plugin_id ASC, access_mode ASC, id ASC;
 `)
@@ -1751,19 +1863,20 @@ ORDER BY provider_plugin_id ASC, access_mode ASC, id ASC;
 	routes := make([]AccessRoute, 0, len(rows))
 	for _, row := range rows {
 		routes = append(routes, AccessRoute{
-			ID:                row.ID,
-			ProviderPluginID:  row.ProviderPluginID,
-			DisplayName:       row.DisplayName,
-			AccessMode:        row.AccessMode,
-			Transport:         row.Transport,
-			RequiresLicense:   row.RequiresLicense != 0,
-			RequiresAPIKey:    row.RequiresAPIKey != 0,
-			SupportsStreaming: row.SupportsStreaming != 0,
-			SupportsTools:     row.SupportsTools != 0,
-			SupportsImport:    row.SupportsImport != 0,
-			SupportsHandoff:   row.SupportsHandoff != 0,
-			CostModel:         row.CostModel,
-			Status:            row.Status,
+			ID:                 row.ID,
+			ProviderPluginID:   row.ProviderPluginID,
+			DisplayName:        row.DisplayName,
+			AccessMode:         row.AccessMode,
+			Transport:          row.Transport,
+			RequiresLicense:    row.RequiresLicense != 0,
+			RequiresAPIKey:     row.RequiresAPIKey != 0,
+			SupportsStreaming:  row.SupportsStreaming != 0,
+			SupportsTools:      row.SupportsTools != 0,
+			SupportsImport:     row.SupportsImport != 0,
+			SupportsHandoff:    row.SupportsHandoff != 0,
+			CostModel:          row.CostModel,
+			ContextBudgetChars: row.ContextBudgetChars,
+			Status:             row.Status,
 		})
 	}
 	return routes, nil
@@ -1771,7 +1884,7 @@ ORDER BY provider_plugin_id ASC, access_mode ASC, id ASC;
 
 func (s Store) DefaultProject() (Project, error) {
 	out, err := s.queryJSON(`
-SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy, COALESCE(handoff_policy, 'route-change') AS handoff_policy, COALESCE(route_policy, 'manual') AS route_policy
 FROM projects
 ORDER BY is_default DESC, created_at ASC
 LIMIT 1;
@@ -1791,7 +1904,7 @@ LIMIT 1;
 
 func (s Store) ListProjects() ([]Project, error) {
 	out, err := s.queryJSON(`
-SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy, COALESCE(handoff_policy, 'route-change') AS handoff_policy, COALESCE(route_policy, 'manual') AS route_policy
 FROM projects
 ORDER BY is_default DESC, display_name ASC;
 `)
@@ -1822,7 +1935,7 @@ VALUES (%s, %s, %s, 0);
 		return Project{}, err
 	}
 	out, err := s.queryJSON(fmt.Sprintf(`
-SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy, COALESCE(handoff_policy, 'route-change') AS handoff_policy, COALESCE(route_policy, 'manual') AS route_policy
 FROM projects
 WHERE id = %s;
 `, quote(projectID)))
@@ -1854,7 +1967,7 @@ func (s Store) RenameProject(projectID string, displayName string) (Project, err
 		return Project{}, err
 	}
 	out, err := s.queryJSON(fmt.Sprintf(`
-SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy, COALESCE(handoff_policy, 'route-change') AS handoff_policy, COALESCE(route_policy, 'manual') AS route_policy
 FROM projects
 WHERE id = %s;
 `, quote(projectID)))
@@ -1877,7 +1990,7 @@ func (s Store) GetProject(projectID string) (Project, error) {
 		return Project{}, errors.New("project id is required")
 	}
 	out, err := s.queryJSON(fmt.Sprintf(`
-SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy, COALESCE(handoff_policy, 'route-change') AS handoff_policy, COALESCE(route_policy, 'manual') AS route_policy
 FROM projects WHERE id = %s;
 `, quote(projectID)))
 	if err != nil {
@@ -1899,7 +2012,7 @@ func (s Store) DeleteProject(projectID string) error {
 		return errors.New("project id is required")
 	}
 	out, err := s.queryJSON(fmt.Sprintf(`
-SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy, COALESCE(handoff_policy, 'route-change') AS handoff_policy, COALESCE(route_policy, 'manual') AS route_policy
 FROM projects
 WHERE id = %s;
 `, quote(projectID)))
@@ -2161,7 +2274,8 @@ SELECT par.project_id,
        ar.supports_import,
        ar.supports_handoff,
        ar.cost_model,
-       ar.status
+       ar.status,
+       COALESCE(ar.context_budget_chars, 0) AS context_budget_chars
 FROM project_access_routes par
 JOIN access_routes ar ON ar.id = par.access_route_id
 WHERE par.project_id = %s
@@ -2525,6 +2639,63 @@ func (s Store) queryJSON(sql string) (string, error) {
 	return string(out), nil
 }
 
+func (s Store) ensureAccessRouteContextBudgetColumn() error {
+	out, err := s.queryJSON(`PRAGMA table_info(access_routes);`)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(out, `"name":"context_budget_chars"`) {
+		return nil
+	}
+	return s.run(`
+ALTER TABLE access_routes ADD COLUMN context_budget_chars INTEGER NOT NULL DEFAULT 0;
+UPDATE access_routes SET context_budget_chars = 80000 WHERE id = 'claude-code-cli';
+UPDATE access_routes SET context_budget_chars = 60000 WHERE id = 'codex-subscription-cli';
+UPDATE access_routes SET context_budget_chars = 4000  WHERE id = 'ollama-local';
+`)
+}
+
+func (s Store) ensureSessionActiveRouteColumns() error {
+	out, err := s.queryJSON(`PRAGMA table_info(sessions);`)
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(out, `"name":"active_route_id"`) {
+		if err := s.run(`ALTER TABLE sessions ADD COLUMN active_route_id TEXT NOT NULL DEFAULT '';`); err != nil {
+			return err
+		}
+	}
+	if !strings.Contains(out, `"name":"active_model_id"`) {
+		if err := s.run(`ALTER TABLE sessions ADD COLUMN active_model_id TEXT NOT NULL DEFAULT '';`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s Store) SetSessionActiveRoute(sessionID, routeID, modelID string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return errors.New("session id is required")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	return s.run(fmt.Sprintf(`
+UPDATE sessions SET active_route_id = %s, active_model_id = %s, updated_at = %s
+WHERE id = %s;
+`, quote(routeID), quote(modelID), quote(now), quote(sessionID)))
+}
+
+func (s Store) ensureProjectHandoffPolicyColumn() error {
+	out, err := s.queryJSON(`PRAGMA table_info(projects);`)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(out, `"name":"handoff_policy"`) {
+		return nil
+	}
+	return s.run(`ALTER TABLE projects ADD COLUMN handoff_policy TEXT NOT NULL DEFAULT 'route-change';`)
+}
+
 func (s Store) ensureProjectContextPolicyColumn() error {
 	out, err := s.queryJSON(`PRAGMA table_info(projects);`)
 	if err != nil {
@@ -2534,6 +2705,17 @@ func (s Store) ensureProjectContextPolicyColumn() error {
 		return nil
 	}
 	return s.run(`ALTER TABLE projects ADD COLUMN context_policy TEXT NOT NULL DEFAULT 'flat-trim';`)
+}
+
+func (s Store) ensureProjectRoutePolicyColumn() error {
+	out, err := s.queryJSON(`PRAGMA table_info(projects);`)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(out, `"name":"route_policy"`) {
+		return nil
+	}
+	return s.run(`ALTER TABLE projects ADD COLUMN route_policy TEXT NOT NULL DEFAULT 'manual';`)
 }
 
 func (s Store) ensureSessionProjectColumn() error {
@@ -2551,15 +2733,17 @@ UPDATE sessions SET project_id = 'default' WHERE project_id IS NULL OR project_i
 }
 
 type sessionRow struct {
-	ID           string `json:"id"`
-	ProjectID    string `json:"project_id"`
-	SourceTool   string `json:"source_tool"`
-	SourceID     string `json:"source_id"`
-	Title        string `json:"title"`
-	CreatedAt    string `json:"created_at"`
-	UpdatedAt    string `json:"updated_at"`
-	ParentID     string `json:"parent_id"`
-	BranchFromID string `json:"branch_from_id"`
+	ID            string `json:"id"`
+	ProjectID     string `json:"project_id"`
+	SourceTool    string `json:"source_tool"`
+	SourceID      string `json:"source_id"`
+	Title         string `json:"title"`
+	CreatedAt     string `json:"created_at"`
+	UpdatedAt     string `json:"updated_at"`
+	ParentID      string `json:"parent_id"`
+	BranchFromID  string `json:"branch_from_id"`
+	ActiveRouteID string `json:"active_route_id"`
+	ActiveModelID string `json:"active_model_id"`
 }
 
 func (r sessionRow) toCore() (core.Session, error) {
@@ -2572,15 +2756,17 @@ func (r sessionRow) toCore() (core.Session, error) {
 		return core.Session{}, err
 	}
 	return core.Session{
-		ID:           r.ID,
-		ProjectID:    r.ProjectID,
-		SourceTool:   core.SourceTool(r.SourceTool),
-		SourceID:     r.SourceID,
-		Title:        r.Title,
-		CreatedAt:    createdAt,
-		UpdatedAt:    updatedAt,
-		ParentID:     r.ParentID,
-		BranchFromID: r.BranchFromID,
+		ID:            r.ID,
+		ProjectID:     r.ProjectID,
+		SourceTool:    core.SourceTool(r.SourceTool),
+		SourceID:      r.SourceID,
+		Title:         r.Title,
+		CreatedAt:     createdAt,
+		UpdatedAt:     updatedAt,
+		ParentID:      r.ParentID,
+		BranchFromID:  r.BranchFromID,
+		ActiveRouteID: r.ActiveRouteID,
+		ActiveModelID: r.ActiveModelID,
 	}, nil
 }
 
@@ -2734,19 +2920,20 @@ type providerModelRow struct {
 }
 
 type accessRouteRow struct {
-	ID                string `json:"id"`
-	ProviderPluginID  string `json:"provider_plugin_id"`
-	DisplayName       string `json:"display_name"`
-	AccessMode        string `json:"access_mode"`
-	Transport         string `json:"transport"`
-	RequiresLicense   int    `json:"requires_license"`
-	RequiresAPIKey    int    `json:"requires_api_key"`
-	SupportsStreaming int    `json:"supports_streaming"`
-	SupportsTools     int    `json:"supports_tools"`
-	SupportsImport    int    `json:"supports_import"`
-	SupportsHandoff   int    `json:"supports_handoff"`
-	CostModel         string `json:"cost_model"`
-	Status            string `json:"status"`
+	ID                 string `json:"id"`
+	ProviderPluginID   string `json:"provider_plugin_id"`
+	DisplayName        string `json:"display_name"`
+	AccessMode         string `json:"access_mode"`
+	Transport          string `json:"transport"`
+	RequiresLicense    int    `json:"requires_license"`
+	RequiresAPIKey     int    `json:"requires_api_key"`
+	SupportsStreaming  int    `json:"supports_streaming"`
+	SupportsTools      int    `json:"supports_tools"`
+	SupportsImport     int    `json:"supports_import"`
+	SupportsHandoff    int    `json:"supports_handoff"`
+	CostModel          string `json:"cost_model"`
+	Status             string `json:"status"`
+	ContextBudgetChars int    `json:"context_budget_chars"`
 }
 
 type projectRow struct {
@@ -2755,6 +2942,8 @@ type projectRow struct {
 	RootPath      string `json:"root_path"`
 	IsDefault     int    `json:"is_default"`
 	ContextPolicy string `json:"context_policy"`
+	HandoffPolicy string `json:"handoff_policy"`
+	RoutePolicy   string `json:"route_policy"`
 }
 
 type commandRunRow struct {
@@ -2778,26 +2967,29 @@ func (r projectRow) toCore() Project {
 		RootPath:      r.RootPath,
 		IsDefault:     r.IsDefault != 0,
 		ContextPolicy: r.ContextPolicy,
+		HandoffPolicy: r.HandoffPolicy,
+		RoutePolicy:   r.RoutePolicy,
 	}
 }
 
 type projectAccessRouteRow struct {
-	ProjectID         string `json:"project_id"`
-	Enabled           int    `json:"enabled"`
-	Priority          int    `json:"priority"`
-	ID                string `json:"id"`
-	ProviderPluginID  string `json:"provider_plugin_id"`
-	DisplayName       string `json:"display_name"`
-	AccessMode        string `json:"access_mode"`
-	Transport         string `json:"transport"`
-	RequiresLicense   int    `json:"requires_license"`
-	RequiresAPIKey    int    `json:"requires_api_key"`
-	SupportsStreaming int    `json:"supports_streaming"`
-	SupportsTools     int    `json:"supports_tools"`
-	SupportsImport    int    `json:"supports_import"`
-	SupportsHandoff   int    `json:"supports_handoff"`
-	CostModel         string `json:"cost_model"`
-	Status            string `json:"status"`
+	ProjectID          string `json:"project_id"`
+	Enabled            int    `json:"enabled"`
+	Priority           int    `json:"priority"`
+	ID                 string `json:"id"`
+	ProviderPluginID   string `json:"provider_plugin_id"`
+	DisplayName        string `json:"display_name"`
+	AccessMode         string `json:"access_mode"`
+	Transport          string `json:"transport"`
+	RequiresLicense    int    `json:"requires_license"`
+	RequiresAPIKey     int    `json:"requires_api_key"`
+	SupportsStreaming  int    `json:"supports_streaming"`
+	SupportsTools      int    `json:"supports_tools"`
+	SupportsImport     int    `json:"supports_import"`
+	SupportsHandoff    int    `json:"supports_handoff"`
+	CostModel          string `json:"cost_model"`
+	Status             string `json:"status"`
+	ContextBudgetChars int    `json:"context_budget_chars"`
 }
 
 type moderatorPreferenceRow struct {
@@ -2820,19 +3012,20 @@ func (r moderatorPreferenceRow) toCore() ModeratorPreference {
 
 func (r projectAccessRouteRow) toAccessRoute() AccessRoute {
 	return AccessRoute{
-		ID:                r.ID,
-		ProviderPluginID:  r.ProviderPluginID,
-		DisplayName:       r.DisplayName,
-		AccessMode:        r.AccessMode,
-		Transport:         r.Transport,
-		RequiresLicense:   r.RequiresLicense != 0,
-		RequiresAPIKey:    r.RequiresAPIKey != 0,
-		SupportsStreaming: r.SupportsStreaming != 0,
-		SupportsTools:     r.SupportsTools != 0,
-		SupportsImport:    r.SupportsImport != 0,
-		SupportsHandoff:   r.SupportsHandoff != 0,
-		CostModel:         r.CostModel,
-		Status:            r.Status,
+		ID:                 r.ID,
+		ProviderPluginID:   r.ProviderPluginID,
+		DisplayName:        r.DisplayName,
+		AccessMode:         r.AccessMode,
+		Transport:          r.Transport,
+		RequiresLicense:    r.RequiresLicense != 0,
+		RequiresAPIKey:     r.RequiresAPIKey != 0,
+		SupportsStreaming:  r.SupportsStreaming != 0,
+		SupportsTools:      r.SupportsTools != 0,
+		SupportsImport:     r.SupportsImport != 0,
+		SupportsHandoff:    r.SupportsHandoff != 0,
+		CostModel:          r.CostModel,
+		Status:             r.Status,
+		ContextBudgetChars: r.ContextBudgetChars,
 	}
 }
 
