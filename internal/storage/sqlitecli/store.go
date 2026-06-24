@@ -64,13 +64,15 @@ type AccessRoute struct {
 }
 
 type Project struct {
-	ID            string
-	DisplayName   string
-	RootPath      string
-	IsDefault     bool
-	ContextPolicy string
-	HandoffPolicy string
-	RoutePolicy   string
+	ID                string
+	DisplayName       string
+	RootPath          string
+	IsDefault         bool
+	ContextPolicy     string
+	HandoffPolicy     string
+	RoutePolicy       string
+	ToolApprovalPolicy string
+	KbScopePolicy     string
 }
 
 type CommandRun struct {
@@ -289,6 +291,12 @@ func (s Store) Init() error {
 		return err
 	}
 	if err := s.ensureProjectRoutePolicyColumn(); err != nil {
+		return err
+	}
+	if err := s.ensureProjectToolApprovalPolicyColumn(); err != nil {
+		return err
+	}
+	if err := s.ensureProjectKbScopePolicyColumn(); err != nil {
 		return err
 	}
 	return s.ensureCandidateTriggerEventColumn()
@@ -2083,7 +2091,7 @@ ORDER BY provider_plugin_id ASC, access_mode ASC, id ASC;
 
 func (s Store) DefaultProject() (Project, error) {
 	out, err := s.queryJSON(`
-SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy, COALESCE(handoff_policy, 'route-change') AS handoff_policy, COALESCE(route_policy, 'manual') AS route_policy
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy, COALESCE(handoff_policy, 'route-change') AS handoff_policy, COALESCE(route_policy, 'manual') AS route_policy, COALESCE(tool_approval_policy, 'safe-only') AS tool_approval_policy, COALESCE(kb_scope_policy, 'project-only') AS kb_scope_policy
 FROM projects
 ORDER BY is_default DESC, created_at ASC
 LIMIT 1;
@@ -2103,7 +2111,7 @@ LIMIT 1;
 
 func (s Store) ListProjects() ([]Project, error) {
 	out, err := s.queryJSON(`
-SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy, COALESCE(handoff_policy, 'route-change') AS handoff_policy, COALESCE(route_policy, 'manual') AS route_policy
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy, COALESCE(handoff_policy, 'route-change') AS handoff_policy, COALESCE(route_policy, 'manual') AS route_policy, COALESCE(tool_approval_policy, 'safe-only') AS tool_approval_policy, COALESCE(kb_scope_policy, 'project-only') AS kb_scope_policy
 FROM projects
 ORDER BY is_default DESC, display_name ASC;
 `)
@@ -2134,7 +2142,7 @@ VALUES (%s, %s, %s, 0);
 		return Project{}, err
 	}
 	out, err := s.queryJSON(fmt.Sprintf(`
-SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy, COALESCE(handoff_policy, 'route-change') AS handoff_policy, COALESCE(route_policy, 'manual') AS route_policy
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy, COALESCE(handoff_policy, 'route-change') AS handoff_policy, COALESCE(route_policy, 'manual') AS route_policy, COALESCE(tool_approval_policy, 'safe-only') AS tool_approval_policy, COALESCE(kb_scope_policy, 'project-only') AS kb_scope_policy
 FROM projects
 WHERE id = %s;
 `, quote(projectID)))
@@ -2166,7 +2174,63 @@ func (s Store) RenameProject(projectID string, displayName string) (Project, err
 		return Project{}, err
 	}
 	out, err := s.queryJSON(fmt.Sprintf(`
-SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy, COALESCE(handoff_policy, 'route-change') AS handoff_policy, COALESCE(route_policy, 'manual') AS route_policy
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy, COALESCE(handoff_policy, 'route-change') AS handoff_policy, COALESCE(route_policy, 'manual') AS route_policy, COALESCE(tool_approval_policy, 'safe-only') AS tool_approval_policy, COALESCE(kb_scope_policy, 'project-only') AS kb_scope_policy
+FROM projects
+WHERE id = %s;
+`, quote(projectID)))
+	if err != nil {
+		return Project{}, err
+	}
+	var rows []projectRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return Project{}, err
+	}
+	if len(rows) == 0 {
+		return Project{}, ErrNotFound
+	}
+	return rows[0].toCore(), nil
+}
+
+// ProjectSettingsUpdate holds the policy fields that can be changed via
+// PATCH /api/projects/{id}/settings. Empty string means "no change".
+type ProjectSettingsUpdate struct {
+	ContextPolicy      string
+	HandoffPolicy      string
+	RoutePolicy        string
+	ToolApprovalPolicy string
+	KbScopePolicy      string
+}
+
+func (s Store) UpdateProjectSettings(projectID string, u ProjectSettingsUpdate) (Project, error) {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return Project{}, errors.New("project id is required")
+	}
+	setClauses := []string{}
+	if u.ContextPolicy != "" {
+		setClauses = append(setClauses, fmt.Sprintf("context_policy = %s", quote(u.ContextPolicy)))
+	}
+	if u.HandoffPolicy != "" {
+		setClauses = append(setClauses, fmt.Sprintf("handoff_policy = %s", quote(u.HandoffPolicy)))
+	}
+	if u.RoutePolicy != "" {
+		setClauses = append(setClauses, fmt.Sprintf("route_policy = %s", quote(u.RoutePolicy)))
+	}
+	if u.ToolApprovalPolicy != "" {
+		setClauses = append(setClauses, fmt.Sprintf("tool_approval_policy = %s", quote(u.ToolApprovalPolicy)))
+	}
+	if u.KbScopePolicy != "" {
+		setClauses = append(setClauses, fmt.Sprintf("kb_scope_policy = %s", quote(u.KbScopePolicy)))
+	}
+	if len(setClauses) > 0 {
+		stmt := fmt.Sprintf("UPDATE projects SET %s WHERE id = %s;",
+			strings.Join(setClauses, ", "), quote(projectID))
+		if err := s.run(stmt); err != nil {
+			return Project{}, err
+		}
+	}
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy, COALESCE(handoff_policy, 'route-change') AS handoff_policy, COALESCE(route_policy, 'manual') AS route_policy, COALESCE(tool_approval_policy, 'safe-only') AS tool_approval_policy, COALESCE(kb_scope_policy, 'project-only') AS kb_scope_policy
 FROM projects
 WHERE id = %s;
 `, quote(projectID)))
@@ -2189,7 +2253,7 @@ func (s Store) GetProject(projectID string) (Project, error) {
 		return Project{}, errors.New("project id is required")
 	}
 	out, err := s.queryJSON(fmt.Sprintf(`
-SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy, COALESCE(handoff_policy, 'route-change') AS handoff_policy, COALESCE(route_policy, 'manual') AS route_policy
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy, COALESCE(handoff_policy, 'route-change') AS handoff_policy, COALESCE(route_policy, 'manual') AS route_policy, COALESCE(tool_approval_policy, 'safe-only') AS tool_approval_policy, COALESCE(kb_scope_policy, 'project-only') AS kb_scope_policy
 FROM projects WHERE id = %s;
 `, quote(projectID)))
 	if err != nil {
@@ -2211,7 +2275,7 @@ func (s Store) DeleteProject(projectID string) error {
 		return errors.New("project id is required")
 	}
 	out, err := s.queryJSON(fmt.Sprintf(`
-SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy, COALESCE(handoff_policy, 'route-change') AS handoff_policy, COALESCE(route_policy, 'manual') AS route_policy
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy, COALESCE(handoff_policy, 'route-change') AS handoff_policy, COALESCE(route_policy, 'manual') AS route_policy, COALESCE(tool_approval_policy, 'safe-only') AS tool_approval_policy, COALESCE(kb_scope_policy, 'project-only') AS kb_scope_policy
 FROM projects
 WHERE id = %s;
 `, quote(projectID)))
@@ -2917,6 +2981,28 @@ func (s Store) ensureProjectRoutePolicyColumn() error {
 	return s.run(`ALTER TABLE projects ADD COLUMN route_policy TEXT NOT NULL DEFAULT 'manual';`)
 }
 
+func (s Store) ensureProjectToolApprovalPolicyColumn() error {
+	out, err := s.queryJSON(`PRAGMA table_info(projects);`)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(out, `"name":"tool_approval_policy"`) {
+		return nil
+	}
+	return s.run(`ALTER TABLE projects ADD COLUMN tool_approval_policy TEXT NOT NULL DEFAULT 'safe-only';`)
+}
+
+func (s Store) ensureProjectKbScopePolicyColumn() error {
+	out, err := s.queryJSON(`PRAGMA table_info(projects);`)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(out, `"name":"kb_scope_policy"`) {
+		return nil
+	}
+	return s.run(`ALTER TABLE projects ADD COLUMN kb_scope_policy TEXT NOT NULL DEFAULT 'project-only';`)
+}
+
 func (s Store) ensureCandidateTriggerEventColumn() error {
 	out, err := s.queryJSON(`PRAGMA table_info(candidate_outputs);`)
 	if err != nil {
@@ -3150,13 +3236,15 @@ type accessRouteRow struct {
 }
 
 type projectRow struct {
-	ID            string `json:"id"`
-	DisplayName   string `json:"display_name"`
-	RootPath      string `json:"root_path"`
-	IsDefault     int    `json:"is_default"`
-	ContextPolicy string `json:"context_policy"`
-	HandoffPolicy string `json:"handoff_policy"`
-	RoutePolicy   string `json:"route_policy"`
+	ID                 string `json:"id"`
+	DisplayName        string `json:"display_name"`
+	RootPath           string `json:"root_path"`
+	IsDefault          int    `json:"is_default"`
+	ContextPolicy      string `json:"context_policy"`
+	HandoffPolicy      string `json:"handoff_policy"`
+	RoutePolicy        string `json:"route_policy"`
+	ToolApprovalPolicy string `json:"tool_approval_policy"`
+	KbScopePolicy      string `json:"kb_scope_policy"`
 }
 
 type commandRunRow struct {
@@ -3175,13 +3263,15 @@ type commandRunRow struct {
 
 func (r projectRow) toCore() Project {
 	return Project{
-		ID:            r.ID,
-		DisplayName:   r.DisplayName,
-		RootPath:      r.RootPath,
-		IsDefault:     r.IsDefault != 0,
-		ContextPolicy: r.ContextPolicy,
-		HandoffPolicy: r.HandoffPolicy,
-		RoutePolicy:   r.RoutePolicy,
+		ID:                 r.ID,
+		DisplayName:        r.DisplayName,
+		RootPath:           r.RootPath,
+		IsDefault:          r.IsDefault != 0,
+		ContextPolicy:      r.ContextPolicy,
+		HandoffPolicy:      r.HandoffPolicy,
+		RoutePolicy:        r.RoutePolicy,
+		ToolApprovalPolicy: r.ToolApprovalPolicy,
+		KbScopePolicy:      r.KbScopePolicy,
 	}
 }
 

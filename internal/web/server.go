@@ -26,16 +26,24 @@ import (
 	"github.com/Floodnut/ergo-loom/internal/toolruntime"
 )
 
+// PolicyEntry is the shape returned by GET /api/plugins for each policy option.
+type PolicyEntry struct {
+	Name  string `json:"name"`
+	Label string `json:"label"`
+}
+
 type Server struct {
-	store           sqlitecli.Store
-	approvals       *approvalBroker
-	filters         chatfilter.Chain
-	drivers         provider.DriverRegistry
-	packetPolicies  packetpolicy.Registry
-	handoffPolicies handoffpolicy.Registry
-	routePolicies   routepolicy.Registry
-	knowledge       core.KnowledgeRetriever
-	moderator       core.Moderator
+	store              sqlitecli.Store
+	approvals          *approvalBroker
+	filters            chatfilter.Chain
+	drivers            provider.DriverRegistry
+	packetPolicies     packetpolicy.Registry
+	handoffPolicies    handoffpolicy.Registry
+	routePolicies      routepolicy.Registry
+	toolApprovalPolicy []PolicyEntry
+	kbScopePolicy      []PolicyEntry
+	knowledge          core.KnowledgeRetriever
+	moderator          core.Moderator
 }
 
 const providerSoftTokenCap = 50000
@@ -163,6 +171,16 @@ func NewServer(store sqlitecli.Store) Server {
 		routePolicies:   routepolicy.NewRegistry(),
 		knowledge:       knowledge.NewKeywordRetriever(store),
 		moderator:       core.DefaultModerator{},
+		toolApprovalPolicy: []PolicyEntry{
+			{Name: "safe-only", Label: "Safe Only"},
+			{Name: "ask-per-command", Label: "Ask Per Command"},
+			{Name: "allow-all", Label: "Allow All"},
+		},
+		kbScopePolicy: []PolicyEntry{
+			{Name: "project-only", Label: "Project Only"},
+			{Name: "project-and-global", Label: "Project and Global"},
+			{Name: "disabled", Label: "Disabled"},
+		},
 		drivers: provider.NewDriverRegistry(
 			provider.CodexAppServerDriver{},
 			provider.UnavailableDriver{ProviderID: "openai", Reason: "ChatGPT handoff driver is not implemented yet"},
@@ -181,6 +199,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/auth/status", s.authStatus)
 	mux.HandleFunc("POST /api/projects", s.createProject)
 	mux.HandleFunc("PATCH /api/projects/", s.renameProject)
+	mux.HandleFunc("PATCH /api/projects/{projectID}/settings", s.updateProjectSettings)
 	mux.HandleFunc("POST /api/projects/", s.projectRoute)
 	mux.HandleFunc("DELETE /api/projects/", s.projectRoute)
 	mux.HandleFunc("POST /api/provider-profiles/connect", s.connectProviderProfile)
@@ -254,6 +273,8 @@ func (s Server) plugins(w http.ResponseWriter, r *http.Request) {
 			"contextPackets": s.packetPolicies.List(),
 			"handoffs":       s.handoffPolicies.List(),
 			"routeSelection": s.routePolicies.List(),
+			"toolApproval":   s.toolApprovalPolicy,
+			"kbScope":        s.kbScopePolicy,
 		},
 	})
 }
@@ -412,6 +433,87 @@ func (s Server) renameProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"project": project})
+}
+
+func (s Server) updateProjectSettings(w http.ResponseWriter, r *http.Request) {
+	projectID := r.PathValue("projectID")
+	if projectID == "" {
+		writeError(w, errors.New("project id is required"), http.StatusBadRequest)
+		return
+	}
+	var input struct {
+		ContextPolicy      string `json:"contextPolicy"`
+		HandoffPolicy      string `json:"handoffPolicy"`
+		RoutePolicy        string `json:"routePolicy"`
+		ToolApprovalPolicy string `json:"toolApprovalPolicy"`
+		KbScopePolicy      string `json:"kbScopePolicy"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	if err := s.validateProjectSettings(input.ContextPolicy, input.HandoffPolicy, input.RoutePolicy, input.ToolApprovalPolicy, input.KbScopePolicy); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	project, err := s.store.UpdateProjectSettings(projectID, sqlitecli.ProjectSettingsUpdate{
+		ContextPolicy:      input.ContextPolicy,
+		HandoffPolicy:      input.HandoffPolicy,
+		RoutePolicy:        input.RoutePolicy,
+		ToolApprovalPolicy: input.ToolApprovalPolicy,
+		KbScopePolicy:      input.KbScopePolicy,
+	})
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"project": project})
+}
+
+func (s Server) validateProjectSettings(contextPolicy, handoffPolicy, routePolicy, toolApprovalPolicy, kbScopePolicy string) error {
+	if contextPolicy != "" && !containsString(s.packetPolicies.List(), contextPolicy) {
+		return fmt.Errorf("unknown contextPolicy: %s", contextPolicy)
+	}
+	if handoffPolicy != "" && !containsString(s.handoffPolicies.List(), handoffPolicy) {
+		return fmt.Errorf("unknown handoffPolicy: %s", handoffPolicy)
+	}
+	if routePolicy != "" && !containsString(s.routePolicies.List(), routePolicy) {
+		return fmt.Errorf("unknown routePolicy: %s", routePolicy)
+	}
+	if toolApprovalPolicy != "" && !s.isValidToolApprovalPolicy(toolApprovalPolicy) {
+		return fmt.Errorf("unknown toolApprovalPolicy: %s", toolApprovalPolicy)
+	}
+	if kbScopePolicy != "" && !s.isValidKbScopePolicy(kbScopePolicy) {
+		return fmt.Errorf("unknown kbScopePolicy: %s", kbScopePolicy)
+	}
+	return nil
+}
+
+func containsString(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+func (s Server) isValidToolApprovalPolicy(name string) bool {
+	for _, e := range s.toolApprovalPolicy {
+		if e.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (s Server) isValidKbScopePolicy(name string) bool {
+	for _, e := range s.kbScopePolicy {
+		if e.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (s Server) searchSessions(w http.ResponseWriter, r *http.Request) {
