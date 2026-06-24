@@ -2958,6 +2958,7 @@ func (s Store) ensureAccessRouteContextBudgetColumn() error {
 	return s.run(`
 ALTER TABLE access_routes ADD COLUMN context_budget_chars INTEGER NOT NULL DEFAULT 0;
 UPDATE access_routes SET context_budget_chars = 80000 WHERE id = 'claude-code-cli';
+UPDATE access_routes SET context_budget_chars = 80000 WHERE id = 'claude-sdk-bridge';
 UPDATE access_routes SET context_budget_chars = 60000 WHERE id = 'codex-subscription-cli';
 UPDATE access_routes SET context_budget_chars = 4000  WHERE id = 'ollama-local';
 `)

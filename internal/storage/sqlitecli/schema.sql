@@ -94,6 +94,7 @@ INSERT OR IGNORE INTO access_routes (
   ('codex-subscription-cli', 'codex', 'Codex via local CLI or app-server', 'subscription_native', 'cli_or_app_server', 1, 0, 1, 1, 1, 0, 'included_with_license_limits', 'planned'),
   ('chatgpt-web-handoff', 'openai', 'ChatGPT web handoff', 'licensed_handoff', 'manual', 0, 0, 0, 0, 1, 1, 'included_with_chat_subscription_or_free_limits', 'planned'),
   ('claude-code-cli', 'anthropic', 'Claude Code CLI', 'subscription_native', 'claude_cli', 1, 0, 1, 0, 1, 0, 'included_with_license_or_free_limits', 'available'),
+  ('claude-sdk-bridge', 'anthropic', 'Claude Agent SDK bridge', 'subscription_native', 'claude_sdk_bridge', 1, 0, 1, 0, 0, 0, 'included_with_license_or_free_limits', 'available'),
   ('claude-web-free-handoff', 'anthropic', 'Claude web free handoff', 'free_handoff', 'manual', 0, 0, 0, 0, 1, 1, 'included_with_free_limits', 'planned'),
   ('claude-web-licensed-handoff', 'anthropic', 'Claude web licensed handoff', 'licensed_handoff', 'manual', 1, 0, 0, 0, 1, 1, 'included_with_license_limits', 'planned'),
   ('copilot-vscode-bridge', 'copilot', 'VS Code Copilot bridge', 'subscription_native', 'ide_bridge', 1, 0, 1, 1, 0, 0, 'included_with_license_limits', 'planned'),

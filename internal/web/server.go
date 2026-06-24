@@ -244,6 +244,7 @@ func NewServer(store sqlitecli.Store) Server {
 			provider.CodexAppServerDriver{},
 			provider.UnavailableDriver{ProviderID: "openai", Reason: "ChatGPT handoff driver is not implemented yet"},
 			provider.ClaudeCLIDriver{},
+			provider.ClaudeSDKBridgeDriver{},
 			provider.CopilotBridgeDriver{},
 			provider.UnavailableDriver{ProviderID: "gemini", Reason: "Gemini bridge driver is not implemented yet"},
 			provider.UnavailableDriver{ProviderID: "ollama", Reason: "Ollama local model driver is not implemented yet"},

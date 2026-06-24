@@ -257,6 +257,166 @@ func (d ClaudeCLIDriver) Ping(ctx context.Context) error {
 	return nil
 }
 
+// ClaudeSDKBridgeDriver calls the Ergo Loom Python bridge that wraps
+// claude_code_sdk. The bridge streams SSE events so the driver can emit
+// token deltas in real time.
+//
+// Set ERGO_CLAUDE_SDK_BRIDGE_URL (default http://127.0.0.1:3764) and start
+// the bridge with: python tools/claude-sdk-bridge/main.py
+type ClaudeSDKBridgeDriver struct {
+	BridgeURL string
+}
+
+func (d ClaudeSDKBridgeDriver) ProviderPluginID() string { return "anthropic" }
+
+func (d ClaudeSDKBridgeDriver) CanExecute(request ChatRequest) bool {
+	return request.ProviderPluginID == "anthropic" &&
+		request.RouteTransport == "claude_sdk_bridge" &&
+		strings.TrimSpace(d.bridgeURL()) != ""
+}
+
+func (d ClaudeSDKBridgeDriver) bridgeURL() string {
+	return strings.TrimRight(
+		strings.TrimSpace(firstNonEmpty(d.BridgeURL, os.Getenv("ERGO_CLAUDE_SDK_BRIDGE_URL"), "http://127.0.0.1:3764")),
+		"/",
+	)
+}
+
+func (d ClaudeSDKBridgeDriver) Respond(ctx context.Context, request ChatRequest, onEvent func(Event)) (ChatResponse, error) {
+	if !d.CanExecute(request) {
+		return ChatResponse{}, driverError(ErrKindUnavailable, "Claude SDK bridge is not available; start tools/claude-sdk-bridge/main.py and set ERGO_CLAUDE_SDK_BRIDGE_URL")
+	}
+
+	payload := map[string]string{
+		"prompt":         request.Input,
+		"sessionId":      request.ExternalThreadID,
+		"modelRef":       request.ModelRef,
+		"thinkingEffort": request.ThinkingEffort,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return ChatResponse{}, driverError(ErrKindFatal, err.Error())
+	}
+
+	onEvent(Event{Kind: EventKindStatus, Text: "Connecting to Claude SDK bridge"})
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, d.bridgeURL()+"/v1/claude/chat", bytes.NewReader(body))
+	if err != nil {
+		return ChatResponse{}, driverError(ErrKindFatal, err.Error())
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+
+	resp, err := (&http.Client{Timeout: 10 * time.Minute}).Do(httpReq)
+	if err != nil {
+		return ChatResponse{}, driverError(ErrKindTransient, "Claude SDK bridge unreachable: "+err.Error())
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return ChatResponse{}, httpDriverError(resp.StatusCode, "Claude SDK bridge: "+strings.TrimSpace(string(msg)))
+	}
+
+	var fullText strings.Builder
+	var sessionID = request.ExternalThreadID
+	var streamed bool
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		var ev struct {
+			Type    string          `json:"type"`
+			Payload json.RawMessage `json:"payload"`
+		}
+		if err := json.Unmarshal([]byte(data), &ev); err != nil {
+			continue
+		}
+		switch ev.Type {
+		case "delta":
+			var p struct{ Text string `json:"text"` }
+			if err := json.Unmarshal(ev.Payload, &p); err == nil && p.Text != "" {
+				fullText.WriteString(p.Text)
+				streamed = true
+				onEvent(Event{Kind: EventKindDelta, Text: p.Text})
+			}
+		case "tool_start":
+			var p struct {
+				ToolName string `json:"toolName"`
+				ToolID   string `json:"toolId"`
+				Command  string `json:"command"`
+			}
+			if err := json.Unmarshal(ev.Payload, &p); err == nil {
+				onEvent(Event{Kind: EventKindToolStart, Tool: &toolruntime.Event{
+					Type:     "sdk_tool",
+					ToolID:   firstNonEmpty(p.ToolID, p.ToolName),
+					ToolName: p.ToolName,
+					Command:  p.Command,
+					Text:     "Claude requested " + p.ToolName,
+					Status:   "started",
+				}})
+			}
+		case "done":
+			var p struct {
+				Text      string `json:"text"`
+				SessionID string `json:"sessionId"`
+			}
+			if err := json.Unmarshal(ev.Payload, &p); err == nil {
+				if p.SessionID != "" {
+					sessionID = p.SessionID
+				}
+				if !streamed && strings.TrimSpace(p.Text) != "" {
+					fullText.Reset()
+					fullText.WriteString(p.Text)
+				}
+			}
+		case "error":
+			var p struct{ Message string `json:"message"` }
+			if err := json.Unmarshal(ev.Payload, &p); err == nil {
+				return ChatResponse{ExternalThreadID: sessionID, Streamed: streamed},
+					driverError(ErrKindTransient, "Claude SDK bridge error: "+p.Message)
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return ChatResponse{ExternalThreadID: sessionID, Streamed: streamed}, driverError(ErrKindTransient, err.Error())
+	}
+
+	final := strings.TrimSpace(fullText.String())
+	if final == "" {
+		return ChatResponse{ExternalThreadID: sessionID, Streamed: streamed},
+			driverError(ErrKindTransient, "Claude SDK bridge returned an empty response")
+	}
+	return ChatResponse{Text: final, ExternalThreadID: sessionID, Streamed: streamed}, nil
+}
+
+func (d ClaudeSDKBridgeDriver) Ping(ctx context.Context) error {
+	url := d.bridgeURL()
+	if url == "" {
+		return driverError(ErrKindUnavailable, "Claude SDK bridge URL is not configured")
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(pingCtx, http.MethodGet, url+"/healthz", nil)
+	if err != nil {
+		return driverError(ErrKindFatal, err.Error())
+	}
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return driverError(ErrKindTransient, "Claude SDK bridge unreachable: "+err.Error())
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return driverError(ErrKindTransient, fmt.Sprintf("Claude SDK bridge health check failed: %d", resp.StatusCode))
+	}
+	return nil
+}
+
 type CopilotBridgeDriver struct {
 	BridgeURL string
 }
