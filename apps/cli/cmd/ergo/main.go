@@ -189,18 +189,22 @@ func defaultStore() sqlitecli.Store {
 func runApp(store sqlitecli.Store, args []string) error {
 	flags := flag.NewFlagSet("app", flag.ContinueOnError)
 	addr := flags.String("addr", "127.0.0.1:3763", "address for the local chat app")
+	debug := flags.Bool("debug", false, "enable debug logging (developer mode)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
-		return errors.New("usage: ergo app [--addr 127.0.0.1:3763]")
+		return errors.New("usage: ergo app [--addr 127.0.0.1:3763] [--debug]")
 	}
 	if err := store.Init(); err != nil {
 		return err
 	}
 
-	server := web.NewServer(store)
+	server := web.NewServer(store, web.ServerOptions{Debug: *debug})
 	fmt.Printf("Ergo Loom chat app: http://%s\n", *addr)
+	if *debug {
+		fmt.Println("developer mode: debug logging enabled")
+	}
 	return http.ListenAndServe(*addr, server.Handler())
 }
 

@@ -73,33 +73,50 @@ type ChatDriver interface {
 	Ping(ctx context.Context) error
 }
 
+// DriverRegistry maps provider requests to chat drivers. Multiple drivers may
+// share the same provider plugin ID (e.g. ClaudeCLIDriver and
+// ClaudeSDKBridgeDriver are both "anthropic"). GetForRequest finds the first
+// driver whose CanExecute returns true for the specific request transport.
 type DriverRegistry struct {
-	drivers map[string]ChatDriver
+	drivers []ChatDriver
 }
 
 func NewDriverRegistry(drivers ...ChatDriver) DriverRegistry {
-	registry := DriverRegistry{drivers: make(map[string]ChatDriver, len(drivers))}
-	for _, driver := range drivers {
-		if driver == nil {
+	var list []ChatDriver
+	for _, d := range drivers {
+		if d == nil || strings.TrimSpace(d.ProviderPluginID()) == "" {
 			continue
 		}
-		providerID := strings.TrimSpace(driver.ProviderPluginID())
-		if providerID == "" {
-			continue
-		}
-		registry.drivers[providerID] = driver
+		list = append(list, d)
 	}
-	return registry
+	return DriverRegistry{drivers: list}
 }
 
+// GetForRequest returns the first driver that can handle this specific request.
+func (r DriverRegistry) GetForRequest(request ChatRequest) (ChatDriver, bool) {
+	for _, d := range r.drivers {
+		if d.ProviderPluginID() == request.ProviderPluginID && d.CanExecute(request) {
+			return d, true
+		}
+	}
+	return nil, false
+}
+
+// Get returns the first driver registered for providerPluginID regardless of
+// transport. Used for ping/diagnostics where no specific request is available.
 func (r DriverRegistry) Get(providerPluginID string) (ChatDriver, bool) {
-	driver, ok := r.drivers[strings.TrimSpace(providerPluginID)]
-	return driver, ok
+	providerPluginID = strings.TrimSpace(providerPluginID)
+	for _, d := range r.drivers {
+		if d.ProviderPluginID() == providerPluginID {
+			return d, true
+		}
+	}
+	return nil, false
 }
 
 func (r DriverRegistry) CanExecute(request ChatRequest) bool {
-	driver, ok := r.Get(request.ProviderPluginID)
-	return ok && driver.CanExecute(request)
+	_, ok := r.GetForRequest(request)
+	return ok
 }
 
 type CodexAppServerDriver struct {
@@ -272,7 +289,15 @@ func (d ClaudeSDKBridgeDriver) ProviderPluginID() string { return "anthropic" }
 func (d ClaudeSDKBridgeDriver) CanExecute(request ChatRequest) bool {
 	return request.ProviderPluginID == "anthropic" &&
 		request.RouteTransport == "claude_sdk_bridge" &&
-		strings.TrimSpace(d.bridgeURL()) != ""
+		strings.TrimSpace(d.explicitBridgeURL()) != ""
+}
+
+// explicitBridgeURL returns the bridge URL only when explicitly configured via
+// BridgeURL field or ERGO_CLAUDE_SDK_BRIDGE_URL env. Falls back to empty string
+// (not the default port) so CanExecute=false when the bridge is not set up,
+// avoiding an unnecessary connection failure before falling through to ClaudeCLIDriver.
+func (d ClaudeSDKBridgeDriver) explicitBridgeURL() string {
+	return strings.TrimRight(strings.TrimSpace(firstNonEmpty(d.BridgeURL, os.Getenv("ERGO_CLAUDE_SDK_BRIDGE_URL"))), "/")
 }
 
 func (d ClaudeSDKBridgeDriver) bridgeURL() string {

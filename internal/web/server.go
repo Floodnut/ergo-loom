@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -45,10 +46,12 @@ type Server struct {
 	kbScopePolicy      []PolicyEntry
 	knowledge          core.KnowledgeRetriever
 	moderator          core.Moderator
-	sessionCancelMu    sync.Mutex
-	sessionCancels     map[string]context.CancelFunc
-	sessionExcludedMu  sync.Mutex
-	sessionExcluded    map[string]map[string]bool // sessionID → set of excluded routeIDs
+	sessionCancelMu       sync.Mutex
+	sessionCancels        map[string]context.CancelFunc
+	sessionExcludedMu     sync.Mutex
+	sessionExcluded       map[string]map[string]bool // sessionID → set of excluded routeIDs
+	sessionDisabledGroups map[string]map[string]bool // sessionID → set of disabled provider group IDs
+	debug                 bool
 }
 
 const providerSoftTokenCap = 50000
@@ -217,8 +220,22 @@ func (b *approvalBroker) resolve(id string, decision string) bool {
 	return true
 }
 
-func NewServer(store sqlitecli.Store) Server {
+// ServerOptions configures optional server behavior.
+type ServerOptions struct {
+	Debug bool // enable debug-level structured logging
+}
+
+func NewServer(store sqlitecli.Store, opts ...ServerOptions) Server {
+	var opt ServerOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	if opt.Debug {
+		slog.SetLogLoggerLevel(slog.LevelDebug)
+		slog.Debug("debug mode enabled")
+	}
 	return Server{
+		debug: opt.Debug,
 		store:           store,
 		approvals:       newApprovalBroker(),
 		push:            newSessionPushBroker(),
@@ -228,8 +245,9 @@ func NewServer(store sqlitecli.Store) Server {
 		routePolicies:   routepolicy.NewRegistry(),
 		knowledge:       knowledge.NewKeywordRetriever(store),
 		moderator:       core.DefaultModerator{},
-		sessionCancels:  make(map[string]context.CancelFunc),
-		sessionExcluded: make(map[string]map[string]bool),
+		sessionCancels:        make(map[string]context.CancelFunc),
+		sessionExcluded:       make(map[string]map[string]bool),
+		sessionDisabledGroups: make(map[string]map[string]bool),
 		toolApprovalPolicy: []PolicyEntry{
 			{Name: "safe-only", Label: "Safe Only"},
 			{Name: "ask-per-command", Label: "Ask Per Command"},
@@ -1621,6 +1639,27 @@ func (s *Server) sessionExcludedRoutes(sessionID string) map[string]bool {
 	return result
 }
 
+// addSessionDisabledGroup marks a provider group as disabled for the session so
+// that moderatedSelectionForActiveChat immediately routes to the fallback provider
+// without retrying the failed group. Called when ActionFailover is triggered.
+func (s *Server) addSessionDisabledGroup(sessionID, groupID string) {
+	if sessionID == "" || groupID == "" {
+		return
+	}
+	s.sessionExcludedMu.Lock()
+	defer s.sessionExcludedMu.Unlock()
+	if s.sessionDisabledGroups[sessionID] == nil {
+		s.sessionDisabledGroups[sessionID] = make(map[string]bool)
+	}
+	s.sessionDisabledGroups[sessionID][groupID] = true
+}
+
+func (s *Server) isSessionGroupDisabled(sessionID, groupID string) bool {
+	s.sessionExcludedMu.Lock()
+	defer s.sessionExcludedMu.Unlock()
+	return s.sessionDisabledGroups[sessionID][groupID]
+}
+
 func (s *Server) executeMainRun(ctx context.Context, req RunRequest, onEvent func(kind string, payload any)) error {
 	if onEvent == nil {
 		onEvent = func(string, any) {}
@@ -1696,9 +1735,12 @@ func (s *Server) executeMainRun(ctx context.Context, req RunRequest, onEvent fun
 		s.recordTokenUsage(sessionID, selection, assistantInput, "", "error")
 		decision := s.moderationDecision(sessionID, providerSegment, reason)
 		if decision.Action == core.ActionFailover {
+			slog.Debug("failover triggered", "session", sessionID, "from_route", selection.Route.ID, "reason", string(reason))
 			s.addSessionExcludedRoute(sessionID, selection.Route.ID)
+			s.addSessionDisabledGroup(sessionID, providerGroupID(selection.Route.ProviderPluginID))
 			nextSelection, failoverErr := s.resolveChatSelectionExcluding(sessionID, selection.Route.ID)
 			if failoverErr == nil {
+				slog.Debug("failover target resolved", "session", sessionID, "to_route", nextSelection.Route.ID)
 				selection = nextSelection
 				contextNote = "Failover after " + string(reason)
 				statusPayload := map[string]string{"text": "Failing over to " + selection.Route.DisplayName + " / " + selection.Model.DisplayName}
@@ -1845,6 +1887,7 @@ func (s *Server) maybeConsumeQueue(sessionID string) {
 	if err != nil {
 		return
 	}
+	slog.Debug("queue item consumed", "session", sessionID, "item", item.ID, "mode", string(item.Mode), "route", item.RouteID)
 	s.push.publish(sessionID, "queue_item_consumed", map[string]any{"queueItemId": item.ID, "mode": string(item.Mode)})
 	onEvent := func(kind string, payload any) {
 		s.push.publish(sessionID, kind, payload)
@@ -2238,17 +2281,16 @@ func textChunks(text string) []string {
 }
 
 func (s Server) runAssistant(ctx context.Context, sessionID string, content string, thinkingEffort string, selection chatSelection, onEvent func(provider.Event)) (string, bool, error) {
-	driver, ok := s.drivers.Get(selection.Route.ProviderPluginID)
-	if !ok {
-		return "", false, fmt.Errorf("%s has no Ergo Loom chat driver", selection.Route.DisplayName)
-	}
 	request, err := s.providerChatRequest(sessionID, content, thinkingEffort, selection)
 	if err != nil {
 		return "", false, err
 	}
-	if !driver.CanExecute(request) {
+	driver, ok := s.drivers.GetForRequest(request)
+	if !ok {
+		slog.Debug("no driver for request", "route", selection.Route.ID, "transport", selection.Route.Transport, "provider", selection.Route.ProviderPluginID)
 		return "", false, fmt.Errorf("%s is not executable from Ergo Loom chat yet", selection.Route.DisplayName)
 	}
+	slog.Debug("driver selected", "route", selection.Route.ID, "transport", selection.Route.Transport, "model", selection.Model.ModelRef)
 	response, err := driver.Respond(ctx, request, onEvent)
 	if response.ExternalThreadID != "" {
 		bindingInput := providerChatBindingInput(sessionID, selection)
@@ -2265,6 +2307,17 @@ func (s *Server) moderatedSelectionForActiveChat(sessionID string, selection cha
 	expired, used, err := s.providerGroupSoftExpired(expiredGroup)
 	if err != nil {
 		return selection, nil, err
+	}
+	// Also treat as expired if this provider group failed in this session (ActionFailover).
+	// This prevents re-trying a provider whose API is actually exhausted but whose
+	// Ergo Loom token tracking hasn't yet hit the soft cap.
+	if !expired {
+		if s.isSessionGroupDisabled(sessionID, expiredGroup) {
+			slog.Debug("provider group disabled in session, routing to secondary", "session", sessionID, "group", expiredGroup)
+			expired = true
+		}
+	} else {
+		slog.Debug("provider group soft-expired", "session", sessionID, "group", expiredGroup, "used_tokens", used, "cap", providerSoftTokenCap)
 	}
 	if !expired {
 		return selection, nil, nil
@@ -2616,6 +2669,9 @@ func (s *Server) resolveChatSelectionExcluding(sessionID string, excludeRouteID 
 func (s *Server) resolveChatSelectionWithExclusions(sessionID string, routeID string, modelID string, excludedRouteIDs map[string]bool) (chatSelection, error) {
 	routeID = strings.TrimSpace(routeID)
 	modelID = strings.TrimSpace(modelID)
+	if excludedRouteIDs == nil {
+		excludedRouteIDs = make(map[string]bool)
+	}
 	for k, v := range s.sessionExcludedRoutes(sessionID) {
 		excludedRouteIDs[k] = v
 	}
@@ -2748,7 +2804,7 @@ func (s *Server) resolveChatSelectionWithExclusions(sessionID string, routeID st
 		Model:   selectedModel,
 		Profile: selectedProfile,
 	}
-	if !s.drivers.CanExecute(chatRequestFromSelection(sessionIDForCapabilityCheck, "", "", selection, "")) {
+	if _, ok := s.drivers.GetForRequest(chatRequestFromSelection(sessionIDForCapabilityCheck, "", "", selection, "")); !ok {
 		return chatSelection{}, fmt.Errorf("%s is not executable from Ergo Loom chat yet", selection.Route.DisplayName)
 	}
 	return selection, nil

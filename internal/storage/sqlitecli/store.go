@@ -299,7 +299,10 @@ func (s Store) Init() error {
 	if err := s.ensureProjectKbScopePolicyColumn(); err != nil {
 		return err
 	}
-	return s.ensureCandidateTriggerEventColumn()
+	if err := s.ensureCandidateTriggerEventColumn(); err != nil {
+		return err
+	}
+	return s.ensureClaudeSDKBridgeRoute()
 }
 
 func (s Store) ListSessions() ([]core.Session, error) {
@@ -3060,6 +3063,23 @@ func (s Store) ensureCandidateTriggerEventColumn() error {
 		}
 	}
 	return s.run(`CREATE INDEX IF NOT EXISTS idx_candidate_outputs_trigger ON candidate_outputs(session_id, trigger_event_id, status);`)
+}
+
+// ensureClaudeSDKBridgeRoute adds claude-sdk-bridge to the default project's
+// access routes at priority 15 (sdk → cli → handoff order) if not already present.
+func (s Store) ensureClaudeSDKBridgeRoute() error {
+	out, err := s.queryJSON(`
+SELECT COUNT(*) AS n FROM project_access_routes
+WHERE project_id = 'default' AND access_route_id = 'claude-sdk-bridge';`)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(out, `"n":1`) {
+		return nil
+	}
+	return s.run(`
+INSERT OR IGNORE INTO project_access_routes (project_id, access_route_id, enabled, priority)
+VALUES ('default', 'claude-sdk-bridge', 1, 15);`)
 }
 
 func (s Store) ensureSessionProjectColumn() error {

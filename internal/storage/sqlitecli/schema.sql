@@ -181,13 +181,16 @@ CREATE TABLE IF NOT EXISTS command_runs (
   finished_at TEXT
 );
 
+-- Claude fallback order within 'anthropic' group: sdk(15) → cli(20) → handoff(30/35)
+-- sdk and cli require a paid subscription; handoff is the free/licensed fallback.
 INSERT OR IGNORE INTO project_access_routes (project_id, access_route_id, enabled, priority) VALUES
-  ('default', 'codex-subscription-cli', 1, 10),
-  ('default', 'claude-code-cli', 1, 20),
-  ('default', 'claude-web-free-handoff', 1, 30),
-  ('default', 'claude-web-licensed-handoff', 1, 40),
-  ('default', 'copilot-sdk-cli', 1, 50),
-  ('default', 'copilot-vscode-bridge', 1, 60);
+  ('default', 'codex-subscription-cli',      1, 10),
+  ('default', 'claude-sdk-bridge',            1, 15),
+  ('default', 'claude-code-cli',              1, 20),
+  ('default', 'claude-web-free-handoff',      1, 30),
+  ('default', 'claude-web-licensed-handoff',  1, 35),
+  ('default', 'copilot-sdk-cli',              1, 50),
+  ('default', 'copilot-vscode-bridge',        1, 60);
 
 CREATE TABLE IF NOT EXISTS provider_chats (
   id TEXT PRIMARY KEY,
