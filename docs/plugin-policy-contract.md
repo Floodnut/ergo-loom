@@ -268,6 +268,10 @@ executeWithSelection(ctx, sessionID, content, nextSelection, ...)
     → starts new ProviderSegment on the new route
 ```
 
+The current server implementation performs one inline failover retry for a
+streamed chat response. Future queue workers may move this into a reusable
+`executeWithSelection` helper.
+
 When `OnSegmentEnd` returns `ActionTerminate`:
 
 ```text
@@ -294,11 +298,11 @@ decision := moderator.OnSegmentEnd(core.ModerationContext{
 
 ### Implementation Checklist
 
-- `handleFailover(ctx, sessionID, failedSelection, content, ...)` in `server.go`
-- `resolveChatSelectionExcluding(sessionID, excludeRouteID)` in `server.go`
+- `handleFailover(ctx, sessionID, failedSelection, content, ...)` in `server.go` or equivalent inline flow
+- `resolveChatSelectionExcluding(sessionID, excludeRouteID)` in `server.go` — implemented for streamed chat failover
 - `maybeConsumeQueue(sessionID)` in `server.go`, called after `ActionTerminate`
-- Wire `segmentEndReason` → `moderator.OnSegmentEnd` → `switch decision.Action` in `streamSessionMessage`
-- Populate `ModerationContext.QueueDepth` from `ListPendingQueueItems`
+- Wire `segmentEndReason` → `moderator.OnSegmentEnd` → `switch decision.Action` in `streamSessionMessage` — failover path implemented
+- Populate `ModerationContext.QueueDepth` from `ListPendingQueueItems` — implemented
 
 ## Tool Runtime And Approval Policy
 
@@ -571,11 +575,11 @@ for user approval. `queued` runs are not active — they have not started yet.
 // active = running or waiting_approval only
 func (s Store) GetActiveChatRun(sessionID string) (core.ChatRun, error)
 
-// next item waiting to be consumed
+// optional queued ChatRun helper; current server queue consumption uses QueueItem
 func (s Store) NextQueuedChatRun(sessionID string) (core.ChatRun, error)
 
 // transition queued → running before execution
-func (s Store) UpdateChatRunStatus(id string, status core.ChatRunStatus) error
+func (s Store) UpdateChatRunStatus(id string, status core.ChatRunStatus) (core.ChatRun, error)
 ```
 
 The existing `ActiveMainChatRun` includes `queued` in its status filter. It
@@ -606,19 +610,25 @@ execute immediately              mode?
 ### Queue Consumption
 
 `maybeConsumeQueue` runs after every `CompleteChatRun` and after a Moderator
-`ActionTerminate` decision:
+`ActionTerminate` decision. The current server queue is `chat_queue_items`;
+queued `ChatRun` records are not the primary queue source.
 
 ```go
 func (s Server) maybeConsumeQueue(sessionID string) {
     if _, err := s.store.GetActiveChatRun(sessionID); err == nil {
         return // active run still present
     }
-    run, err := s.store.NextQueuedChatRun(sessionID)
-    if err != nil {
+    items, err := s.store.ListPendingQueueItems(sessionID)
+    if err != nil || len(items) == 0 {
         return // queue empty
     }
-    s.store.UpdateChatRunStatus(run.ID, core.ChatRunRunning)
-    go s.executeChatRun(run)
+    item := items[0]
+    s.store.UpdateQueueItemStatus(item.ID, core.QueueItemConsumed)
+    req, err := s.runRequestFromQueueItem(item)
+    if err != nil {
+        return
+    }
+    go s.executeMainRun(context.Background(), req, func(string, any) {})
 }
 ```
 
@@ -637,21 +647,133 @@ ON chat_runs(session_id, branch_id, role, status);
   `GetActiveChatRun` as a separate store method
 - Add `NextQueuedChatRun` store method
 - Add `UpdateChatRunStatus` store method
-- Add `maybeConsumeQueue` to server, call after `CompleteChatRun`
+- Add `maybeConsumeQueue` to server, consuming `chat_queue_items` in order
 - Update `streamSessionMessage` to check active run before executing:
   normal → queue, steering → inject, no active run → execute immediately
 
-## Knowledge Boundary
+## executeMainRun Refactoring
 
-Knowledge is reusable context, not a transcript dump.
+`streamSessionMessage` currently mixes HTTP parsing, route resolution, context
+packet building, provider execution, and result persistence in one function.
+`maybeConsumeQueue` and `handleFailover` both need to execute the same core
+flow without an HTTP context. Extract `executeMainRun` as the shared execution
+core.
 
-Initial scopes:
+### RunRequest
 
-- project knowledge
-- global knowledge
+```go
+type RunRequest struct {
+    SessionID      string
+    Content        string        // user input; used to build the context packet
+    ThinkingEffort string
+    Selection      chatSelection // resolved route/model/profile
+    ContextNote    string        // handoff reason or empty
+}
+```
 
-Promotion should be explicit or policy-driven. Context packet policies decide
-how much retrieved knowledge is included in provider input.
+### executeMainRun
+
+```go
+func (s Server) executeMainRun(
+    ctx context.Context,
+    req RunRequest,
+    onEvent func(kind string, payload any),
+) error
+```
+
+Internal sequence:
+
+```text
+AddMessage(user)
+    ↓
+buildContextPacket(req)
+    ↓
+startMainChatRun → startProviderSegment
+    ↓
+runAssistant → onEvent(delta/status/tool_*)
+    ↓
+success:
+    AddMessage(assistant) → completeProviderSegment → completeChatRun
+    → maybeConsumeQueue(req.SessionID)
+
+failure:
+    segmentEndReason(err) → moderator.OnSegmentEnd(ModerationContext{...})
+    → ActionFailover  : handleFailover(ctx, req, onEvent)
+    → ActionTerminate : completeChatRun(failed) + maybeConsumeQueue
+    → ActionSuspend   : completeChatRun(failed) + onEvent("error", ...)
+```
+
+`streamSessionMessage` becomes HTTP plumbing only — it parses input, handles
+the steering/queue branch, then delegates to `executeMainRun` with an `onEvent`
+that writes SSE frames.
+
+### maybeConsumeQueue
+
+```go
+func (s Server) maybeConsumeQueue(sessionID string) {
+    if _, err := s.store.GetActiveChatRun(sessionID); err == nil {
+        return
+    }
+    items, err := s.store.ListPendingQueueItems(sessionID)
+    if err != nil || len(items) == 0 {
+        return
+    }
+    item := items[0]
+    s.store.UpdateQueueItemStatus(item.ID, core.QueueItemConsumed)
+    req, err := s.runRequestFromQueueItem(item)
+    if err != nil {
+        return
+    }
+    go s.executeMainRun(context.Background(), req, func(kind string, payload any) {
+        // no HTTP writer; SSE notification is a future addition
+    })
+}
+```
+
+### runRequestFromQueueItem
+
+Restores a `RunRequest` from a queued item. The `ChatRun` is created only when
+the item is consumed and execution begins.
+
+```go
+func (s Server) runRequestFromQueueItem(item core.QueueItem) (RunRequest, error) {
+    selection, err := s.resolveChatSelection(item.SessionID, item.RouteID, item.ModelID)
+    // item.Content        → Content
+    // item.ThinkingEffort → ThinkingEffort
+}
+```
+
+`queue_items.thinking_effort` exists and survives the queue round-trip.
+
+### handleFailover
+
+```go
+func (s Server) handleFailover(
+    ctx context.Context,
+    req RunRequest,
+    onEvent func(string, any),
+) error {
+    next, err := s.resolveChatSelectionExcluding(req.SessionID, req.Selection.Route.ID)
+    if err != nil {
+        return err
+    }
+    s.maybeGenerateHandoffSummary(req.SessionID, next)
+    req.Selection = next
+    return s.executeMainRun(ctx, req, onEvent)
+}
+```
+
+`executeMainRun` is re-entrant: failover simply rebuilds the selection and
+re-enters the same execution core.
+
+### Implementation Checklist
+
+- Define `RunRequest` type
+- Extract `executeMainRun` from `streamSessionMessage`
+- Implement `runRequestFromQueueItem`
+- Implement `maybeConsumeQueue`, call it at end of `executeMainRun` success
+- Implement failover using `resolveChatSelectionExcluding` and the shared run core
+- Confirm `queue_items.thinking_effort` column exists — done
 
 ## Team Rule
 

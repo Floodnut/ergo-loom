@@ -35,14 +35,24 @@ type Server struct {
 	handoffPolicies handoffpolicy.Registry
 	routePolicies   routepolicy.Registry
 	knowledge       core.KnowledgeRetriever
+	moderator       core.Moderator
 }
 
 const providerSoftTokenCap = 50000
+const contextKnowledgeLimit = 3
 
 type chatSelection struct {
 	Route   sqlitecli.AccessRoute
 	Model   sqlitecli.ProviderModel
 	Profile sqlitecli.ProviderProfile
+}
+
+type RunRequest struct {
+	SessionID      string
+	Content        string
+	ThinkingEffort string
+	Selection      chatSelection
+	ContextNote    string
 }
 
 type moderatorHandoff struct {
@@ -152,6 +162,7 @@ func NewServer(store sqlitecli.Store) Server {
 		handoffPolicies: handoffpolicy.NewRegistry(),
 		routePolicies:   routepolicy.NewRegistry(),
 		knowledge:       knowledge.NewKeywordRetriever(store),
+		moderator:       core.DefaultModerator{},
 		drivers: provider.NewDriverRegistry(
 			provider.CodexAppServerDriver{},
 			provider.UnavailableDriver{ProviderID: "openai", Reason: "ChatGPT handoff driver is not implemented yet"},
@@ -1342,122 +1353,167 @@ func (s Server) streamSessionMessage(w http.ResponseWriter, r *http.Request, ses
 	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 
+	_ = s.executeMainRun(r.Context(), RunRequest{
+		SessionID:      sessionID,
+		Content:        content,
+		ThinkingEffort: input.ThinkingEffort,
+		Selection:      selection,
+	}, func(kind string, payload any) {
+		writeStreamEvent(w, kind, payload)
+		flusher.Flush()
+	})
+}
+
+func (s Server) executeMainRun(ctx context.Context, req RunRequest, onEvent func(kind string, payload any)) error {
+	if onEvent == nil {
+		onEvent = func(string, any) {}
+	}
+	sessionID := strings.TrimSpace(req.SessionID)
+	content := strings.TrimSpace(req.Content)
+	if sessionID == "" {
+		return errors.New("session id is required")
+	}
+	if content == "" {
+		return errors.New("message content is required")
+	}
+
 	userMessage, err := s.store.AddMessage(sessionID, "user", content)
 	if err != nil {
-		writeStreamEvent(w, "error", map[string]string{"message": err.Error()})
-		flusher.Flush()
-		return
+		onEvent("error", map[string]string{"message": err.Error()})
+		return err
 	}
-	writeStreamEvent(w, "message", userMessage)
-	flusher.Flush()
+	onEvent("message", userMessage)
 
 	assistantActivityIndex := s.nextAssistantActivityIndex(sessionID)
-	writeStreamEvent(w, "assistant_start", map[string]string{"role": "assistant"})
+	onEvent("assistant_start", map[string]string{"role": "assistant"})
 	s.recordMessageEvent(sessionID, assistantActivityIndex, "status", map[string]string{"text": "Started assistant reply"})
-	flusher.Flush()
 
-	selection, handoff, err := s.moderatedSelectionForActiveChat(sessionID, selection)
+	selection, handoff, err := s.moderatedSelectionForActiveChat(sessionID, req.Selection)
 	if err != nil {
-		writeStreamEvent(w, "error", map[string]string{"message": err.Error()})
-		flusher.Flush()
-		return
+		onEvent("error", map[string]string{"message": err.Error()})
+		return err
 	}
-	contextNote := ""
+	contextNote := strings.TrimSpace(req.ContextNote)
 	if handoff != nil {
-		contextNote = handoff.Reason
+		contextNote = strings.TrimSpace(strings.Join(compactStrings([]string{contextNote, handoff.Reason}), " · "))
 		payload := map[string]string{"text": handoff.Reason}
-		writeStreamEvent(w, "assistant_status", payload)
+		onEvent("assistant_status", payload)
 		s.recordMessageEvent(sessionID, assistantActivityIndex, "status", payload)
-		flusher.Flush()
 	}
-	s.maybeGenerateHandoffSummary(sessionID, selection)
-	contextPacket := s.buildContextPacket(sessionID, content, selection, contextNote)
-	if _, err := s.store.SaveContextPacket(contextPacket); err != nil {
-		payload := map[string]string{"text": "Context packet persistence failed: " + err.Error()}
-		writeStreamEvent(w, "assistant_status", payload)
-		s.recordMessageEvent(sessionID, assistantActivityIndex, "status", payload)
-		flusher.Flush()
-	}
-	assistantInput := contextPacket.Content
-	packetPayload := map[string]string{"text": "Prepared Ergo Loom local context packet"}
-	writeStreamEvent(w, "assistant_status", packetPayload)
-	s.recordMessageEvent(sessionID, assistantActivityIndex, "status", packetPayload)
-	flusher.Flush()
 
-	chatRun := s.startMainChatRun(sessionID, contextPacket)
-	providerSegment := s.startProviderSegment(chatRun.ID, selection, contextNote)
-	s.recordContextEvent(sessionID, core.EventProviderRunStarted, providerRunPayloadRef(selection, "started"))
-	assistantContent, streamed, err := s.runAssistant(r.Context(), sessionID, assistantInput, input.ThinkingEffort, selection, func(event provider.Event) {
+	chatRun, providerSegment, assistantInput, err := s.prepareMainRun(sessionID, content, selection, contextNote, assistantActivityIndex, onEvent)
+	if err != nil {
+		return err
+	}
+	onAssistantEvent := func(event provider.Event) {
 		switch event.Kind {
 		case "delta":
-			writeStreamEvent(w, "assistant_delta", map[string]string{"text": event.Text})
+			onEvent("assistant_delta", map[string]string{"text": event.Text})
 		case "status":
 			payload := map[string]string{"text": event.Text}
-			writeStreamEvent(w, "assistant_status", payload)
+			onEvent("assistant_status", payload)
 			s.recordMessageEvent(sessionID, assistantActivityIndex, "status", payload)
 		case "tool_start", "tool_result", "approval_request", "tool_error", "turn_aborted":
 			payload := toolEventPayloadForSession(sessionID, event)
-			writeStreamEvent(w, event.Kind, payload)
+			onEvent(event.Kind, payload)
 			messageEvent := s.recordMessageEvent(sessionID, assistantActivityIndex, streamEventKindToActivityKind(event.Kind), payload)
 			s.recordProviderToolEvent(sessionID, event, messageEvent.ID)
 		}
-		flusher.Flush()
-	})
+	}
+
+	assistantContent, streamed, err := s.runAssistant(ctx, sessionID, assistantInput, req.ThinkingEffort, selection, onAssistantEvent)
 	if err != nil {
 		reason := segmentEndReason(err)
 		s.recordContextEvent(sessionID, core.EventProviderRunCompleted, providerRunPayloadRef(selection, string(reason)))
 		s.completeProviderSegment(providerSegment.ID, core.ProviderSegmentFailed, "")
-		s.completeChatRun(chatRun.ID, core.ChatRunFailed, "")
-		payload := map[string]string{"message": err.Error(), "reason": string(reason)}
-		writeStreamEvent(w, "error", payload)
-		s.recordMessageEvent(sessionID, assistantActivityIndex, "error", map[string]string{"text": err.Error(), "toolName": "chat", "reason": string(reason)})
-		flusher.Flush()
-		_ = s.store.AddTokenUsage(sqlitecli.TokenUsageInput{
-			ProviderPluginID:  selection.Route.ProviderPluginID,
-			ProviderProfileID: selection.Profile.ID,
-			SessionID:         sessionID,
-			Model:             selection.Model.ModelRef,
-			PromptTokens:      estimateTokens(assistantInput),
-			Status:            "error",
-		})
-		return
+		s.recordTokenUsage(sessionID, selection, assistantInput, "", "error")
+		decision := s.moderationDecision(sessionID, providerSegment, reason)
+		if decision.Action == core.ActionFailover {
+			nextSelection, failoverErr := s.resolveChatSelectionExcluding(sessionID, selection.Route.ID)
+			if failoverErr == nil {
+				selection = nextSelection
+				contextNote = "Failover after " + string(reason)
+				statusPayload := map[string]string{"text": "Failing over to " + selection.Route.DisplayName + " / " + selection.Model.DisplayName}
+				onEvent("assistant_status", statusPayload)
+				s.recordMessageEvent(sessionID, assistantActivityIndex, "status", statusPayload)
+				providerSegment, assistantInput, err = s.prepareMainRunForExistingChatRun(chatRun, sessionID, content, selection, contextNote, assistantActivityIndex, onEvent)
+				if err == nil {
+					assistantContent, streamed, err = s.runAssistant(ctx, sessionID, assistantInput, req.ThinkingEffort, selection, onAssistantEvent)
+				}
+			} else {
+				err = fmt.Errorf("%w; failover unavailable: %v", err, failoverErr)
+			}
+		}
+		if err != nil {
+			reason := segmentEndReason(err)
+			s.recordContextEvent(sessionID, core.EventProviderRunCompleted, providerRunPayloadRef(selection, string(reason)))
+			s.completeProviderSegment(providerSegment.ID, core.ProviderSegmentFailed, "")
+			s.completeChatRun(chatRun.ID, core.ChatRunFailed, "")
+			payload := map[string]string{"message": err.Error(), "reason": string(reason), "action": string(decision.Action)}
+			onEvent("error", payload)
+			s.recordMessageEvent(sessionID, assistantActivityIndex, "error", map[string]string{"text": err.Error(), "toolName": "chat", "reason": string(reason), "action": string(decision.Action)})
+			s.recordTokenUsage(sessionID, selection, assistantInput, "", "error")
+			return err
+		}
 	}
 	if strings.TrimSpace(assistantContent) == "" {
 		s.recordContextEvent(sessionID, core.EventProviderRunCompleted, providerRunPayloadRef(selection, "empty"))
 		s.completeProviderSegment(providerSegment.ID, core.ProviderSegmentFailed, "")
 		s.completeChatRun(chatRun.ID, core.ChatRunFailed, "")
 		payload := map[string]string{"message": "assistant returned an empty response"}
-		writeStreamEvent(w, "error", payload)
+		onEvent("error", payload)
 		s.recordMessageEvent(sessionID, assistantActivityIndex, "error", map[string]string{"text": payload["message"], "toolName": "chat"})
-		flusher.Flush()
-		return
+		return errors.New(payload["message"])
 	}
 
 	if !streamed {
-		streamTextChunks(r.Context(), w, flusher, assistantContent)
+		emitTextChunks(ctx, assistantContent, onEvent)
 	}
 
 	s.recordContextEvent(sessionID, core.EventProviderRunCompleted, providerRunPayloadRef(selection, "completed"))
 	s.completeProviderSegment(providerSegment.ID, core.ProviderSegmentCompleted, "")
 	assistantMessage, err := s.store.AddMessage(sessionID, "assistant", assistantContent)
 	if err != nil {
-		writeStreamEvent(w, "error", map[string]string{"message": err.Error()})
-		flusher.Flush()
-		return
+		onEvent("error", map[string]string{"message": err.Error()})
+		return err
 	}
 	outputEventID := s.currentHeadEventID(sessionID)
 	s.completeChatRun(chatRun.ID, core.ChatRunCompleted, outputEventID)
-	_ = s.store.AddTokenUsage(sqlitecli.TokenUsageInput{
-		ProviderPluginID:  selection.Route.ProviderPluginID,
-		ProviderProfileID: selection.Profile.ID,
-		SessionID:         sessionID,
-		Model:             selection.Model.ModelRef,
-		PromptTokens:      estimateTokens(assistantInput),
-		CompletionTokens:  estimateTokens(assistantContent),
-		Status:            "success",
-	})
-	writeStreamEvent(w, "assistant_done", assistantMessage)
-	flusher.Flush()
+	s.recordTokenUsage(sessionID, selection, assistantInput, assistantContent, "success")
+	onEvent("assistant_done", assistantMessage)
+	s.maybeConsumeQueue(sessionID)
+	return nil
+}
+
+func (s Server) prepareMainRun(sessionID string, content string, selection chatSelection, contextNote string, activityIndex int, onEvent func(string, any)) (core.ChatRun, core.ProviderSegment, string, error) {
+	s.maybeGenerateHandoffSummary(sessionID, selection)
+	contextPacket := s.buildContextPacket(sessionID, content, selection, contextNote)
+	if _, err := s.store.SaveContextPacket(contextPacket); err != nil {
+		payload := map[string]string{"text": "Context packet persistence failed: " + err.Error()}
+		onEvent("assistant_status", payload)
+		s.recordMessageEvent(sessionID, activityIndex, "status", payload)
+	}
+	assistantInput := contextPacket.Content
+	packetPayload := map[string]string{"text": "Prepared Ergo Loom local context packet"}
+	onEvent("assistant_status", packetPayload)
+	s.recordMessageEvent(sessionID, activityIndex, "status", packetPayload)
+	chatRun := s.startMainChatRun(sessionID, contextPacket)
+	providerSegment := s.startProviderSegment(chatRun.ID, selection, contextNote)
+	s.recordContextEvent(sessionID, core.EventProviderRunStarted, providerRunPayloadRef(selection, "started"))
+	return chatRun, providerSegment, assistantInput, nil
+}
+
+func (s Server) prepareMainRunForExistingChatRun(chatRun core.ChatRun, sessionID string, content string, selection chatSelection, contextNote string, activityIndex int, onEvent func(string, any)) (core.ProviderSegment, string, error) {
+	s.maybeGenerateHandoffSummary(sessionID, selection)
+	contextPacket := s.buildContextPacket(sessionID, content, selection, contextNote)
+	if _, err := s.store.SaveContextPacket(contextPacket); err != nil {
+		payload := map[string]string{"text": "Context packet persistence failed: " + err.Error()}
+		onEvent("assistant_status", payload)
+		s.recordMessageEvent(sessionID, activityIndex, "status", payload)
+	}
+	providerSegment := s.startProviderSegment(chatRun.ID, selection, contextNote)
+	s.recordContextEvent(sessionID, core.EventProviderRunStarted, providerRunPayloadRef(selection, "started"))
+	return providerSegment, contextPacket.Content, nil
 }
 
 func segmentEndReason(err error) core.SegmentEndReason {
@@ -1476,6 +1532,87 @@ func segmentEndReason(err error) core.SegmentEndReason {
 		return core.ReasonError
 	default:
 		return core.ReasonError
+	}
+}
+
+func (s Server) moderationDecision(sessionID string, segment core.ProviderSegment, reason core.SegmentEndReason) core.ModerationDecision {
+	if s.moderator == nil {
+		return core.ModerationDecision{Action: core.ActionSuspend}
+	}
+	session, _, err := s.store.GetSession(sessionID)
+	if err != nil {
+		return core.ModerationDecision{Action: core.ActionSuspend}
+	}
+	queueDepth := 0
+	if items, err := s.store.ListPendingQueueItems(sessionID); err == nil {
+		queueDepth = len(items)
+	}
+	return s.moderator.OnSegmentEnd(core.ModerationContext{
+		Session:       session,
+		ActiveSegment: segment,
+		Reason:        reason,
+		QueueDepth:    queueDepth,
+	})
+}
+
+func (s Server) maybeConsumeQueue(sessionID string) {
+	if strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	if _, err := s.store.GetActiveChatRun(sessionID); err == nil {
+		return
+	}
+	items, err := s.store.ListPendingQueueItems(sessionID)
+	if err != nil || len(items) == 0 {
+		return
+	}
+	item := items[0]
+	if _, err := s.store.UpdateQueueItemStatus(item.ID, core.QueueItemConsumed); err != nil {
+		return
+	}
+	req, err := s.runRequestFromQueueItem(item)
+	if err != nil {
+		return
+	}
+	go func() {
+		_ = s.executeMainRun(context.Background(), req, func(string, any) {})
+	}()
+}
+
+func (s Server) runRequestFromQueueItem(item core.QueueItem) (RunRequest, error) {
+	selection, err := s.resolveChatSelection(item.SessionID, item.RouteID, item.ModelID)
+	if err != nil {
+		return RunRequest{}, err
+	}
+	return RunRequest{
+		SessionID:      item.SessionID,
+		Content:        item.Content,
+		ThinkingEffort: item.ThinkingEffort,
+		Selection:      selection,
+	}, nil
+}
+
+func (s Server) recordTokenUsage(sessionID string, selection chatSelection, prompt string, completion string, status string) {
+	_ = s.store.AddTokenUsage(sqlitecli.TokenUsageInput{
+		ProviderPluginID:  selection.Route.ProviderPluginID,
+		ProviderProfileID: selection.Profile.ID,
+		SessionID:         sessionID,
+		Model:             selection.Model.ModelRef,
+		PromptTokens:      estimateTokens(prompt),
+		CompletionTokens:  estimateTokens(completion),
+		Status:            status,
+	})
+}
+
+func emitTextChunks(ctx context.Context, text string, onEvent func(string, any)) {
+	for _, chunk := range textChunks(text) {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		onEvent("assistant_delta", map[string]string{"text": chunk})
+		time.Sleep(18 * time.Millisecond)
 	}
 }
 
@@ -2026,7 +2163,7 @@ func (s Server) buildContextPacket(sessionID string, latestUserInput string, sel
 				SessionID: session.ID,
 				ProjectID: session.ProjectID,
 				Text:      text,
-				Limit:     3,
+				Limit:     contextKnowledgeLimit,
 			})
 		},
 	}
@@ -2104,6 +2241,18 @@ func providerGroupLabel(groupID string) string {
 }
 
 func (s Server) resolveChatSelection(sessionID string, routeID string, modelID string) (chatSelection, error) {
+	return s.resolveChatSelectionWithExclusions(sessionID, routeID, modelID, nil)
+}
+
+func (s Server) resolveChatSelectionExcluding(sessionID string, excludeRouteID string) (chatSelection, error) {
+	excluded := map[string]bool{}
+	if strings.TrimSpace(excludeRouteID) != "" {
+		excluded[strings.TrimSpace(excludeRouteID)] = true
+	}
+	return s.resolveChatSelectionWithExclusions(sessionID, "", "", excluded)
+}
+
+func (s Server) resolveChatSelectionWithExclusions(sessionID string, routeID string, modelID string, excludedRouteIDs map[string]bool) (chatSelection, error) {
 	routeID = strings.TrimSpace(routeID)
 	modelID = strings.TrimSpace(modelID)
 
@@ -2126,14 +2275,24 @@ func (s Server) resolveChatSelection(sessionID string, routeID string, modelID s
 		return chatSelection{}, err
 	}
 
+	models, err := s.store.ListProviderModels()
+	if err != nil {
+		return chatSelection{}, err
+	}
+
 	// Build candidates sorted by priority for route selection policy.
 	candidates := make([]core.RouteCandidate, 0, len(projectRoutes))
 	for _, r := range projectRoutes {
-		if r.Enabled && r.Route.Status == "available" {
+		if !r.Enabled || r.Route.Status != "available" || excludedRouteIDs[r.Route.ID] {
+			continue
+		}
+		for _, model := range preferredModelsForProvider(models, r.Route.ProviderPluginID) {
 			candidates = append(candidates, core.RouteCandidate{
 				RouteID:  r.Route.ID,
+				ModelID:  model.ID,
 				Priority: r.Priority,
 			})
+			break
 		}
 	}
 
@@ -2176,10 +2335,6 @@ func (s Server) resolveChatSelection(sessionID string, routeID string, modelID s
 		return chatSelection{}, fmt.Errorf("%s is not available yet", selectedRoute.DisplayName)
 	}
 
-	models, err := s.store.ListProviderModels()
-	if err != nil {
-		return chatSelection{}, err
-	}
 	var selectedModel sqlitecli.ProviderModel
 	for _, model := range models {
 		if model.ID == modelID {

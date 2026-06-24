@@ -53,7 +53,14 @@ func (ManualPolicy) Select(ctx core.RouteSelectionContext) (string, string, erro
 	}
 	// Session active route.
 	if ctx.Session.ActiveRouteID != "" {
-		return ctx.Session.ActiveRouteID, ctx.Session.ActiveModelID, nil
+		for _, c := range ctx.Candidates {
+			if c.RouteID == ctx.Session.ActiveRouteID {
+				if ctx.Session.ActiveModelID != "" {
+					return c.RouteID, ctx.Session.ActiveModelID, nil
+				}
+				return c.RouteID, c.ModelID, nil
+			}
+		}
 	}
 	// Fall back to highest-priority candidate.
 	if len(ctx.Candidates) > 0 {

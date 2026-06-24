@@ -55,3 +55,45 @@ func TestKeywordRetrieverReturnsProjectAndGlobalKnowledge(t *testing.T) {
 		t.Fatalf("unexpected search order: %#v", items)
 	}
 }
+
+func TestKeywordRetrieverWithoutProjectSearchesGlobalKnowledge(t *testing.T) {
+	dir := t.TempDir()
+	store := sqlitecli.Store{
+		DBPath:     filepath.Join(dir, "ergo.db"),
+		SchemaPath: filepath.Join("..", "storage", "sqlitecli", "schema.sql"),
+	}
+	if err := store.Init(); err != nil {
+		t.Fatalf("init store: %v", err)
+	}
+	project, err := store.CreateProject("KB Project", "/tmp/kb-project")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := store.AddKnowledgeItem(core.KnowledgeItem{
+		Scope:     core.KnowledgeScopeProject,
+		ProjectID: project.ID,
+		Kind:      "note",
+		Title:     "OpenStack project note",
+	}); err != nil {
+		t.Fatalf("add project knowledge: %v", err)
+	}
+	globalItem, err := store.AddKnowledgeItem(core.KnowledgeItem{
+		Scope: core.KnowledgeScopeGlobal,
+		Kind:  "note",
+		Title: "OpenStack global note",
+	})
+	if err != nil {
+		t.Fatalf("add global knowledge: %v", err)
+	}
+
+	items, err := NewKeywordRetriever(store).Search(context.Background(), core.KnowledgeQuery{
+		Text:  "OpenStack",
+		Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("search knowledge: %v", err)
+	}
+	if len(items) != 1 || items[0].ID != globalItem.ID {
+		t.Fatalf("expected only global item %s, got %#v", globalItem.ID, items)
+	}
+}

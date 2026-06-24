@@ -29,12 +29,19 @@ func (r KeywordRetriever) Search(ctx context.Context, q core.KnowledgeQuery) ([]
 		limit = 20
 	}
 	query := strings.TrimSpace(q.Text)
-	if q.Scope != "" || strings.TrimSpace(q.ProjectID) == "" {
+	if q.Scope != "" {
 		return r.store.SearchKnowledge(sqlitecli.KnowledgeSearchOptions{
 			Query:     query,
 			Scope:     q.Scope,
 			ProjectID: q.ProjectID,
 			Limit:     limit,
+		})
+	}
+	if strings.TrimSpace(q.ProjectID) == "" {
+		return r.store.SearchKnowledge(sqlitecli.KnowledgeSearchOptions{
+			Query: query,
+			Scope: core.KnowledgeScopeGlobal,
+			Limit: limit,
 		})
 	}
 
