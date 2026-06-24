@@ -1,3 +1,3 @@
-module github.com/jkj-dev/ergo-loom
+module github.com/Floodnut/ergo-loom
 
 go 1.22.3

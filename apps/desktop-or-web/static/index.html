@@ -8,6 +8,7 @@
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
+    <div class="window-titlebar-hitbox" id="window-titlebar-hitbox" aria-hidden="true"></div>
     <main class="app-shell" id="app-shell">
       <aside class="nav-pane">
         <div class="brand-row">
@@ -42,6 +43,7 @@
             <div class="project-menu" id="project-menu" hidden>
               <button id="new-session" type="button">New chat</button>
               <button id="rename-project" type="button">Rename project</button>
+              <button id="delete-project" class="danger" type="button">Delete project</button>
             </div>
             <div class="project-chats">
               <div class="session-list" id="session-list"></div>
@@ -56,6 +58,7 @@
               <span>AI Usage</span>
               <span class="usage-gauge" aria-hidden="true"><span id="usage-gauge-fill"></span></span>
             </button>
+            <button class="usage-refresh" id="provider-refresh" type="button" aria-label="Refresh AI provider status" title="Refresh AI provider status">↻</button>
             <div class="usage-details" id="nav-token-usage"></div>
           </section>
           <button class="nav-action settings-action" type="button">Settings</button>
@@ -138,6 +141,8 @@
         <section class="workspace-panel active" id="workspace-activity-panel" data-workspace-panel="activity">
           <h2>Tool Activity</h2>
           <div class="auth-status-list" id="auth-status-list"></div>
+          <div class="runtime-diagnostics" id="runtime-diagnostics"></div>
+          <div class="provider-thread-list" id="provider-thread-list"></div>
           <div class="tool-registry-list" id="tool-registry-list"></div>
           <div class="workspace-approvals" id="workspace-approvals"></div>
           <div class="workspace-activity" id="workspace-activity">

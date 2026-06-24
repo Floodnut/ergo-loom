@@ -113,12 +113,14 @@ UPDATE access_routes
 SET status = 'available'
 WHERE id IN (
   'chatgpt-web-handoff',
-  'claude-web-free-handoff',
-  'claude-web-licensed-handoff',
   'copilot-sdk-cli',
   'copilot-vscode-bridge',
   'gemini-web-handoff'
 );
+
+UPDATE access_routes
+SET status = 'planned'
+WHERE id IN ('claude-web-free-handoff', 'claude-web-licensed-handoff');
 
 UPDATE provider_models
 SET status = 'bridge_required'
@@ -279,6 +281,161 @@ CREATE TABLE IF NOT EXISTS messages (
   UNIQUE (session_id, ordinal)
 );
 
+CREATE TABLE IF NOT EXISTS message_events (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+  activity_index INTEGER NOT NULL DEFAULT 0,
+  kind TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_events_session
+ON message_events(session_id, activity_index, created_at);
+
+CREATE TABLE IF NOT EXISTS context_events (
+  id TEXT PRIMARY KEY,
+  type TEXT NOT NULL,
+  project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+  session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+  branch_id TEXT,
+  payload_ref TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS context_event_parents (
+  event_id TEXT NOT NULL REFERENCES context_events(id) ON DELETE CASCADE,
+  parent_event_id TEXT NOT NULL REFERENCES context_events(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (event_id, parent_event_id)
+);
+
+CREATE TABLE IF NOT EXISTS context_branches (
+  id TEXT PRIMARY KEY,
+  project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+  session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+  from_event_id TEXT NOT NULL REFERENCES context_events(id) ON DELETE CASCADE,
+  head_event_id TEXT NOT NULL REFERENCES context_events(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  UNIQUE (session_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS context_heads (
+  id TEXT PRIMARY KEY,
+  project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+  session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+  branch_id TEXT NOT NULL DEFAULT 'main',
+  event_id TEXT NOT NULL REFERENCES context_events(id) ON DELETE CASCADE,
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  UNIQUE (project_id, session_id, branch_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_context_events_session
+ON context_events(session_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_context_event_parents_parent
+ON context_event_parents(parent_event_id);
+
+CREATE INDEX IF NOT EXISTS idx_context_branches_session
+ON context_branches(session_id, created_at);
+
+CREATE TABLE IF NOT EXISTS chat_runs (
+  id TEXT PRIMARY KEY,
+  project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  branch_id TEXT NOT NULL DEFAULT 'main',
+  role TEXT NOT NULL,
+  status TEXT NOT NULL,
+  input_event_id TEXT REFERENCES context_events(id) ON DELETE SET NULL,
+  output_event_id TEXT REFERENCES context_events(id) ON DELETE SET NULL,
+  context_packet_id TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS provider_segments (
+  id TEXT PRIMARY KEY,
+  chat_run_id TEXT NOT NULL REFERENCES chat_runs(id) ON DELETE CASCADE,
+  provider_id TEXT NOT NULL,
+  route_id TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  external_thread_id TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL,
+  handoff_reason TEXT NOT NULL DEFAULT '',
+  started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS steering_events (
+  id TEXT PRIMARY KEY,
+  chat_run_id TEXT NOT NULL REFERENCES chat_runs(id) ON DELETE CASCADE,
+  provider_segment_id TEXT REFERENCES provider_segments(id) ON DELETE SET NULL,
+  event_id TEXT REFERENCES context_events(id) ON DELETE SET NULL,
+  content TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'recorded',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_runs_session
+ON chat_runs(session_id, branch_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_chat_runs_status
+ON chat_runs(status, role);
+
+CREATE INDEX IF NOT EXISTS idx_provider_segments_chat_run
+ON provider_segments(chat_run_id, started_at);
+
+CREATE INDEX IF NOT EXISTS idx_steering_events_chat_run
+ON steering_events(chat_run_id, created_at);
+
+CREATE TABLE IF NOT EXISTS chat_queue_items (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  branch_id TEXT NOT NULL DEFAULT 'main',
+  content TEXT NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'normal',
+  status TEXT NOT NULL DEFAULT 'pending',
+  order_index INTEGER NOT NULL DEFAULT 0,
+  route_id TEXT NOT NULL DEFAULT '',
+  model_id TEXT NOT NULL DEFAULT '',
+  thinking_effort TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_queue_items_session
+ON chat_queue_items(session_id, status, order_index);
+
+CREATE TABLE IF NOT EXISTS candidate_outputs (
+  id TEXT PRIMARY KEY,
+  chat_run_id TEXT NOT NULL REFERENCES chat_runs(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  branch_id TEXT NOT NULL DEFAULT 'main',
+  content_ref TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_candidate_outputs_session
+ON candidate_outputs(session_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS context_packets (
+  id TEXT PRIMARY KEY,
+  project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  branch_id TEXT NOT NULL DEFAULT 'main',
+  head_event_id TEXT,
+  user_input TEXT NOT NULL DEFAULT '',
+  content_ref TEXT NOT NULL,
+  reference_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_context_packets_session
+ON context_packets(session_id, created_at);
+
 CREATE TABLE IF NOT EXISTS session_provider_groups (
   session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   provider_group_id TEXT NOT NULL,
@@ -344,6 +501,18 @@ CREATE TABLE IF NOT EXISTS kb_terms (
   PRIMARY KEY (document_id, term)
 );
 
+CREATE TABLE IF NOT EXISTS knowledge_items (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL,
+  project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  source_event_id TEXT REFERENCES context_events(id) ON DELETE SET NULL,
+  content_ref TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
 CREATE INDEX IF NOT EXISTS idx_session_provider_groups_session ON session_provider_groups(session_id);
 CREATE INDEX IF NOT EXISTS idx_messages_session_ordinal ON messages(session_id, ordinal);
@@ -356,3 +525,5 @@ CREATE INDEX IF NOT EXISTS idx_provider_models_provider ON provider_models(provi
 CREATE INDEX IF NOT EXISTS idx_project_access_routes_project ON project_access_routes(project_id, priority);
 CREATE INDEX IF NOT EXISTS idx_command_runs_started_at ON command_runs(started_at);
 CREATE INDEX IF NOT EXISTS idx_provider_chats_session ON provider_chats(session_id, provider_plugin_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_items_scope ON knowledge_items(scope, project_id, kind);
+CREATE INDEX IF NOT EXISTS idx_knowledge_items_source_event ON knowledge_items(source_event_id);

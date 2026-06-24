@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jkj-dev/ergo-loom/internal/core"
+	"github.com/Floodnut/ergo-loom/internal/core"
 )
 
 var ErrNotFound = errors.New("not found")
@@ -146,6 +146,99 @@ type ProviderChatBindingInput struct {
 	ModelID           string
 	ExternalThreadID  string
 	Status            string
+}
+
+type ChatRunInput struct {
+	ProjectID       string
+	SessionID       string
+	BranchID        string
+	Role            core.ChatRunRole
+	Status          core.ChatRunStatus
+	InputEventID    string
+	ContextPacketID string
+}
+
+type ProviderSegmentInput struct {
+	ChatRunID        string
+	ProviderID       string
+	RouteID          string
+	ModelID          string
+	ExternalThreadID string
+	Status           core.ProviderSegmentStatus
+	HandoffReason    string
+}
+
+type ContextPacketRecord struct {
+	ID             string
+	ProjectID      string
+	SessionID      string
+	BranchID       string
+	HeadEventID    string
+	UserInput      string
+	ContentRef     string
+	ReferenceCount int
+	CreatedAt      time.Time
+}
+
+type SteeringInput struct {
+	ChatRunID         string
+	ProviderSegmentID string
+	EventID           string
+	Content           string
+	Status            string
+}
+
+type SteeringRecord struct {
+	ID                string
+	ChatRunID         string
+	ProviderSegmentID string
+	EventID           string
+	Content           string
+	Status            string
+	CreatedAt         time.Time
+}
+
+type QueueItemInput struct {
+	SessionID      string
+	BranchID       string
+	Content        string
+	Mode           core.QueueItemMode
+	RouteID        string
+	ModelID        string
+	ThinkingEffort string
+}
+
+type CandidateOutputInput struct {
+	ChatRunID string
+	SessionID string
+	BranchID  string
+	Content   string
+	Status    core.CandidateOutputStatus
+}
+
+type MessageEventInput struct {
+	SessionID     string
+	MessageID     string
+	ActivityIndex int
+	Kind          string
+	PayloadJSON   string
+}
+
+type MessageEvent struct {
+	ID            string `json:"id"`
+	SessionID     string `json:"sessionId"`
+	MessageID     string `json:"messageId"`
+	ActivityIndex int    `json:"activityIndex"`
+	Kind          string `json:"kind"`
+	PayloadJSON   string `json:"payloadJson"`
+	CreatedAt     string `json:"createdAt"`
+}
+
+type KnowledgeSearchOptions struct {
+	Query     string
+	Scope     core.KnowledgeScope
+	ProjectID string
+	Limit     int
 }
 
 func New(dbPath string) Store {
@@ -368,6 +461,30 @@ WHERE id = %s;
 	return session, err
 }
 
+func (s Store) DeleteSession(sessionID string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return errors.New("session id is required")
+	}
+	if _, _, err := s.GetSession(sessionID); err != nil {
+		return err
+	}
+	stmt := fmt.Sprintf(`BEGIN;
+DELETE FROM branches WHERE parent_session_id = %s OR session_id = %s;
+UPDATE sessions SET parent_session_id = NULL, branch_from_message_id = NULL WHERE parent_session_id = %s;
+DELETE FROM message_events WHERE session_id = %s;
+DELETE FROM messages WHERE session_id = %s;
+DELETE FROM session_provider_groups WHERE session_id = %s;
+DELETE FROM provider_chats WHERE session_id = %s;
+DELETE FROM token_ledger WHERE session_id = %s;
+UPDATE command_runs SET session_id = NULL WHERE session_id = %s;
+UPDATE agent_runs SET session_id = NULL WHERE session_id = %s;
+DELETE FROM sessions WHERE id = %s;
+COMMIT;
+`, quote(sessionID), quote(sessionID), quote(sessionID), quote(sessionID), quote(sessionID), quote(sessionID), quote(sessionID), quote(sessionID), quote(sessionID), quote(sessionID), quote(sessionID))
+	return s.run(stmt)
+}
+
 func (s Store) AddMessage(sessionID string, role string, content string) (core.Message, error) {
 	if strings.TrimSpace(role) == "" {
 		return core.Message{}, errors.New("role is required")
@@ -376,7 +493,8 @@ func (s Store) AddMessage(sessionID string, role string, content string) (core.M
 		return core.Message{}, errors.New("content is required")
 	}
 
-	if _, _, err := s.GetSession(sessionID); err != nil {
+	session, _, err := s.GetSession(sessionID)
+	if err != nil {
 		return core.Message{}, err
 	}
 
@@ -397,6 +515,9 @@ COMMIT;
 	if err := s.run(stmt); err != nil {
 		return core.Message{}, err
 	}
+	if _, err := s.appendMessageEventProjection(session, messageID, role); err != nil {
+		return core.Message{}, err
+	}
 	_, messages, err := s.GetSession(sessionID)
 	if err != nil {
 		return core.Message{}, err
@@ -407,6 +528,1035 @@ COMMIT;
 		}
 	}
 	return core.Message{}, ErrNotFound
+}
+
+func (s Store) appendMessageEventProjection(session core.Session, messageID string, role string) (core.Event, error) {
+	eventType := messageEventType(role)
+	parentIDs := []string{}
+	if head, err := s.getHead(session.ProjectID, session.ID, "main"); err == nil && strings.TrimSpace(head.EventID) != "" {
+		parentIDs = append(parentIDs, head.EventID)
+	} else if err != nil && !errors.Is(err, ErrNotFound) {
+		return core.Event{}, err
+	}
+	event, err := s.AppendEvent(core.EventInput{
+		Type:           eventType,
+		ProjectID:      session.ProjectID,
+		SessionID:      session.ID,
+		BranchID:       "main",
+		ParentEventIDs: parentIDs,
+		PayloadRef:     "message:" + messageID,
+	})
+	if err != nil {
+		return core.Event{}, err
+	}
+	if _, err := s.MoveHead(session.ProjectID, session.ID, "main", event.ID); err != nil {
+		return core.Event{}, err
+	}
+	return event, nil
+}
+
+func messageEventType(role string) core.EventType {
+	switch strings.TrimSpace(strings.ToLower(role)) {
+	case "user":
+		return core.EventMessageUser
+	case "assistant":
+		return core.EventMessageAssistant
+	default:
+		return core.EventType("message." + strings.TrimSpace(strings.ToLower(role)))
+	}
+}
+
+func (s Store) AddMessageEvent(input MessageEventInput) (MessageEvent, error) {
+	input.SessionID = strings.TrimSpace(input.SessionID)
+	input.Kind = strings.TrimSpace(input.Kind)
+	if input.SessionID == "" {
+		return MessageEvent{}, errors.New("session id is required")
+	}
+	if input.Kind == "" {
+		return MessageEvent{}, errors.New("message event kind is required")
+	}
+	if strings.TrimSpace(input.PayloadJSON) == "" {
+		input.PayloadJSON = "{}"
+	}
+	if input.ActivityIndex < 0 {
+		input.ActivityIndex = 0
+	}
+
+	eventID := "message_event_" + randomHex(16)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	stmt := fmt.Sprintf(`INSERT INTO message_events (id, session_id, message_id, activity_index, kind, payload_json, created_at)
+VALUES (%s, %s, %s, %d, %s, %s, %s);
+`, quote(eventID), quote(input.SessionID), nullable(strings.TrimSpace(input.MessageID)), input.ActivityIndex, quote(input.Kind), quote(input.PayloadJSON), quote(now))
+	if err := s.run(stmt); err != nil {
+		return MessageEvent{}, err
+	}
+	return MessageEvent{
+		ID:            eventID,
+		SessionID:     input.SessionID,
+		MessageID:     strings.TrimSpace(input.MessageID),
+		ActivityIndex: input.ActivityIndex,
+		Kind:          input.Kind,
+		PayloadJSON:   input.PayloadJSON,
+		CreatedAt:     now,
+	}, nil
+}
+
+func (s Store) ListMessageEvents(sessionID string) ([]MessageEvent, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, errors.New("session id is required")
+	}
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id, session_id, COALESCE(message_id, '') AS message_id, activity_index, kind, payload_json, created_at
+FROM message_events
+WHERE session_id = %s
+ORDER BY activity_index ASC, created_at ASC, id ASC;
+`, quote(sessionID)))
+	if err != nil {
+		return nil, err
+	}
+	var rows []messageEventRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return nil, err
+	}
+	events := make([]MessageEvent, 0, len(rows))
+	for _, row := range rows {
+		events = append(events, row.toCore())
+	}
+	return events, nil
+}
+
+func (s Store) AppendEvent(input core.EventInput) (core.Event, error) {
+	input.Type = core.EventType(strings.TrimSpace(string(input.Type)))
+	input.ProjectID = strings.TrimSpace(input.ProjectID)
+	input.SessionID = strings.TrimSpace(input.SessionID)
+	input.BranchID = strings.TrimSpace(input.BranchID)
+	input.PayloadRef = strings.TrimSpace(input.PayloadRef)
+	if input.Type == "" {
+		return core.Event{}, errors.New("event type is required")
+	}
+	if input.BranchID == "" {
+		input.BranchID = "main"
+	}
+	if input.ProjectID == "" && input.SessionID != "" {
+		if session, _, err := s.GetSession(input.SessionID); err == nil {
+			input.ProjectID = session.ProjectID
+		}
+	}
+
+	eventID := "event_" + randomHex(16)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	createdAt, err := parseTime(now)
+	if err != nil {
+		return core.Event{}, err
+	}
+	parentIDs := compactStrings(input.ParentEventIDs)
+	event := core.Event{
+		ID:             eventID,
+		Type:           input.Type,
+		ProjectID:      input.ProjectID,
+		SessionID:      input.SessionID,
+		BranchID:       input.BranchID,
+		ParentEventIDs: parentIDs,
+		PayloadRef:     input.PayloadRef,
+		CreatedAt:      createdAt,
+	}
+	if err := s.writeContextEventObject(event); err != nil {
+		return core.Event{}, err
+	}
+	stmt := fmt.Sprintf(`BEGIN;
+INSERT INTO context_events (id, type, project_id, session_id, branch_id, payload_ref, created_at)
+VALUES (%s, %s, %s, %s, %s, %s, %s);
+`, quote(eventID), quote(string(input.Type)), nullable(input.ProjectID), nullable(input.SessionID), quote(input.BranchID), quote(input.PayloadRef), quote(now))
+	for i, parentID := range parentIDs {
+		stmt += fmt.Sprintf(`INSERT INTO context_event_parents (event_id, parent_event_id, ordinal)
+VALUES (%s, %s, %d);
+`, quote(eventID), quote(parentID), i)
+	}
+	stmt += "COMMIT;\n"
+	if err := s.run(stmt); err != nil {
+		return core.Event{}, err
+	}
+	return s.GetEvent(eventID)
+}
+
+func (s Store) writeContextEventObject(event core.Event) error {
+	if strings.TrimSpace(s.DBPath) == "" {
+		return nil
+	}
+	path := filepath.Join(filepath.Dir(s.DBPath), "objects", "events", event.ID+".json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(event, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return os.WriteFile(path, data, 0o644)
+}
+
+func (s Store) GetEvent(id string) (core.Event, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return core.Event{}, errors.New("event id is required")
+	}
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT ce.id,
+       ce.type,
+       COALESCE(ce.project_id, '') AS project_id,
+       COALESCE(ce.session_id, '') AS session_id,
+       COALESCE(ce.branch_id, '') AS branch_id,
+       COALESCE(ce.payload_ref, '') AS payload_ref,
+       ce.created_at,
+       COALESCE(GROUP_CONCAT(cep.parent_event_id, char(31)), '') AS parent_event_ids
+FROM context_events ce
+LEFT JOIN context_event_parents cep ON cep.event_id = ce.id
+WHERE ce.id = %s
+GROUP BY ce.id;
+`, quote(id)))
+	if err != nil {
+		return core.Event{}, err
+	}
+	var rows []contextEventRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return core.Event{}, err
+	}
+	if len(rows) == 0 {
+		return core.Event{}, ErrNotFound
+	}
+	return rows[0].toCore()
+}
+
+func (s Store) ListAncestors(headEventID string, limit int) ([]core.Event, error) {
+	headEventID = strings.TrimSpace(headEventID)
+	if headEventID == "" {
+		return nil, errors.New("head event id is required")
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	out, err := s.queryJSON(fmt.Sprintf(`
+WITH RECURSIVE ancestry(id, depth) AS (
+  SELECT %s, 0
+  UNION ALL
+  SELECT cep.parent_event_id, ancestry.depth + 1
+  FROM context_event_parents cep
+  JOIN ancestry ON cep.event_id = ancestry.id
+  WHERE ancestry.depth < %d
+)
+SELECT ce.id,
+       ce.type,
+       COALESCE(ce.project_id, '') AS project_id,
+       COALESCE(ce.session_id, '') AS session_id,
+       COALESCE(ce.branch_id, '') AS branch_id,
+       COALESCE(ce.payload_ref, '') AS payload_ref,
+       ce.created_at,
+       COALESCE(GROUP_CONCAT(cep.parent_event_id, char(31)), '') AS parent_event_ids,
+       MIN(ancestry.depth) AS depth
+FROM ancestry
+JOIN context_events ce ON ce.id = ancestry.id
+LEFT JOIN context_event_parents cep ON cep.event_id = ce.id
+GROUP BY ce.id
+ORDER BY depth DESC, ce.created_at ASC, ce.id ASC;
+`, quote(headEventID), limit-1))
+	if err != nil {
+		return nil, err
+	}
+	var rows []contextEventRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return nil, err
+	}
+	events := make([]core.Event, 0, len(rows))
+	for _, row := range rows {
+		event, err := row.toCore()
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	return events, nil
+}
+
+func (s Store) MoveHead(projectID string, sessionID string, branchID string, eventID string) (core.Head, error) {
+	projectID = strings.TrimSpace(projectID)
+	sessionID = strings.TrimSpace(sessionID)
+	branchID = strings.TrimSpace(branchID)
+	eventID = strings.TrimSpace(eventID)
+	if branchID == "" {
+		branchID = "main"
+	}
+	event, err := s.GetEvent(eventID)
+	if err != nil {
+		return core.Head{}, err
+	}
+	if projectID == "" {
+		projectID = event.ProjectID
+	}
+	if sessionID == "" {
+		sessionID = event.SessionID
+	}
+	if projectID == "" || sessionID == "" {
+		return core.Head{}, errors.New("project id and session id are required")
+	}
+
+	headID := "head_" + randomHex(16)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	stmt := fmt.Sprintf(`
+INSERT INTO context_heads (id, project_id, session_id, branch_id, event_id, updated_at)
+VALUES (%s, %s, %s, %s, %s, %s)
+ON CONFLICT(project_id, session_id, branch_id)
+DO UPDATE SET event_id = excluded.event_id, updated_at = excluded.updated_at;
+`, quote(headID), quote(projectID), quote(sessionID), quote(branchID), quote(eventID), quote(now))
+	if err := s.run(stmt); err != nil {
+		return core.Head{}, err
+	}
+	return s.getHead(projectID, sessionID, branchID)
+}
+
+func (s Store) GetHead(projectID string, sessionID string, branchID string) (core.Head, error) {
+	projectID = strings.TrimSpace(projectID)
+	sessionID = strings.TrimSpace(sessionID)
+	branchID = strings.TrimSpace(branchID)
+	if branchID == "" {
+		branchID = "main"
+	}
+	if projectID == "" || sessionID == "" {
+		return core.Head{}, errors.New("project id and session id are required")
+	}
+	return s.getHead(projectID, sessionID, branchID)
+}
+
+func (s Store) getHead(projectID string, sessionID string, branchID string) (core.Head, error) {
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id, project_id, session_id, branch_id, event_id, updated_at
+FROM context_heads
+WHERE project_id = %s AND session_id = %s AND branch_id = %s;
+`, quote(projectID), quote(sessionID), quote(branchID)))
+	if err != nil {
+		return core.Head{}, err
+	}
+	var rows []contextHeadRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return core.Head{}, err
+	}
+	if len(rows) == 0 {
+		return core.Head{}, ErrNotFound
+	}
+	return rows[0].toCore()
+}
+
+func (s Store) CreateGraphBranch(sessionID string, fromEventID string) (core.GraphBranch, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	fromEventID = strings.TrimSpace(fromEventID)
+	if sessionID == "" {
+		return core.GraphBranch{}, errors.New("session id is required")
+	}
+	event, err := s.GetEvent(fromEventID)
+	if err != nil {
+		return core.GraphBranch{}, err
+	}
+	projectID := event.ProjectID
+	if projectID == "" {
+		if session, _, err := s.GetSession(sessionID); err == nil {
+			projectID = session.ProjectID
+		}
+	}
+	branchID := "branch_" + randomHex(8)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	stmt := fmt.Sprintf(`BEGIN;
+INSERT INTO context_branches (id, project_id, session_id, from_event_id, head_event_id, created_at)
+VALUES (%s, %s, %s, %s, %s, %s);
+INSERT INTO context_heads (id, project_id, session_id, branch_id, event_id, updated_at)
+VALUES (%s, %s, %s, %s, %s, %s);
+COMMIT;
+`, quote(branchID), nullable(projectID), quote(sessionID), quote(fromEventID), quote(fromEventID), quote(now),
+		quote("head_"+randomHex(16)), nullable(projectID), quote(sessionID), quote(branchID), quote(fromEventID), quote(now))
+	if err := s.run(stmt); err != nil {
+		return core.GraphBranch{}, err
+	}
+	createdAt, err := parseTime(now)
+	if err != nil {
+		return core.GraphBranch{}, err
+	}
+	return core.GraphBranch{
+		ID:          branchID,
+		ProjectID:   projectID,
+		SessionID:   sessionID,
+		FromEventID: fromEventID,
+		HeadEventID: fromEventID,
+		CreatedAt:   createdAt,
+	}, nil
+}
+
+func (s Store) CreateMerge(projectID string, sessionID string, branchID string, parentEventIDs []string) (core.Event, error) {
+	projectID = strings.TrimSpace(projectID)
+	sessionID = strings.TrimSpace(sessionID)
+	branchID = strings.TrimSpace(branchID)
+	if branchID == "" {
+		branchID = "main"
+	}
+	if len(parentEventIDs) < 2 {
+		return core.Event{}, errors.New("merge requires at least two parent events")
+	}
+	event, err := s.AppendEvent(core.EventInput{
+		Type:           core.EventMergeCreated,
+		ProjectID:      projectID,
+		SessionID:      sessionID,
+		BranchID:       branchID,
+		ParentEventIDs: parentEventIDs,
+		PayloadRef:     "merge",
+	})
+	if err != nil {
+		return core.Event{}, err
+	}
+	if _, err := s.MoveHead(projectID, sessionID, branchID, event.ID); err != nil {
+		return core.Event{}, err
+	}
+	return event, nil
+}
+
+func (s Store) StartChatRun(input ChatRunInput) (core.ChatRun, error) {
+	input.ProjectID = strings.TrimSpace(input.ProjectID)
+	input.SessionID = strings.TrimSpace(input.SessionID)
+	input.BranchID = strings.TrimSpace(input.BranchID)
+	input.InputEventID = strings.TrimSpace(input.InputEventID)
+	input.ContextPacketID = strings.TrimSpace(input.ContextPacketID)
+	if input.SessionID == "" {
+		return core.ChatRun{}, errors.New("session id is required")
+	}
+	if input.BranchID == "" {
+		input.BranchID = "main"
+	}
+	if input.Role == "" {
+		input.Role = core.ChatRunRoleMain
+	}
+	if input.Status == "" {
+		input.Status = core.ChatRunRunning
+	}
+	if input.ProjectID == "" {
+		if session, _, err := s.GetSession(input.SessionID); err == nil {
+			input.ProjectID = session.ProjectID
+		}
+	}
+	runID := "chat_run_" + randomHex(16)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	stmt := fmt.Sprintf(`
+INSERT INTO chat_runs (id, project_id, session_id, branch_id, role, status, input_event_id, context_packet_id, created_at, updated_at)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+`, quote(runID), nullable(input.ProjectID), quote(input.SessionID), quote(input.BranchID), quote(string(input.Role)), quote(string(input.Status)), nullable(input.InputEventID), quote(input.ContextPacketID), quote(now), quote(now))
+	if err := s.run(stmt); err != nil {
+		return core.ChatRun{}, err
+	}
+	return s.getChatRun(runID)
+}
+
+func (s Store) CompleteChatRun(id string, status core.ChatRunStatus, outputEventID string) (core.ChatRun, error) {
+	id = strings.TrimSpace(id)
+	outputEventID = strings.TrimSpace(outputEventID)
+	if id == "" {
+		return core.ChatRun{}, errors.New("chat run id is required")
+	}
+	if status == "" {
+		status = core.ChatRunCompleted
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	stmt := fmt.Sprintf(`UPDATE chat_runs
+SET status = %s, output_event_id = %s, updated_at = %s
+WHERE id = %s;
+`, quote(string(status)), nullable(outputEventID), quote(now), quote(id))
+	if err := s.run(stmt); err != nil {
+		return core.ChatRun{}, err
+	}
+	return s.getChatRun(id)
+}
+
+func (s Store) ActiveMainChatRun(sessionID string) (core.ChatRun, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return core.ChatRun{}, errors.New("session id is required")
+	}
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id, COALESCE(project_id, '') AS project_id, session_id, branch_id, role, status,
+       COALESCE(input_event_id, '') AS input_event_id,
+       COALESCE(output_event_id, '') AS output_event_id,
+       context_packet_id, created_at, updated_at
+FROM chat_runs
+WHERE session_id = %s AND branch_id = 'main' AND role = %s AND status IN (%s, %s, %s)
+ORDER BY created_at DESC, id DESC
+LIMIT 1;
+`, quote(sessionID), quote(string(core.ChatRunRoleMain)), quote(string(core.ChatRunRunning)), quote(string(core.ChatRunWaitingApproval)), quote(string(core.ChatRunQueued))))
+	if err != nil {
+		return core.ChatRun{}, err
+	}
+	var rows []chatRunRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return core.ChatRun{}, err
+	}
+	if len(rows) == 0 {
+		return core.ChatRun{}, ErrNotFound
+	}
+	return rows[0].toCore()
+}
+
+func (s Store) StartProviderSegment(input ProviderSegmentInput) (core.ProviderSegment, error) {
+	input.ChatRunID = strings.TrimSpace(input.ChatRunID)
+	input.ProviderID = strings.TrimSpace(input.ProviderID)
+	input.RouteID = strings.TrimSpace(input.RouteID)
+	input.ModelID = strings.TrimSpace(input.ModelID)
+	input.ExternalThreadID = strings.TrimSpace(input.ExternalThreadID)
+	input.HandoffReason = strings.TrimSpace(input.HandoffReason)
+	if input.ChatRunID == "" {
+		return core.ProviderSegment{}, errors.New("chat run id is required")
+	}
+	if input.ProviderID == "" {
+		return core.ProviderSegment{}, errors.New("provider id is required")
+	}
+	if input.Status == "" {
+		input.Status = core.ProviderSegmentRunning
+	}
+	segmentID := "provider_segment_" + randomHex(16)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	stmt := fmt.Sprintf(`
+INSERT INTO provider_segments (id, chat_run_id, provider_id, route_id, model_id, external_thread_id, status, handoff_reason, started_at)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+`, quote(segmentID), quote(input.ChatRunID), quote(input.ProviderID), quote(input.RouteID), quote(input.ModelID), quote(input.ExternalThreadID), quote(string(input.Status)), quote(input.HandoffReason), quote(now))
+	if err := s.run(stmt); err != nil {
+		return core.ProviderSegment{}, err
+	}
+	return s.getProviderSegment(segmentID)
+}
+
+func (s Store) CompleteProviderSegment(id string, status core.ProviderSegmentStatus, externalThreadID string) (core.ProviderSegment, error) {
+	id = strings.TrimSpace(id)
+	externalThreadID = strings.TrimSpace(externalThreadID)
+	if id == "" {
+		return core.ProviderSegment{}, errors.New("provider segment id is required")
+	}
+	if status == "" {
+		status = core.ProviderSegmentCompleted
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	setExternalThread := ""
+	if externalThreadID != "" {
+		setExternalThread = fmt.Sprintf(", external_thread_id = %s", quote(externalThreadID))
+	}
+	stmt := fmt.Sprintf(`UPDATE provider_segments
+SET status = %s, completed_at = %s%s
+WHERE id = %s;
+`, quote(string(status)), quote(now), setExternalThread, quote(id))
+	if err := s.run(stmt); err != nil {
+		return core.ProviderSegment{}, err
+	}
+	return s.getProviderSegment(id)
+}
+
+func (s Store) ActiveProviderSegment(chatRunID string) (core.ProviderSegment, error) {
+	chatRunID = strings.TrimSpace(chatRunID)
+	if chatRunID == "" {
+		return core.ProviderSegment{}, errors.New("chat run id is required")
+	}
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id, chat_run_id, provider_id, route_id, model_id, external_thread_id, status,
+       handoff_reason, started_at, COALESCE(completed_at, '') AS completed_at
+FROM provider_segments
+WHERE chat_run_id = %s AND status = %s
+ORDER BY started_at DESC, id DESC
+LIMIT 1;
+`, quote(chatRunID), quote(string(core.ProviderSegmentRunning))))
+	if err != nil {
+		return core.ProviderSegment{}, err
+	}
+	var rows []providerSegmentRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return core.ProviderSegment{}, err
+	}
+	if len(rows) == 0 {
+		return core.ProviderSegment{}, ErrNotFound
+	}
+	return rows[0].toCore()
+}
+
+func (s Store) SaveContextPacket(packet core.ContextPacket) (ContextPacketRecord, error) {
+	packet.ID = strings.TrimSpace(packet.ID)
+	packet.ProjectID = strings.TrimSpace(packet.ProjectID)
+	packet.SessionID = strings.TrimSpace(packet.SessionID)
+	packet.BranchID = strings.TrimSpace(packet.BranchID)
+	packet.HeadEventID = strings.TrimSpace(packet.HeadEventID)
+	if packet.ID == "" {
+		packet.ID = "context_packet_" + randomHex(16)
+	}
+	if packet.SessionID == "" {
+		return ContextPacketRecord{}, errors.New("session id is required")
+	}
+	if packet.BranchID == "" {
+		packet.BranchID = "main"
+	}
+	if packet.ProjectID == "" {
+		if session, _, err := s.GetSession(packet.SessionID); err == nil {
+			packet.ProjectID = session.ProjectID
+		}
+	}
+	if packet.CreatedAt.IsZero() {
+		packet.CreatedAt = time.Now().UTC()
+	}
+	contentRef := filepath.ToSlash(filepath.Join("objects", "context-packets", packet.ID+".json"))
+	if err := s.writeContextPacketObject(contentRef, packet); err != nil {
+		return ContextPacketRecord{}, err
+	}
+	stmt := fmt.Sprintf(`
+INSERT INTO context_packets (id, project_id, session_id, branch_id, head_event_id, user_input, content_ref, reference_count, created_at)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %d, %s);
+`, quote(packet.ID), nullable(packet.ProjectID), quote(packet.SessionID), quote(packet.BranchID), nullable(packet.HeadEventID), quote(packet.UserInput), quote(contentRef), len(packet.References), quote(packet.CreatedAt.Format(time.RFC3339Nano)))
+	if err := s.run(stmt); err != nil {
+		return ContextPacketRecord{}, err
+	}
+	return s.getContextPacketRecord(packet.ID)
+}
+
+func (s Store) writeContextPacketObject(contentRef string, packet core.ContextPacket) error {
+	if strings.TrimSpace(s.DBPath) == "" {
+		return nil
+	}
+	path := filepath.Join(filepath.Dir(s.DBPath), filepath.FromSlash(contentRef))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(packet, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return os.WriteFile(path, data, 0o644)
+}
+
+func (s Store) getContextPacketRecord(id string) (ContextPacketRecord, error) {
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id, COALESCE(project_id, '') AS project_id, session_id, branch_id,
+       COALESCE(head_event_id, '') AS head_event_id, user_input, content_ref,
+       reference_count, created_at
+FROM context_packets
+WHERE id = %s;
+`, quote(id)))
+	if err != nil {
+		return ContextPacketRecord{}, err
+	}
+	var rows []contextPacketRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return ContextPacketRecord{}, err
+	}
+	if len(rows) == 0 {
+		return ContextPacketRecord{}, ErrNotFound
+	}
+	return rows[0].toCore()
+}
+
+func (s Store) RecordSteering(input SteeringInput) (SteeringRecord, error) {
+	input.ChatRunID = strings.TrimSpace(input.ChatRunID)
+	input.ProviderSegmentID = strings.TrimSpace(input.ProviderSegmentID)
+	input.EventID = strings.TrimSpace(input.EventID)
+	input.Content = strings.TrimSpace(input.Content)
+	input.Status = strings.TrimSpace(input.Status)
+	if input.ChatRunID == "" {
+		return SteeringRecord{}, errors.New("chat run id is required")
+	}
+	if input.Content == "" {
+		return SteeringRecord{}, errors.New("steering content is required")
+	}
+	if input.Status == "" {
+		input.Status = "recorded"
+	}
+	id := "steering_" + randomHex(16)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	stmt := fmt.Sprintf(`
+INSERT INTO steering_events (id, chat_run_id, provider_segment_id, event_id, content, status, created_at)
+VALUES (%s, %s, %s, %s, %s, %s, %s);
+`, quote(id), quote(input.ChatRunID), nullable(input.ProviderSegmentID), nullable(input.EventID), quote(input.Content), quote(input.Status), quote(now))
+	if err := s.run(stmt); err != nil {
+		return SteeringRecord{}, err
+	}
+	return s.getSteeringRecord(id)
+}
+
+func (s Store) AddQueueItem(input QueueItemInput) (core.QueueItem, error) {
+	input.SessionID = strings.TrimSpace(input.SessionID)
+	input.BranchID = strings.TrimSpace(input.BranchID)
+	input.Content = strings.TrimSpace(input.Content)
+	input.RouteID = strings.TrimSpace(input.RouteID)
+	input.ModelID = strings.TrimSpace(input.ModelID)
+	input.ThinkingEffort = strings.TrimSpace(input.ThinkingEffort)
+	if input.SessionID == "" {
+		return core.QueueItem{}, errors.New("session id is required")
+	}
+	if input.Content == "" {
+		return core.QueueItem{}, errors.New("queue item content is required")
+	}
+	if input.BranchID == "" {
+		input.BranchID = "main"
+	}
+	if input.Mode == "" {
+		input.Mode = core.QueueItemNormal
+	}
+	orderIndex, err := s.nextQueueOrder(input.SessionID, input.BranchID)
+	if err != nil {
+		return core.QueueItem{}, err
+	}
+	id := "queue_" + randomHex(16)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	stmt := fmt.Sprintf(`
+INSERT INTO chat_queue_items (id, session_id, branch_id, content, mode, status, order_index, route_id, model_id, thinking_effort, created_at, updated_at)
+VALUES (%s, %s, %s, %s, %s, %s, %d, %s, %s, %s, %s, %s);
+`, quote(id), quote(input.SessionID), quote(input.BranchID), quote(input.Content), quote(string(input.Mode)), quote(string(core.QueueItemPending)), orderIndex, quote(input.RouteID), quote(input.ModelID), quote(input.ThinkingEffort), quote(now), quote(now))
+	if err := s.run(stmt); err != nil {
+		return core.QueueItem{}, err
+	}
+	return s.getQueueItem(id)
+}
+
+func (s Store) ListPendingQueueItems(sessionID string) ([]core.QueueItem, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, errors.New("session id is required")
+	}
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id, session_id, branch_id, content, mode, status, order_index, route_id, model_id, thinking_effort, created_at, updated_at
+FROM chat_queue_items
+WHERE session_id = %s AND status = %s
+ORDER BY order_index ASC, created_at ASC, id ASC;
+`, quote(sessionID), quote(string(core.QueueItemPending))))
+	if err != nil {
+		return nil, err
+	}
+	var rows []queueItemRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return nil, err
+	}
+	items := make([]core.QueueItem, 0, len(rows))
+	for _, row := range rows {
+		item, err := row.toCore()
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func (s Store) UpdateQueueItemStatus(id string, status core.QueueItemStatus) (core.QueueItem, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return core.QueueItem{}, errors.New("queue item id is required")
+	}
+	if status == "" {
+		status = core.QueueItemConsumed
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	stmt := fmt.Sprintf(`UPDATE chat_queue_items
+SET status = %s, updated_at = %s
+WHERE id = %s;
+`, quote(string(status)), quote(now), quote(id))
+	if err := s.run(stmt); err != nil {
+		return core.QueueItem{}, err
+	}
+	return s.getQueueItem(id)
+}
+
+func (s Store) ReorderQueueItems(sessionID string, itemIDs []string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return errors.New("session id is required")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	var sql strings.Builder
+	sql.WriteString("BEGIN;\n")
+	for index, id := range compactStrings(itemIDs) {
+		fmt.Fprintf(&sql, `UPDATE chat_queue_items
+SET order_index = %d, updated_at = %s
+WHERE id = %s AND session_id = %s AND status = %s;
+`, index, quote(now), quote(id), quote(sessionID), quote(string(core.QueueItemPending)))
+	}
+	sql.WriteString("COMMIT;\n")
+	return s.run(sql.String())
+}
+
+func (s Store) nextQueueOrder(sessionID string, branchID string) (int, error) {
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT COALESCE(MAX(order_index), -1) + 1 AS next_ordinal
+FROM chat_queue_items
+WHERE session_id = %s AND branch_id = %s AND status = %s;
+`, quote(sessionID), quote(branchID), quote(string(core.QueueItemPending))))
+	if err != nil {
+		return 0, err
+	}
+	var rows []nextOrdinalRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return 0, err
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	return rows[0].NextOrdinal, nil
+}
+
+func (s Store) getQueueItem(id string) (core.QueueItem, error) {
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id, session_id, branch_id, content, mode, status, order_index, route_id, model_id, thinking_effort, created_at, updated_at
+FROM chat_queue_items
+WHERE id = %s;
+`, quote(id)))
+	if err != nil {
+		return core.QueueItem{}, err
+	}
+	var rows []queueItemRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return core.QueueItem{}, err
+	}
+	if len(rows) == 0 {
+		return core.QueueItem{}, ErrNotFound
+	}
+	return rows[0].toCore()
+}
+
+func (s Store) AddCandidateOutput(input CandidateOutputInput) (core.CandidateOutput, error) {
+	input.ChatRunID = strings.TrimSpace(input.ChatRunID)
+	input.SessionID = strings.TrimSpace(input.SessionID)
+	input.BranchID = strings.TrimSpace(input.BranchID)
+	input.Content = strings.TrimSpace(input.Content)
+	if input.ChatRunID == "" {
+		return core.CandidateOutput{}, errors.New("chat run id is required")
+	}
+	if input.SessionID == "" {
+		return core.CandidateOutput{}, errors.New("session id is required")
+	}
+	if input.Content == "" && input.Status != core.CandidateOutputPending {
+		return core.CandidateOutput{}, errors.New("candidate content is required")
+	}
+	if input.BranchID == "" {
+		input.BranchID = "main"
+	}
+	if input.Status == "" {
+		input.Status = core.CandidateOutputReady
+	}
+	id := "candidate_" + randomHex(16)
+	contentRef := filepath.ToSlash(filepath.Join("objects", "candidates", id+".json"))
+	if err := s.writeCandidateObject(contentRef, map[string]any{
+		"id":         id,
+		"chatRunId":  input.ChatRunID,
+		"sessionId":  input.SessionID,
+		"branchId":   input.BranchID,
+		"content":    input.Content,
+		"status":     input.Status,
+		"recordedAt": time.Now().UTC().Format(time.RFC3339Nano),
+	}); err != nil {
+		return core.CandidateOutput{}, err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	stmt := fmt.Sprintf(`
+INSERT INTO candidate_outputs (id, chat_run_id, session_id, branch_id, content_ref, status, created_at, updated_at)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+`, quote(id), quote(input.ChatRunID), quote(input.SessionID), quote(input.BranchID), quote(contentRef), quote(string(input.Status)), quote(now), quote(now))
+	if err := s.run(stmt); err != nil {
+		return core.CandidateOutput{}, err
+	}
+	return s.getCandidateOutput(id)
+}
+
+func (s Store) ListPendingCandidateOutputs(sessionID string) ([]core.CandidateOutput, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, errors.New("session id is required")
+	}
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id, chat_run_id, session_id, branch_id, content_ref, status, created_at, updated_at
+FROM candidate_outputs
+WHERE session_id = %s AND status NOT IN (%s, %s)
+ORDER BY created_at ASC;
+`, quote(sessionID), quote(string(core.CandidateOutputAccepted)), quote(string(core.CandidateOutputRejected))))
+	if err != nil {
+		return nil, err
+	}
+	var rows []candidateOutputRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return nil, err
+	}
+	items := make([]core.CandidateOutput, 0, len(rows))
+	for _, row := range rows {
+		item, err := row.toCore()
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func (s Store) UpdateCandidateOutput(id string, content string, status core.CandidateOutputStatus) (core.CandidateOutput, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return core.CandidateOutput{}, errors.New("candidate output id is required")
+	}
+	if status == "" {
+		status = core.CandidateOutputReady
+	}
+	existing, err := s.getCandidateOutput(id)
+	if err != nil {
+		return core.CandidateOutput{}, err
+	}
+	if err := s.writeCandidateObject(existing.ContentRef, map[string]any{
+		"id":         id,
+		"chatRunId":  existing.ChatRunID,
+		"sessionId":  existing.SessionID,
+		"branchId":   existing.BranchID,
+		"content":    content,
+		"status":     string(status),
+		"recordedAt": time.Now().UTC().Format(time.RFC3339Nano),
+	}); err != nil {
+		return core.CandidateOutput{}, err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	stmt := fmt.Sprintf(`UPDATE candidate_outputs
+SET status = %s, updated_at = %s
+WHERE id = %s;
+`, quote(string(status)), quote(now), quote(id))
+	if err := s.run(stmt); err != nil {
+		return core.CandidateOutput{}, err
+	}
+	return s.getCandidateOutput(id)
+}
+
+func (s Store) UpdateQueueItemMode(id string, mode core.QueueItemMode) (core.QueueItem, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return core.QueueItem{}, errors.New("queue item id is required")
+	}
+	if mode == "" {
+		mode = core.QueueItemNormal
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	stmt := fmt.Sprintf(`UPDATE chat_queue_items
+SET mode = %s, updated_at = %s
+WHERE id = %s;
+`, quote(string(mode)), quote(now), quote(id))
+	if err := s.run(stmt); err != nil {
+		return core.QueueItem{}, err
+	}
+	return s.getQueueItem(id)
+}
+
+func (s Store) UpdateCandidateOutputStatus(id string, status core.CandidateOutputStatus) (core.CandidateOutput, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return core.CandidateOutput{}, errors.New("candidate output id is required")
+	}
+	if status == "" {
+		status = core.CandidateOutputReady
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	stmt := fmt.Sprintf(`UPDATE candidate_outputs
+SET status = %s, updated_at = %s
+WHERE id = %s;
+`, quote(string(status)), quote(now), quote(id))
+	if err := s.run(stmt); err != nil {
+		return core.CandidateOutput{}, err
+	}
+	return s.getCandidateOutput(id)
+}
+
+func (s Store) writeCandidateObject(contentRef string, payload any) error {
+	if strings.TrimSpace(s.DBPath) == "" {
+		return nil
+	}
+	path := filepath.Join(filepath.Dir(s.DBPath), filepath.FromSlash(contentRef))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return os.WriteFile(path, data, 0o644)
+}
+
+func (s Store) getCandidateOutput(id string) (core.CandidateOutput, error) {
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id, chat_run_id, session_id, branch_id, content_ref, status, created_at, updated_at
+FROM candidate_outputs
+WHERE id = %s;
+`, quote(id)))
+	if err != nil {
+		return core.CandidateOutput{}, err
+	}
+	var rows []candidateOutputRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return core.CandidateOutput{}, err
+	}
+	if len(rows) == 0 {
+		return core.CandidateOutput{}, ErrNotFound
+	}
+	return rows[0].toCore()
+}
+
+func (s Store) getSteeringRecord(id string) (SteeringRecord, error) {
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id, chat_run_id, COALESCE(provider_segment_id, '') AS provider_segment_id,
+       COALESCE(event_id, '') AS event_id, content, status, created_at
+FROM steering_events
+WHERE id = %s;
+`, quote(id)))
+	if err != nil {
+		return SteeringRecord{}, err
+	}
+	var rows []steeringRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return SteeringRecord{}, err
+	}
+	if len(rows) == 0 {
+		return SteeringRecord{}, ErrNotFound
+	}
+	return rows[0].toCore()
+}
+
+func (s Store) getChatRun(id string) (core.ChatRun, error) {
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id, COALESCE(project_id, '') AS project_id, session_id, branch_id, role, status,
+       COALESCE(input_event_id, '') AS input_event_id,
+       COALESCE(output_event_id, '') AS output_event_id,
+       context_packet_id, created_at, updated_at
+FROM chat_runs
+WHERE id = %s;
+`, quote(id)))
+	if err != nil {
+		return core.ChatRun{}, err
+	}
+	var rows []chatRunRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return core.ChatRun{}, err
+	}
+	if len(rows) == 0 {
+		return core.ChatRun{}, ErrNotFound
+	}
+	return rows[0].toCore()
+}
+
+func (s Store) getProviderSegment(id string) (core.ProviderSegment, error) {
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id, chat_run_id, provider_id, route_id, model_id, external_thread_id, status,
+       handoff_reason, started_at, COALESCE(completed_at, '') AS completed_at
+FROM provider_segments
+WHERE id = %s;
+`, quote(id)))
+	if err != nil {
+		return core.ProviderSegment{}, err
+	}
+	var rows []providerSegmentRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return core.ProviderSegment{}, err
+	}
+	if len(rows) == 0 {
+		return core.ProviderSegment{}, ErrNotFound
+	}
+	return rows[0].toCore()
 }
 
 func (s Store) CreateBranch(sessionID string, fromMessageID string) (core.Session, error) {
@@ -717,6 +1867,50 @@ WHERE id = %s;
 	return rows[0].toCore(), nil
 }
 
+func (s Store) DeleteProject(projectID string) error {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return errors.New("project id is required")
+	}
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default
+FROM projects
+WHERE id = %s;
+`, quote(projectID)))
+	if err != nil {
+		return err
+	}
+	var rows []projectRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return ErrNotFound
+	}
+	if rows[0].IsDefault != 0 {
+		return errors.New("default project cannot be deleted")
+	}
+
+	sessionSubquery := fmt.Sprintf("SELECT id FROM sessions WHERE COALESCE(project_id, 'default') = %s", quote(projectID))
+	stmt := fmt.Sprintf(`BEGIN;
+DELETE FROM branches WHERE parent_session_id IN (%s) OR session_id IN (%s);
+UPDATE sessions SET parent_session_id = NULL, branch_from_message_id = NULL WHERE parent_session_id IN (%s);
+DELETE FROM message_events WHERE session_id IN (%s);
+DELETE FROM messages WHERE session_id IN (%s);
+DELETE FROM session_provider_groups WHERE session_id IN (%s);
+DELETE FROM provider_chats WHERE session_id IN (%s);
+DELETE FROM token_ledger WHERE session_id IN (%s);
+UPDATE command_runs SET session_id = NULL WHERE session_id IN (%s);
+UPDATE agent_runs SET session_id = NULL WHERE session_id IN (%s);
+DELETE FROM sessions WHERE COALESCE(project_id, 'default') = %s;
+DELETE FROM project_access_routes WHERE project_id = %s;
+DELETE FROM moderator_preferences WHERE scope = 'project' AND project_id = %s;
+DELETE FROM projects WHERE id = %s;
+COMMIT;
+`, sessionSubquery, sessionSubquery, sessionSubquery, sessionSubquery, sessionSubquery, sessionSubquery, sessionSubquery, sessionSubquery, sessionSubquery, sessionSubquery, quote(projectID), quote(projectID), quote(projectID), quote(projectID))
+	return s.run(stmt)
+}
+
 func (s Store) SearchSessions(query string) ([]core.Session, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
@@ -748,6 +1942,110 @@ ORDER BY s.updated_at DESC, s.id ASC;
 		sessions = append(sessions, session)
 	}
 	return sessions, nil
+}
+
+func (s Store) AddKnowledgeItem(item core.KnowledgeItem) (core.KnowledgeItem, error) {
+	item.Scope = core.KnowledgeScope(strings.TrimSpace(string(item.Scope)))
+	item.ProjectID = strings.TrimSpace(item.ProjectID)
+	item.Kind = strings.TrimSpace(item.Kind)
+	item.Title = strings.TrimSpace(item.Title)
+	item.SourceEventID = strings.TrimSpace(item.SourceEventID)
+	if item.Scope == "" {
+		if item.ProjectID != "" {
+			item.Scope = core.KnowledgeScopeProject
+		} else {
+			item.Scope = core.KnowledgeScopeGlobal
+		}
+	}
+	if item.Scope == core.KnowledgeScopeProject && item.ProjectID == "" {
+		return core.KnowledgeItem{}, errors.New("project knowledge requires project id")
+	}
+	if item.Kind == "" {
+		item.Kind = "fact"
+	}
+	if item.Title == "" {
+		return core.KnowledgeItem{}, errors.New("knowledge title is required")
+	}
+	if item.ID == "" {
+		item.ID = "knowledge_" + randomHex(16)
+	}
+	now := time.Now().UTC()
+	if item.CreatedAt.IsZero() {
+		item.CreatedAt = now
+	}
+	item.UpdatedAt = now
+	if item.ContentRef == "" {
+		item.ContentRef = filepath.ToSlash(filepath.Join("objects", "knowledge", item.ID+".json"))
+	}
+	if err := s.writeKnowledgeObject(item); err != nil {
+		return core.KnowledgeItem{}, err
+	}
+	stmt := fmt.Sprintf(`
+INSERT INTO knowledge_items (id, scope, project_id, kind, title, source_event_id, content_ref, created_at, updated_at)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+`, quote(item.ID), quote(string(item.Scope)), nullable(item.ProjectID), quote(item.Kind), quote(item.Title), nullable(item.SourceEventID), quote(item.ContentRef), quote(item.CreatedAt.Format(time.RFC3339Nano)), quote(item.UpdatedAt.Format(time.RFC3339Nano)))
+	if err := s.run(stmt); err != nil {
+		return core.KnowledgeItem{}, err
+	}
+	return item, nil
+}
+
+func (s Store) SearchKnowledge(options KnowledgeSearchOptions) ([]core.KnowledgeItem, error) {
+	limit := options.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	clauses := []string{"1 = 1"}
+	if strings.TrimSpace(options.Query) != "" {
+		like := "%" + strings.TrimSpace(options.Query) + "%"
+		clauses = append(clauses, fmt.Sprintf("(title LIKE %s OR kind LIKE %s OR content_ref LIKE %s)", quote(like), quote(like), quote(like)))
+	}
+	if options.Scope != "" {
+		clauses = append(clauses, fmt.Sprintf("scope = %s", quote(string(options.Scope))))
+	}
+	if strings.TrimSpace(options.ProjectID) != "" {
+		clauses = append(clauses, fmt.Sprintf("COALESCE(project_id, '') = %s", quote(strings.TrimSpace(options.ProjectID))))
+	}
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id, scope, COALESCE(project_id, '') AS project_id, kind, title,
+       COALESCE(source_event_id, '') AS source_event_id, content_ref, created_at, updated_at
+FROM knowledge_items
+WHERE %s
+ORDER BY updated_at DESC, id ASC
+LIMIT %d;
+`, strings.Join(clauses, " AND "), limit))
+	if err != nil {
+		return nil, err
+	}
+	var rows []knowledgeItemRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return nil, err
+	}
+	items := make([]core.KnowledgeItem, 0, len(rows))
+	for _, row := range rows {
+		item, err := row.toCore()
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func (s Store) writeKnowledgeObject(item core.KnowledgeItem) error {
+	if strings.TrimSpace(s.DBPath) == "" {
+		return nil
+	}
+	path := filepath.Join(filepath.Dir(s.DBPath), filepath.FromSlash(item.ContentRef))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(item, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return os.WriteFile(path, data, 0o644)
 }
 
 func (s Store) AddCommandRun(input CommandRun) (CommandRun, error) {
@@ -1075,6 +2373,31 @@ LIMIT 1;
 	return rows[0].toCore(), nil
 }
 
+func (s Store) ListProviderChatBindings(sessionID string) ([]ProviderChatBinding, error) {
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id, session_id, provider_plugin_id,
+       COALESCE(provider_profile_id, '') AS provider_profile_id,
+       COALESCE(access_route_id, '') AS access_route_id,
+       COALESCE(model_id, '') AS model_id,
+       external_thread_id, status
+FROM provider_chats
+WHERE session_id = %s
+ORDER BY updated_at DESC, created_at DESC;
+`, quote(sessionID)))
+	if err != nil {
+		return nil, err
+	}
+	var rows []providerChatBindingRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return nil, err
+	}
+	bindings := make([]ProviderChatBinding, 0, len(rows))
+	for _, row := range rows {
+		bindings = append(bindings, row.toCore())
+	}
+	return bindings, nil
+}
+
 func (s Store) UpsertProviderChatBinding(input ProviderChatBindingInput) (ProviderChatBinding, error) {
 	if strings.TrimSpace(input.SessionID) == "" {
 		return ProviderChatBinding{}, errors.New("session id is required")
@@ -1231,6 +2554,123 @@ type messageRow struct {
 	Content   string `json:"content"`
 	CreatedAt string `json:"created_at"`
 	SourceID  string `json:"source_id"`
+}
+
+type messageEventRow struct {
+	ID            string `json:"id"`
+	SessionID     string `json:"session_id"`
+	MessageID     string `json:"message_id"`
+	ActivityIndex int    `json:"activity_index"`
+	Kind          string `json:"kind"`
+	PayloadJSON   string `json:"payload_json"`
+	CreatedAt     string `json:"created_at"`
+}
+
+type contextEventRow struct {
+	ID             string `json:"id"`
+	Type           string `json:"type"`
+	ProjectID      string `json:"project_id"`
+	SessionID      string `json:"session_id"`
+	BranchID       string `json:"branch_id"`
+	PayloadRef     string `json:"payload_ref"`
+	ParentEventIDs string `json:"parent_event_ids"`
+	CreatedAt      string `json:"created_at"`
+}
+
+type contextHeadRow struct {
+	ID        string `json:"id"`
+	ProjectID string `json:"project_id"`
+	SessionID string `json:"session_id"`
+	BranchID  string `json:"branch_id"`
+	EventID   string `json:"event_id"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+type knowledgeItemRow struct {
+	ID            string `json:"id"`
+	Scope         string `json:"scope"`
+	ProjectID     string `json:"project_id"`
+	Kind          string `json:"kind"`
+	Title         string `json:"title"`
+	SourceEventID string `json:"source_event_id"`
+	ContentRef    string `json:"content_ref"`
+	CreatedAt     string `json:"created_at"`
+	UpdatedAt     string `json:"updated_at"`
+}
+
+type chatRunRow struct {
+	ID              string `json:"id"`
+	ProjectID       string `json:"project_id"`
+	SessionID       string `json:"session_id"`
+	BranchID        string `json:"branch_id"`
+	Role            string `json:"role"`
+	Status          string `json:"status"`
+	InputEventID    string `json:"input_event_id"`
+	OutputEventID   string `json:"output_event_id"`
+	ContextPacketID string `json:"context_packet_id"`
+	CreatedAt       string `json:"created_at"`
+	UpdatedAt       string `json:"updated_at"`
+}
+
+type providerSegmentRow struct {
+	ID               string `json:"id"`
+	ChatRunID        string `json:"chat_run_id"`
+	ProviderID       string `json:"provider_id"`
+	RouteID          string `json:"route_id"`
+	ModelID          string `json:"model_id"`
+	ExternalThreadID string `json:"external_thread_id"`
+	Status           string `json:"status"`
+	HandoffReason    string `json:"handoff_reason"`
+	StartedAt        string `json:"started_at"`
+	CompletedAt      string `json:"completed_at"`
+}
+
+type contextPacketRow struct {
+	ID             string `json:"id"`
+	ProjectID      string `json:"project_id"`
+	SessionID      string `json:"session_id"`
+	BranchID       string `json:"branch_id"`
+	HeadEventID    string `json:"head_event_id"`
+	UserInput      string `json:"user_input"`
+	ContentRef     string `json:"content_ref"`
+	ReferenceCount int    `json:"reference_count"`
+	CreatedAt      string `json:"created_at"`
+}
+
+type steeringRow struct {
+	ID                string `json:"id"`
+	ChatRunID         string `json:"chat_run_id"`
+	ProviderSegmentID string `json:"provider_segment_id"`
+	EventID           string `json:"event_id"`
+	Content           string `json:"content"`
+	Status            string `json:"status"`
+	CreatedAt         string `json:"created_at"`
+}
+
+type queueItemRow struct {
+	ID             string `json:"id"`
+	SessionID      string `json:"session_id"`
+	BranchID       string `json:"branch_id"`
+	Content        string `json:"content"`
+	Mode           string `json:"mode"`
+	Status         string `json:"status"`
+	OrderIndex     int    `json:"order_index"`
+	RouteID        string `json:"route_id"`
+	ModelID        string `json:"model_id"`
+	ThinkingEffort string `json:"thinking_effort"`
+	CreatedAt      string `json:"created_at"`
+	UpdatedAt      string `json:"updated_at"`
+}
+
+type candidateOutputRow struct {
+	ID         string `json:"id"`
+	ChatRunID  string `json:"chat_run_id"`
+	SessionID  string `json:"session_id"`
+	BranchID   string `json:"branch_id"`
+	ContentRef string `json:"content_ref"`
+	Status     string `json:"status"`
+	CreatedAt  string `json:"created_at"`
+	UpdatedAt  string `json:"updated_at"`
 }
 
 type registryItemRow struct {
@@ -1417,6 +2857,210 @@ func (r messageRow) toCore() (core.Message, error) {
 	}, nil
 }
 
+func (r messageEventRow) toCore() MessageEvent {
+	return MessageEvent{
+		ID:            r.ID,
+		SessionID:     r.SessionID,
+		MessageID:     r.MessageID,
+		ActivityIndex: r.ActivityIndex,
+		Kind:          r.Kind,
+		PayloadJSON:   r.PayloadJSON,
+		CreatedAt:     r.CreatedAt,
+	}
+}
+
+func (r contextEventRow) toCore() (core.Event, error) {
+	createdAt, err := parseTime(r.CreatedAt)
+	if err != nil {
+		return core.Event{}, err
+	}
+	parentIDs := []string{}
+	for _, id := range strings.Split(r.ParentEventIDs, "\x1f") {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			parentIDs = append(parentIDs, id)
+		}
+	}
+	return core.Event{
+		ID:             r.ID,
+		Type:           core.EventType(r.Type),
+		ProjectID:      r.ProjectID,
+		SessionID:      r.SessionID,
+		BranchID:       r.BranchID,
+		ParentEventIDs: parentIDs,
+		PayloadRef:     r.PayloadRef,
+		CreatedAt:      createdAt,
+	}, nil
+}
+
+func (r contextHeadRow) toCore() (core.Head, error) {
+	updatedAt, err := parseTime(r.UpdatedAt)
+	if err != nil {
+		return core.Head{}, err
+	}
+	return core.Head{
+		ID:        r.ID,
+		ProjectID: r.ProjectID,
+		SessionID: r.SessionID,
+		BranchID:  r.BranchID,
+		EventID:   r.EventID,
+		UpdatedAt: updatedAt,
+	}, nil
+}
+
+func (r knowledgeItemRow) toCore() (core.KnowledgeItem, error) {
+	createdAt, err := parseTime(r.CreatedAt)
+	if err != nil {
+		return core.KnowledgeItem{}, err
+	}
+	updatedAt, err := parseTime(r.UpdatedAt)
+	if err != nil {
+		return core.KnowledgeItem{}, err
+	}
+	return core.KnowledgeItem{
+		ID:            r.ID,
+		Scope:         core.KnowledgeScope(r.Scope),
+		ProjectID:     r.ProjectID,
+		Kind:          r.Kind,
+		Title:         r.Title,
+		SourceEventID: r.SourceEventID,
+		ContentRef:    r.ContentRef,
+		CreatedAt:     createdAt,
+		UpdatedAt:     updatedAt,
+	}, nil
+}
+
+func (r chatRunRow) toCore() (core.ChatRun, error) {
+	createdAt, err := parseTime(r.CreatedAt)
+	if err != nil {
+		return core.ChatRun{}, err
+	}
+	updatedAt, err := parseTime(r.UpdatedAt)
+	if err != nil {
+		return core.ChatRun{}, err
+	}
+	return core.ChatRun{
+		ID:              r.ID,
+		ProjectID:       r.ProjectID,
+		SessionID:       r.SessionID,
+		BranchID:        r.BranchID,
+		Role:            core.ChatRunRole(r.Role),
+		Status:          core.ChatRunStatus(r.Status),
+		InputEventID:    r.InputEventID,
+		OutputEventID:   r.OutputEventID,
+		ContextPacketID: r.ContextPacketID,
+		CreatedAt:       createdAt,
+		UpdatedAt:       updatedAt,
+	}, nil
+}
+
+func (r providerSegmentRow) toCore() (core.ProviderSegment, error) {
+	startedAt, err := parseTime(r.StartedAt)
+	if err != nil {
+		return core.ProviderSegment{}, err
+	}
+	var completedAt *time.Time
+	if strings.TrimSpace(r.CompletedAt) != "" {
+		parsed, err := parseTime(r.CompletedAt)
+		if err != nil {
+			return core.ProviderSegment{}, err
+		}
+		completedAt = &parsed
+	}
+	return core.ProviderSegment{
+		ID:               r.ID,
+		ChatRunID:        r.ChatRunID,
+		ProviderID:       r.ProviderID,
+		RouteID:          r.RouteID,
+		ModelID:          r.ModelID,
+		ExternalThreadID: r.ExternalThreadID,
+		Status:           core.ProviderSegmentStatus(r.Status),
+		HandoffReason:    r.HandoffReason,
+		StartedAt:        startedAt,
+		CompletedAt:      completedAt,
+	}, nil
+}
+
+func (r contextPacketRow) toCore() (ContextPacketRecord, error) {
+	createdAt, err := parseTime(r.CreatedAt)
+	if err != nil {
+		return ContextPacketRecord{}, err
+	}
+	return ContextPacketRecord{
+		ID:             r.ID,
+		ProjectID:      r.ProjectID,
+		SessionID:      r.SessionID,
+		BranchID:       r.BranchID,
+		HeadEventID:    r.HeadEventID,
+		UserInput:      r.UserInput,
+		ContentRef:     r.ContentRef,
+		ReferenceCount: r.ReferenceCount,
+		CreatedAt:      createdAt,
+	}, nil
+}
+
+func (r steeringRow) toCore() (SteeringRecord, error) {
+	createdAt, err := parseTime(r.CreatedAt)
+	if err != nil {
+		return SteeringRecord{}, err
+	}
+	return SteeringRecord{
+		ID:                r.ID,
+		ChatRunID:         r.ChatRunID,
+		ProviderSegmentID: r.ProviderSegmentID,
+		EventID:           r.EventID,
+		Content:           r.Content,
+		Status:            r.Status,
+		CreatedAt:         createdAt,
+	}, nil
+}
+
+func (r queueItemRow) toCore() (core.QueueItem, error) {
+	createdAt, err := parseTime(r.CreatedAt)
+	if err != nil {
+		return core.QueueItem{}, err
+	}
+	updatedAt, err := parseTime(r.UpdatedAt)
+	if err != nil {
+		return core.QueueItem{}, err
+	}
+	return core.QueueItem{
+		ID:             r.ID,
+		SessionID:      r.SessionID,
+		BranchID:       r.BranchID,
+		Content:        r.Content,
+		Mode:           core.QueueItemMode(r.Mode),
+		Status:         core.QueueItemStatus(r.Status),
+		OrderIndex:     r.OrderIndex,
+		RouteID:        r.RouteID,
+		ModelID:        r.ModelID,
+		ThinkingEffort: r.ThinkingEffort,
+		CreatedAt:      createdAt,
+		UpdatedAt:      updatedAt,
+	}, nil
+}
+
+func (r candidateOutputRow) toCore() (core.CandidateOutput, error) {
+	createdAt, err := parseTime(r.CreatedAt)
+	if err != nil {
+		return core.CandidateOutput{}, err
+	}
+	updatedAt, err := parseTime(r.UpdatedAt)
+	if err != nil {
+		return core.CandidateOutput{}, err
+	}
+	return core.CandidateOutput{
+		ID:         r.ID,
+		ChatRunID:  r.ChatRunID,
+		SessionID:  r.SessionID,
+		BranchID:   r.BranchID,
+		ContentRef: r.ContentRef,
+		Status:     core.CandidateOutputStatus(r.Status),
+		CreatedAt:  createdAt,
+		UpdatedAt:  updatedAt,
+	}, nil
+}
+
 func parseTime(value string) (time.Time, error) {
 	if t, err := time.Parse(time.RFC3339Nano, value); err == nil {
 		return t, nil
@@ -1440,6 +3084,20 @@ func emptyArray(value string) string {
 		return "[]"
 	}
 	return value
+}
+
+func compactStrings(values []string) []string {
+	seen := map[string]bool{}
+	items := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		items = append(items, value)
+	}
+	return items
 }
 
 func randomHex(bytesLen int) string {

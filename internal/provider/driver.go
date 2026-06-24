@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jkj-dev/ergo-loom/internal/toolruntime"
+	"github.com/Floodnut/ergo-loom/internal/toolruntime"
 )
 
 type ChatRequest struct {
@@ -118,7 +118,7 @@ func (d ClaudeCLIDriver) ProviderPluginID() string {
 }
 
 func (d ClaudeCLIDriver) CanExecute(request ChatRequest) bool {
-	return request.ProviderPluginID == "anthropic" && (request.RouteTransport == "claude_cli" || request.RouteTransport == "manual")
+	return request.ProviderPluginID == "anthropic" && request.RouteTransport == "claude_cli"
 }
 
 func (d ClaudeCLIDriver) Respond(ctx context.Context, request ChatRequest, onEvent func(Event)) (ChatResponse, error) {
@@ -142,10 +142,14 @@ func (d ClaudeCLIDriver) Respond(ctx context.Context, request ChatRequest, onEve
 		"--output-format", "stream-json",
 		"--verbose",
 		"--include-partial-messages",
-		"--session-id", sessionID,
 		"--system-prompt", ergoLoomIdentityInstructions(),
 		"--permission-mode", "default",
 		"--tools", "",
+	}
+	if request.ExternalThreadID != "" {
+		args = append(args, "--resume", request.ExternalThreadID)
+	} else {
+		args = append(args, "--session-id", sessionID)
 	}
 	if model := claudeModel(request.ModelRef); model != "" {
 		args = append(args, "--model", model)
@@ -167,13 +171,16 @@ func (d ClaudeCLIDriver) Respond(ctx context.Context, request ChatRequest, onEve
 		return ChatResponse{}, err
 	}
 
-	onEvent(Event{Kind: "status", Text: "Attached Claude CLI session"})
 	var assistant strings.Builder
 	var streamed bool
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
-		event := claudeStreamEvent(scanner.Bytes())
+		line := scanner.Bytes()
+		if parsedSessionID := claudeSessionID(line); parsedSessionID != "" {
+			sessionID = parsedSessionID
+		}
+		event := claudeStreamEvent(line)
 		if event.Kind == "" {
 			continue
 		}
@@ -193,13 +200,82 @@ func (d ClaudeCLIDriver) Respond(ctx context.Context, request ChatRequest, onEve
 		return ChatResponse{ExternalThreadID: sessionID, Streamed: streamed}, err
 	}
 	if err := cmd.Wait(); err != nil {
-		return ChatResponse{ExternalThreadID: sessionID, Streamed: streamed}, fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
+		return ChatResponse{ExternalThreadID: sessionID, Streamed: streamed}, errors.New(claudeCLIErrorDetail(firstNonEmpty(stderr.String(), assistant.String())))
 	}
 	final := strings.TrimSpace(assistant.String())
 	if final == "" {
 		return ChatResponse{ExternalThreadID: sessionID, Streamed: streamed}, errors.New("claude CLI returned an empty response")
 	}
 	return ChatResponse{Text: final, ExternalThreadID: sessionID, Streamed: streamed}, nil
+}
+
+type CopilotBridgeDriver struct {
+	BridgeURL string
+}
+
+func (d CopilotBridgeDriver) ProviderPluginID() string {
+	return "copilot"
+}
+
+func (d CopilotBridgeDriver) CanExecute(request ChatRequest) bool {
+	if request.ProviderPluginID != "copilot" {
+		return false
+	}
+	if request.RouteTransport != "copilot_sdk_jsonrpc" && request.RouteTransport != "ide_bridge" {
+		return false
+	}
+	return strings.TrimSpace(firstNonEmpty(d.BridgeURL, os.Getenv("ERGO_COPILOT_BRIDGE_URL"))) != ""
+}
+
+func (d CopilotBridgeDriver) Respond(ctx context.Context, request ChatRequest, onEvent func(Event)) (ChatResponse, error) {
+	if !d.CanExecute(request) {
+		return ChatResponse{}, errors.New("Copilot bridge is not configured. Start an Ergo Loom Copilot bridge worker and set ERGO_COPILOT_BRIDGE_URL.")
+	}
+	bridgeURL := strings.TrimRight(strings.TrimSpace(firstNonEmpty(d.BridgeURL, os.Getenv("ERGO_COPILOT_BRIDGE_URL"))), "/")
+	onEvent(Event{Kind: "status", Text: "Sending request to Ergo Loom Copilot bridge"})
+	payload := map[string]string{
+		"provider":         request.ProviderPluginID,
+		"sessionId":        request.SessionID,
+		"externalThreadId": request.ExternalThreadID,
+		"input":            request.Input,
+		"modelRef":         request.ModelRef,
+		"modelDisplayName": request.ModelDisplayName,
+		"thinkingEffort":   request.ThinkingEffort,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return ChatResponse{}, err
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, bridgeURL+"/v1/copilot/chat", bytes.NewReader(body))
+	if err != nil {
+		return ChatResponse{}, err
+	}
+	httpRequest.Header.Set("Content-Type", "application/json")
+
+	response, err := (&http.Client{Timeout: 2 * time.Minute}).Do(httpRequest)
+	if err != nil {
+		return ChatResponse{}, err
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 2*1024*1024))
+	if err != nil {
+		return ChatResponse{}, err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return ChatResponse{}, fmt.Errorf("Copilot bridge failed: %s", strings.TrimSpace(string(responseBody)))
+	}
+	var result struct {
+		Text             string `json:"text"`
+		ExternalThreadID string `json:"externalThreadId"`
+	}
+	if err := json.Unmarshal(responseBody, &result); err != nil {
+		return ChatResponse{}, err
+	}
+	if strings.TrimSpace(result.Text) == "" {
+		return ChatResponse{}, errors.New("Copilot bridge returned an empty response")
+	}
+	onEvent(Event{Kind: "status", Text: "Received Copilot bridge response"})
+	return ChatResponse{Text: result.Text, ExternalThreadID: result.ExternalThreadID, Streamed: false}, nil
 }
 
 func (d ClaudeCLIDriver) respondWithBrowserHandoff(ctx context.Context, request ChatRequest, onEvent func(Event)) (ChatResponse, error) {
@@ -318,14 +394,40 @@ func claudeModel(modelRef string) string {
 	}
 }
 
+func claudeSessionID(line []byte) string {
+	var message map[string]any
+	if err := json.Unmarshal(line, &message); err != nil {
+		return ""
+	}
+	return firstString(message, "session_id", "sessionId", "message.session_id", "message.sessionId")
+}
+
 func claudeStreamEvent(line []byte) Event {
 	var message map[string]any
 	if err := json.Unmarshal(line, &message); err != nil {
 		return Event{}
 	}
 	eventType := firstString(message, "type")
+	subtype := firstString(message, "subtype")
+	if eventType == "system" {
+		if subtype == "init" {
+			return Event{Kind: "status", Text: "Attached Claude CLI session"}
+		}
+		return Event{}
+	}
+	if toolEvent := claudeToolEvent(message); toolEvent.Kind != "" {
+		return toolEvent
+	}
 	text := firstNonEmpty(
-		firstString(message, "delta.text", "delta.partial_json", "message.content.0.text", "content.0.text", "result", "text"),
+		firstString(message,
+			"delta.text",
+			"delta.partial_json",
+			"message.content.0.text",
+			"message.delta.text",
+			"content.0.text",
+			"result",
+			"text",
+		),
 		claudeContentText(message["message"]),
 		claudeContentText(message["content"]),
 	)
@@ -347,6 +449,71 @@ func claudeStreamEvent(line []byte) Event {
 	return Event{}
 }
 
+func claudeToolEvent(message map[string]any) Event {
+	eventType := firstString(message, "type")
+	for _, block := range claudeContentBlocks(message) {
+		blockType := firstString(block, "type")
+		switch blockType {
+		case "tool_use":
+			name := firstNonEmpty(firstString(block, "name"), "tool")
+			return Event{
+				Kind: "tool_start",
+				Tool: &toolruntime.Event{
+					Type:         "claude_tool",
+					ToolID:       firstNonEmpty(firstString(block, "id"), name),
+					ToolName:     name,
+					InvocationID: firstString(block, "id"),
+					Command:      claudeToolInputSummary(block["input"]),
+					Text:         "Claude requested " + name,
+					Status:       "started",
+					Payload:      block,
+				},
+			}
+		case "tool_result":
+			toolID := firstString(block, "tool_use_id")
+			return Event{
+				Kind: "tool_result",
+				Tool: &toolruntime.Event{
+					Type:         "claude_tool",
+					ToolID:       firstNonEmpty(toolID, "tool"),
+					ToolName:     firstNonEmpty(firstString(block, "name"), "tool"),
+					InvocationID: toolID,
+					Text:         firstNonEmpty(claudeContentText(block["content"]), firstString(block, "content")),
+					Status:       "completed",
+					Payload:      block,
+				},
+			}
+		}
+	}
+	if eventType == "error" {
+		return Event{Kind: "tool_error", Text: firstNonEmpty(firstString(message, "error.message", "message"), "Claude CLI stream error")}
+	}
+	return Event{}
+}
+
+func claudeContentBlocks(message map[string]any) []map[string]any {
+	values := []any{message["content"]}
+	if nested, ok := message["message"].(map[string]any); ok {
+		values = append(values, nested["content"])
+	}
+	for _, value := range values {
+		items, ok := value.([]any)
+		if !ok {
+			continue
+		}
+		blocks := make([]map[string]any, 0, len(items))
+		for _, item := range items {
+			if block, ok := item.(map[string]any); ok {
+				blocks = append(blocks, block)
+			}
+		}
+		if len(blocks) > 0 {
+			return blocks
+		}
+	}
+	return nil
+}
+
 func claudeContentText(value any) string {
 	switch typed := value.(type) {
 	case []any:
@@ -362,6 +529,36 @@ func claudeContentText(value any) string {
 	default:
 		return ""
 	}
+}
+
+func claudeToolInputSummary(value any) string {
+	switch typed := value.(type) {
+	case map[string]any:
+		if command := firstString(typed, "command"); command != "" {
+			return command
+		}
+		encoded, err := json.Marshal(typed)
+		if err == nil {
+			return string(encoded)
+		}
+	case string:
+		return typed
+	}
+	return ""
+}
+
+func claudeCLIErrorDetail(stderr string) string {
+	detail := strings.TrimSpace(stderr)
+	if strings.Contains(strings.ToLower(detail), "not logged in") {
+		return "Claude CLI is not logged in with a subscription token. Run `claude setup-token` with your Pro/Max subscription account, then refresh provider status in Ergo Loom."
+	}
+	if strings.Contains(strings.ToLower(detail), "credit balance too low") {
+		return "Claude CLI is using API billing and reports low credit balance. Run `claude setup-token` with your Pro/Max subscription account so Ergo Loom can use the subscription route instead of API billing."
+	}
+	if detail == "" {
+		return "Claude CLI command failed"
+	}
+	return detail
 }
 
 func newUUID() string {

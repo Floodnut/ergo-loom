@@ -59,7 +59,25 @@
     "dmg": {
       "artifactName": "Ergo-Loom-${version}-${arch}.${ext}",
       "backgroundColor": "#fffdf8",
-      "icon": "build/icon.icns"
+      "icon": "build/icon.icns",
+      "iconSize": 96,
+      "window": {
+        "width": 540,
+        "height": 360
+      },
+      "contents": [
+        {
+          "x": 150,
+          "y": 170,
+          "type": "file"
+        },
+        {
+          "x": 390,
+          "y": 170,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
     },
     "publish": [
       {

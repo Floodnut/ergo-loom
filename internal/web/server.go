@@ -14,11 +14,12 @@ import (
 	"sync"
 	"time"
 
-	webapp "github.com/jkj-dev/ergo-loom/apps/desktop-or-web"
-	"github.com/jkj-dev/ergo-loom/internal/chatfilter"
-	"github.com/jkj-dev/ergo-loom/internal/provider"
-	"github.com/jkj-dev/ergo-loom/internal/storage/sqlitecli"
-	"github.com/jkj-dev/ergo-loom/internal/toolruntime"
+	webapp "github.com/Floodnut/ergo-loom/apps/desktop-or-web"
+	"github.com/Floodnut/ergo-loom/internal/chatfilter"
+	"github.com/Floodnut/ergo-loom/internal/core"
+	"github.com/Floodnut/ergo-loom/internal/provider"
+	"github.com/Floodnut/ergo-loom/internal/storage/sqlitecli"
+	"github.com/Floodnut/ergo-loom/internal/toolruntime"
 )
 
 type Server struct {
@@ -28,10 +29,18 @@ type Server struct {
 	drivers   provider.DriverRegistry
 }
 
+const providerSoftTokenCap = 50000
+
 type chatSelection struct {
 	Route   sqlitecli.AccessRoute
 	Model   sqlitecli.ProviderModel
 	Profile sqlitecli.ProviderProfile
+}
+
+type moderatorHandoff struct {
+	FromSelection chatSelection
+	ToSelection   chatSelection
+	Reason        string
 }
 
 type authStatus struct {
@@ -41,6 +50,23 @@ type authStatus struct {
 	Connected    bool   `json:"connected"`
 	Status       string `json:"status"`
 	Detail       string `json:"detail"`
+}
+
+type runtimeDiagnostics struct {
+	Desktop       bool                `json:"desktop"`
+	AppRoot       string              `json:"appRoot"`
+	DataDir       string              `json:"dataDir"`
+	HandoffBridge string              `json:"handoffBridge"`
+	Path          string              `json:"path"`
+	Executables   []runtimeExecutable `json:"executables"`
+}
+
+type runtimeExecutable struct {
+	ID     string `json:"id"`
+	Label  string `json:"label"`
+	Path   string `json:"path"`
+	Status string `json:"status"`
+	Detail string `json:"detail"`
 }
 
 func (s Server) projectFromRequest(r *http.Request, projects []sqlitecli.Project) (sqlitecli.Project, error) {
@@ -118,7 +144,7 @@ func NewServer(store sqlitecli.Store) Server {
 			provider.CodexAppServerDriver{},
 			provider.UnavailableDriver{ProviderID: "openai", Reason: "ChatGPT handoff driver is not implemented yet"},
 			provider.ClaudeCLIDriver{},
-			provider.UnavailableDriver{ProviderID: "copilot", Reason: "Copilot bridge driver is not implemented yet"},
+			provider.CopilotBridgeDriver{},
 			provider.UnavailableDriver{ProviderID: "gemini", Reason: "Gemini bridge driver is not implemented yet"},
 			provider.UnavailableDriver{ProviderID: "ollama", Reason: "Ollama local model driver is not implemented yet"},
 		),
@@ -135,8 +161,15 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/projects/", s.projectRoute)
 	mux.HandleFunc("POST /api/provider-profiles/connect", s.connectProviderProfile)
 	mux.HandleFunc("GET /api/sessions/search", s.searchSessions)
+	mux.HandleFunc("PATCH /api/sessions/{sessionID}/providers", s.updateSessionProviders)
+	mux.HandleFunc("POST /api/sessions/{sessionID}/steering", s.recordSteering)
+	mux.HandleFunc("GET /api/sessions/{sessionID}/queue", s.sessionQueue)
+	mux.HandleFunc("POST /api/sessions/{sessionID}/queue", s.sessionQueue)
+	mux.HandleFunc("PATCH /api/sessions/{sessionID}/queue", s.sessionQueue)
+	mux.HandleFunc("POST /api/sessions/{sessionID}/parallel", s.startParallelRun)
 	mux.HandleFunc("GET /api/sessions/", s.session)
 	mux.HandleFunc("PATCH /api/sessions/", s.renameSession)
+	mux.HandleFunc("DELETE /api/sessions/", s.deleteSession)
 	mux.HandleFunc("POST /api/sessions/", s.sessionMessage)
 	mux.HandleFunc("POST /api/sessions", s.createSession)
 	mux.HandleFunc("POST /api/files/read", s.readFile)
@@ -201,6 +234,9 @@ func (s Server) state(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
+	if project.IsDefault {
+		s.ensureDefaultProjectRoutes(project.ID)
+	}
 	projectRoutes, err := s.store.ListProjectAccessRoutes(project.ID)
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
@@ -234,7 +270,14 @@ func (s Server) state(w http.ResponseWriter, r *http.Request) {
 		"moderatorPreference": moderator,
 		"usage":               usage,
 		"auth":                detectAuthStatuses(),
+		"diagnostics":         detectRuntimeDiagnostics(),
 	})
+}
+
+func (s Server) ensureDefaultProjectRoutes(projectID string) {
+	for _, routeID := range []string{"codex-subscription-cli"} {
+		_ = s.store.AddProjectAccessRoute(projectID, routeID)
+	}
 }
 
 func (s Server) authStatus(w http.ResponseWriter, r *http.Request) {
@@ -326,6 +369,176 @@ func (s Server) renameSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"session": session})
 }
 
+func (s Server) updateSessionProviders(w http.ResponseWriter, r *http.Request) {
+	sessionID := strings.TrimSpace(r.PathValue("sessionID"))
+	if sessionID == "" {
+		writeError(w, errors.New("session id is required"), http.StatusBadRequest)
+		return
+	}
+	var input struct {
+		ProviderGroupIDs []string `json:"providerGroupIds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	if _, _, err := s.store.GetSession(sessionID); err != nil {
+		writeError(w, err, http.StatusNotFound)
+		return
+	}
+	if err := s.store.SetSessionProviderGroups(sessionID, compactStrings(input.ProviderGroupIDs)); err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	groups, err := s.store.ListSessionProviderGroups(sessionID)
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"providerGroupIds": groups})
+}
+
+func (s Server) recordSteering(w http.ResponseWriter, r *http.Request) {
+	sessionID := strings.TrimSpace(r.PathValue("sessionID"))
+	if sessionID == "" {
+		writeError(w, errors.New("session id is required"), http.StatusBadRequest)
+		return
+	}
+	var input struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	content := strings.TrimSpace(input.Content)
+	if content == "" {
+		writeError(w, errors.New("steering content is required"), http.StatusBadRequest)
+		return
+	}
+	run, err := s.store.ActiveMainChatRun(sessionID)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, sqlitecli.ErrNotFound) {
+			status = http.StatusConflict
+		}
+		writeError(w, err, status)
+		return
+	}
+	segment, err := s.store.ActiveProviderSegment(run.ID)
+	if err != nil && !errors.Is(err, sqlitecli.ErrNotFound) {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	event := s.recordContextEventAfter(sessionID, core.EventSteeringAdded, "steering:"+run.ID, run.InputEventID)
+	record, err := s.store.RecordSteering(sqlitecli.SteeringInput{
+		ChatRunID:         run.ID,
+		ProviderSegmentID: segment.ID,
+		EventID:           event.ID,
+		Content:           content,
+		Status:            "recorded",
+	})
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"steering": record, "chatRun": run, "providerSegment": segment})
+}
+
+func (s Server) startParallelRun(w http.ResponseWriter, r *http.Request) {
+	sessionID := strings.TrimSpace(r.PathValue("sessionID"))
+	if sessionID == "" {
+		writeError(w, errors.New("session id is required"), http.StatusBadRequest)
+		return
+	}
+	var input struct {
+		Content        string `json:"content"`
+		RouteID        string `json:"routeId"`
+		ModelID        string `json:"modelId"`
+		ThinkingEffort string `json:"thinkingEffort"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	content := strings.TrimSpace(input.Content)
+	if content == "" {
+		writeError(w, errors.New("content is required"), http.StatusBadRequest)
+		return
+	}
+	session, _, err := s.store.GetSession(sessionID)
+	if err != nil {
+		writeError(w, err, http.StatusNotFound)
+		return
+	}
+	selection, err := s.resolveChatSelection(sessionID, input.RouteID, input.ModelID)
+	if err != nil {
+		writeError(w, fmt.Errorf("cannot resolve provider for parallel run: %w", err), http.StatusBadRequest)
+		return
+	}
+	packet := s.buildContextPacket(sessionID, content, selection, "parallel run")
+	if _, err := s.store.SaveContextPacket(packet); err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	run, err := s.store.StartChatRun(sqlitecli.ChatRunInput{
+		ProjectID:       session.ProjectID,
+		SessionID:       sessionID,
+		BranchID:        "main",
+		Role:            core.ChatRunRoleParallel,
+		Status:          core.ChatRunRunning,
+		ContextPacketID: packet.ID,
+	})
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	candidate, err := s.store.AddCandidateOutput(sqlitecli.CandidateOutputInput{
+		ChatRunID: run.ID,
+		SessionID: sessionID,
+		BranchID:  "main",
+		Content:   "",
+		Status:    core.CandidateOutputPending,
+	})
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	thinkingEffort := strings.TrimSpace(input.ThinkingEffort)
+	go func() {
+		seg := s.startProviderSegment(run.ID, selection, "")
+		text, _, runErr := s.runAssistant(context.Background(), sessionID, content, thinkingEffort, selection, func(event provider.Event) {})
+		segStatus := core.ProviderSegmentCompleted
+		candidateStatus := core.CandidateOutputReady
+		if runErr != nil {
+			segStatus = core.ProviderSegmentFailed
+			candidateStatus = core.CandidateOutputRejected
+			text = runErr.Error()
+		}
+		s.completeProviderSegment(seg.ID, segStatus, "")
+		s.store.UpdateCandidateOutput(candidate.ID, text, candidateStatus)
+		runStatus := core.ChatRunCompleted
+		if runErr != nil {
+			runStatus = core.ChatRunFailed
+		}
+		s.store.CompleteChatRun(run.ID, runStatus, "")
+	}()
+	writeJSON(w, map[string]any{"candidateId": candidate.ID, "chatRunId": run.ID})
+}
+
+func (s Server) deleteSession(w http.ResponseWriter, r *http.Request) {
+	sessionID, ok := sessionIDFromPath(r.URL.Path)
+	if !ok {
+		writeError(w, errors.New("session id is required"), http.StatusBadRequest)
+		return
+	}
+	if err := s.store.DeleteSession(sessionID); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
 func (s Server) connectProviderProfile(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		ProviderPluginID string `json:"providerPluginId"`
@@ -362,10 +575,27 @@ func (s Server) projectRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodDelete {
+		if _, _, ok := projectRouteIDsFromPath(r.URL.Path); !ok {
+			s.deleteProject(w, r)
+			return
+		}
 		s.removeProjectRoute(w, r)
 		return
 	}
 	writeError(w, errors.New("method not allowed"), http.StatusMethodNotAllowed)
+}
+
+func (s Server) deleteProject(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := projectIDFromPath(r.URL.Path)
+	if !ok {
+		writeError(w, errors.New("project id is required"), http.StatusBadRequest)
+		return
+	}
+	if err := s.store.DeleteProject(projectID); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "ok"})
 }
 
 func (s Server) updateProjectModerator(w http.ResponseWriter, r *http.Request) {
@@ -625,12 +855,132 @@ func (s Server) session(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
+	events, err := s.store.ListMessageEvents(sessionID)
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	providerChats, err := s.store.ListProviderChatBindings(sessionID)
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	queueItems, err := s.store.ListPendingQueueItems(sessionID)
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	candidateOutputs, err := s.store.ListPendingCandidateOutputs(sessionID)
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, map[string]any{
 		"session":          session,
 		"messages":         messages,
+		"events":           events,
+		"providerChats":    providerChats,
+		"queueItems":       queueItems,
+		"candidateOutputs": candidateOutputs,
 		"context":          contextUsageOrZero(s.store, sessionID),
 		"providerGroupIds": providerGroupIDs,
 	})
+}
+
+func (s Server) sessionQueue(w http.ResponseWriter, r *http.Request) {
+	sessionID := strings.TrimSpace(r.PathValue("sessionID"))
+	if sessionID == "" {
+		writeError(w, errors.New("session id is required"), http.StatusBadRequest)
+		return
+	}
+	if _, _, err := s.store.GetSession(sessionID); err != nil {
+		writeError(w, err, http.StatusNotFound)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		items, err := s.store.ListPendingQueueItems(sessionID)
+		if err != nil {
+			writeError(w, err, http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{"queueItems": items})
+	case http.MethodPost:
+		var input struct {
+			Content        string `json:"content"`
+			Mode           string `json:"mode"`
+			RouteID        string `json:"routeId"`
+			ModelID        string `json:"modelId"`
+			ThinkingEffort string `json:"thinkingEffort"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			writeError(w, err, http.StatusBadRequest)
+			return
+		}
+		item, err := s.store.AddQueueItem(sqlitecli.QueueItemInput{
+			SessionID:      sessionID,
+			BranchID:       "main",
+			Content:        input.Content,
+			Mode:           core.QueueItemMode(strings.TrimSpace(input.Mode)),
+			RouteID:        input.RouteID,
+			ModelID:        input.ModelID,
+			ThinkingEffort: input.ThinkingEffort,
+		})
+		if err != nil {
+			writeError(w, err, http.StatusBadRequest)
+			return
+		}
+		s.recordContextEvent(sessionID, core.EventQueueItemCreated, "queue:"+item.ID)
+		writeJSON(w, map[string]any{"queueItem": item})
+	case http.MethodPatch:
+		var input struct {
+			ItemIDs []string `json:"itemIds"`
+			ItemID  string   `json:"itemId"`
+			Status  string   `json:"status"`
+			Mode    string   `json:"mode"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			writeError(w, err, http.StatusBadRequest)
+			return
+		}
+		if len(input.ItemIDs) > 0 {
+			if err := s.store.ReorderQueueItems(sessionID, input.ItemIDs); err != nil {
+				writeError(w, err, http.StatusBadRequest)
+				return
+			}
+			s.recordContextEvent(sessionID, core.EventQueueItemReordered, "queue:reorder")
+		}
+		var item core.QueueItem
+		if strings.TrimSpace(input.ItemID) != "" {
+			if strings.TrimSpace(input.Mode) != "" {
+				updated, err := s.store.UpdateQueueItemMode(input.ItemID, core.QueueItemMode(strings.TrimSpace(input.Mode)))
+				if err != nil {
+					writeError(w, err, http.StatusBadRequest)
+					return
+				}
+				item = updated
+			} else {
+				status := core.QueueItemStatus(strings.TrimSpace(input.Status))
+				if status == "" {
+					status = core.QueueItemConsumed
+				}
+				updated, err := s.store.UpdateQueueItemStatus(input.ItemID, status)
+				if err != nil {
+					writeError(w, err, http.StatusBadRequest)
+					return
+				}
+				item = updated
+			}
+		}
+		items, err := s.store.ListPendingQueueItems(sessionID)
+		if err != nil {
+			writeError(w, err, http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{"queueItem": item, "queueItems": items})
+	default:
+		writeError(w, errors.New("method not allowed"), http.StatusMethodNotAllowed)
+	}
 }
 
 func (s Server) sessionMessage(w http.ResponseWriter, r *http.Request) {
@@ -681,6 +1031,11 @@ func (s Server) sessionMessage(w http.ResponseWriter, r *http.Request) {
 	userMessage, err := s.store.AddMessage(sessionID, "user", content)
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	selection, _, err = s.moderatedSelectionForActiveChat(sessionID, selection)
+	if err != nil {
+		writeError(w, err, http.StatusBadRequest)
 		return
 	}
 	assistantMessage, err := s.store.AddMessage(sessionID, "assistant", localUnavailableMessage(selection))
@@ -763,35 +1118,82 @@ func (s Server) streamSessionMessage(w http.ResponseWriter, r *http.Request, ses
 	writeStreamEvent(w, "message", userMessage)
 	flusher.Flush()
 
+	assistantActivityIndex := s.nextAssistantActivityIndex(sessionID)
 	writeStreamEvent(w, "assistant_start", map[string]string{"role": "assistant"})
+	s.recordMessageEvent(sessionID, assistantActivityIndex, "status", map[string]string{"text": "Started assistant reply"})
 	flusher.Flush()
 
-	assistantContent, streamed, err := s.runAssistant(r.Context(), sessionID, content, input.ThinkingEffort, selection, func(event provider.Event) {
+	selection, handoff, err := s.moderatedSelectionForActiveChat(sessionID, selection)
+	if err != nil {
+		writeStreamEvent(w, "error", map[string]string{"message": err.Error()})
+		flusher.Flush()
+		return
+	}
+	contextNote := ""
+	if handoff != nil {
+		contextNote = handoff.Reason
+		payload := map[string]string{"text": handoff.Reason}
+		writeStreamEvent(w, "assistant_status", payload)
+		s.recordMessageEvent(sessionID, assistantActivityIndex, "status", payload)
+		flusher.Flush()
+	}
+	contextPacket := s.buildContextPacket(sessionID, content, selection, contextNote)
+	if _, err := s.store.SaveContextPacket(contextPacket); err != nil {
+		payload := map[string]string{"text": "Context packet persistence failed: " + err.Error()}
+		writeStreamEvent(w, "assistant_status", payload)
+		s.recordMessageEvent(sessionID, assistantActivityIndex, "status", payload)
+		flusher.Flush()
+	}
+	assistantInput := contextPacket.Content
+	packetPayload := map[string]string{"text": "Prepared Ergo Loom local context packet"}
+	writeStreamEvent(w, "assistant_status", packetPayload)
+	s.recordMessageEvent(sessionID, assistantActivityIndex, "status", packetPayload)
+	flusher.Flush()
+
+	chatRun := s.startMainChatRun(sessionID, contextPacket)
+	providerSegment := s.startProviderSegment(chatRun.ID, selection, contextNote)
+	s.recordContextEvent(sessionID, core.EventProviderRunStarted, providerRunPayloadRef(selection, "started"))
+	assistantContent, streamed, err := s.runAssistant(r.Context(), sessionID, assistantInput, input.ThinkingEffort, selection, func(event provider.Event) {
 		switch event.Kind {
 		case "delta":
 			writeStreamEvent(w, "assistant_delta", map[string]string{"text": event.Text})
 		case "status":
-			writeStreamEvent(w, "assistant_status", map[string]string{"text": event.Text})
+			payload := map[string]string{"text": event.Text}
+			writeStreamEvent(w, "assistant_status", payload)
+			s.recordMessageEvent(sessionID, assistantActivityIndex, "status", payload)
 		case "tool_start", "tool_result", "approval_request", "tool_error", "turn_aborted":
-			writeStreamEvent(w, event.Kind, toolEventPayloadForSession(sessionID, event))
+			payload := toolEventPayloadForSession(sessionID, event)
+			writeStreamEvent(w, event.Kind, payload)
+			messageEvent := s.recordMessageEvent(sessionID, assistantActivityIndex, streamEventKindToActivityKind(event.Kind), payload)
+			s.recordProviderToolEvent(sessionID, event, messageEvent.ID)
 		}
 		flusher.Flush()
 	})
 	if err != nil {
-		writeStreamEvent(w, "error", map[string]string{"message": err.Error()})
+		s.recordContextEvent(sessionID, core.EventProviderRunCompleted, providerRunPayloadRef(selection, "error"))
+		s.completeProviderSegment(providerSegment.ID, core.ProviderSegmentFailed, "")
+		s.completeChatRun(chatRun.ID, core.ChatRunFailed, "")
+		payload := map[string]string{"message": err.Error()}
+		writeStreamEvent(w, "error", payload)
+		s.recordMessageEvent(sessionID, assistantActivityIndex, "error", map[string]string{"text": err.Error(), "toolName": "chat"})
 		flusher.Flush()
 		_ = s.store.AddTokenUsage(sqlitecli.TokenUsageInput{
 			ProviderPluginID:  selection.Route.ProviderPluginID,
 			ProviderProfileID: selection.Profile.ID,
 			SessionID:         sessionID,
 			Model:             selection.Model.ModelRef,
-			PromptTokens:      estimateTokens(content),
+			PromptTokens:      estimateTokens(assistantInput),
 			Status:            "error",
 		})
 		return
 	}
 	if strings.TrimSpace(assistantContent) == "" {
-		writeStreamEvent(w, "error", map[string]string{"message": "assistant returned an empty response"})
+		s.recordContextEvent(sessionID, core.EventProviderRunCompleted, providerRunPayloadRef(selection, "empty"))
+		s.completeProviderSegment(providerSegment.ID, core.ProviderSegmentFailed, "")
+		s.completeChatRun(chatRun.ID, core.ChatRunFailed, "")
+		payload := map[string]string{"message": "assistant returned an empty response"}
+		writeStreamEvent(w, "error", payload)
+		s.recordMessageEvent(sessionID, assistantActivityIndex, "error", map[string]string{"text": payload["message"], "toolName": "chat"})
 		flusher.Flush()
 		return
 	}
@@ -800,18 +1202,22 @@ func (s Server) streamSessionMessage(w http.ResponseWriter, r *http.Request, ses
 		streamTextChunks(r.Context(), w, flusher, assistantContent)
 	}
 
+	s.recordContextEvent(sessionID, core.EventProviderRunCompleted, providerRunPayloadRef(selection, "completed"))
+	s.completeProviderSegment(providerSegment.ID, core.ProviderSegmentCompleted, "")
 	assistantMessage, err := s.store.AddMessage(sessionID, "assistant", assistantContent)
 	if err != nil {
 		writeStreamEvent(w, "error", map[string]string{"message": err.Error()})
 		flusher.Flush()
 		return
 	}
+	outputEventID := s.currentHeadEventID(sessionID)
+	s.completeChatRun(chatRun.ID, core.ChatRunCompleted, outputEventID)
 	_ = s.store.AddTokenUsage(sqlitecli.TokenUsageInput{
 		ProviderPluginID:  selection.Route.ProviderPluginID,
 		ProviderProfileID: selection.Profile.ID,
 		SessionID:         sessionID,
 		Model:             selection.Model.ModelRef,
-		PromptTokens:      estimateTokens(content),
+		PromptTokens:      estimateTokens(assistantInput),
 		CompletionTokens:  estimateTokens(assistantContent),
 		Status:            "success",
 	})
@@ -830,6 +1236,195 @@ func streamTextChunks(ctx context.Context, w http.ResponseWriter, flusher http.F
 		flusher.Flush()
 		time.Sleep(18 * time.Millisecond)
 	}
+}
+
+func streamEventKindToActivityKind(kind string) string {
+	switch kind {
+	case "tool_start":
+		return "tool"
+	case "tool_result":
+		return "result"
+	case "approval_request":
+		return "approval"
+	case "tool_error", "turn_aborted":
+		return "error"
+	default:
+		return kind
+	}
+}
+
+func (s Server) nextAssistantActivityIndex(sessionID string) int {
+	_, messages, err := s.store.GetSession(sessionID)
+	if err != nil {
+		return 1
+	}
+	count := 0
+	for _, message := range messages {
+		if message.Role == "assistant" {
+			count++
+		}
+	}
+	return count + 1
+}
+
+func (s Server) recordMessageEvent(sessionID string, activityIndex int, kind string, payload any) sqlitecli.MessageEvent {
+	if strings.TrimSpace(sessionID) == "" || activityIndex <= 0 || strings.TrimSpace(kind) == "" {
+		return sqlitecli.MessageEvent{}
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		data = []byte("{}")
+	}
+	event, _ := s.store.AddMessageEvent(sqlitecli.MessageEventInput{
+		SessionID:     sessionID,
+		ActivityIndex: activityIndex,
+		Kind:          kind,
+		PayloadJSON:   string(data),
+	})
+	return event
+}
+
+func (s Server) recordProviderToolEvent(sessionID string, event provider.Event, messageEventID string) {
+	eventType, ok := contextEventTypeForProviderEvent(event.Kind)
+	if !ok {
+		return
+	}
+	payloadRef := "provider_event:" + event.Kind
+	if strings.TrimSpace(messageEventID) != "" {
+		payloadRef = "message_event:" + messageEventID
+	}
+	s.recordContextEvent(sessionID, eventType, payloadRef)
+}
+
+func (s Server) startMainChatRun(sessionID string, packet core.ContextPacket) core.ChatRun {
+	inputEventID := packet.HeadEventID
+	if strings.TrimSpace(inputEventID) == "" {
+		inputEventID = s.currentHeadEventID(sessionID)
+	}
+	branchID := strings.TrimSpace(packet.BranchID)
+	if branchID == "" {
+		branchID = "main"
+	}
+	run, err := s.store.StartChatRun(sqlitecli.ChatRunInput{
+		ProjectID:       packet.ProjectID,
+		SessionID:       sessionID,
+		BranchID:        branchID,
+		Role:            core.ChatRunRoleMain,
+		Status:          core.ChatRunRunning,
+		InputEventID:    inputEventID,
+		ContextPacketID: packet.ID,
+	})
+	if err != nil {
+		return core.ChatRun{}
+	}
+	return run
+}
+
+func (s Server) completeChatRun(chatRunID string, status core.ChatRunStatus, outputEventID string) {
+	if strings.TrimSpace(chatRunID) == "" {
+		return
+	}
+	_, _ = s.store.CompleteChatRun(chatRunID, status, outputEventID)
+}
+
+func (s Server) startProviderSegment(chatRunID string, selection chatSelection, handoffReason string) core.ProviderSegment {
+	if strings.TrimSpace(chatRunID) == "" {
+		return core.ProviderSegment{}
+	}
+	segment, err := s.store.StartProviderSegment(sqlitecli.ProviderSegmentInput{
+		ChatRunID:     chatRunID,
+		ProviderID:    selection.Route.ProviderPluginID,
+		RouteID:       selection.Route.ID,
+		ModelID:       selection.Model.ID,
+		Status:        core.ProviderSegmentRunning,
+		HandoffReason: handoffReason,
+	})
+	if err != nil {
+		return core.ProviderSegment{}
+	}
+	return segment
+}
+
+func (s Server) completeProviderSegment(segmentID string, status core.ProviderSegmentStatus, externalThreadID string) {
+	if strings.TrimSpace(segmentID) == "" {
+		return
+	}
+	_, _ = s.store.CompleteProviderSegment(segmentID, status, externalThreadID)
+}
+
+func (s Server) currentHeadEventID(sessionID string) string {
+	session, _, err := s.store.GetSession(sessionID)
+	if err != nil {
+		return ""
+	}
+	head, err := s.store.GetHead(session.ProjectID, session.ID, "main")
+	if err != nil {
+		return ""
+	}
+	return head.EventID
+}
+
+func contextEventTypeForProviderEvent(kind string) (core.EventType, bool) {
+	switch kind {
+	case "tool_start", "approval_request":
+		return core.EventToolRequested, true
+	case "tool_result":
+		return core.EventToolCompleted, true
+	case "tool_error":
+		return core.EventToolFailed, true
+	case "turn_aborted":
+		return core.EventTurnAborted, true
+	default:
+		return "", false
+	}
+}
+
+func providerRunPayloadRef(selection chatSelection, status string) string {
+	parts := []string{
+		"provider_run",
+		status,
+		selection.Route.ProviderPluginID,
+		selection.Route.ID,
+		selection.Model.ID,
+	}
+	return strings.Join(compactStrings(parts), ":")
+}
+
+func (s Server) recordContextEvent(sessionID string, eventType core.EventType, payloadRef string) core.Event {
+	return s.recordContextEventAfter(sessionID, eventType, payloadRef, "")
+}
+
+func (s Server) recordContextEventAfter(sessionID string, eventType core.EventType, payloadRef string, preferredParentID string) core.Event {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || strings.TrimSpace(string(eventType)) == "" {
+		return core.Event{}
+	}
+	session, _, err := s.store.GetSession(sessionID)
+	if err != nil {
+		return core.Event{}
+	}
+	parentIDs := []string{}
+	preferredParentID = strings.TrimSpace(preferredParentID)
+	if preferredParentID != "" {
+		parentIDs = append(parentIDs, preferredParentID)
+	} else if head, err := s.store.GetHead(session.ProjectID, session.ID, "main"); err == nil && strings.TrimSpace(head.EventID) != "" {
+		parentIDs = append(parentIDs, head.EventID)
+	}
+	event, err := s.store.AppendEvent(core.EventInput{
+		Type:           eventType,
+		ProjectID:      session.ProjectID,
+		SessionID:      session.ID,
+		BranchID:       "main",
+		ParentEventIDs: parentIDs,
+		PayloadRef:     strings.TrimSpace(payloadRef),
+	})
+	if err != nil {
+		return core.Event{}
+	}
+	if _, err := s.store.MoveHead(session.ProjectID, session.ID, "main", event.ID); err != nil {
+		return core.Event{}
+	}
+	return event
 }
 
 func toolEventPayload(event provider.Event) map[string]any {
@@ -891,6 +1486,304 @@ func (s Server) runAssistant(ctx context.Context, sessionID string, content stri
 		}
 	}
 	return response.Text, response.Streamed, err
+}
+
+func (s Server) moderatedSelectionForActiveChat(sessionID string, selection chatSelection) (chatSelection, *moderatorHandoff, error) {
+	expiredGroup := providerGroupID(selection.Route.ProviderPluginID)
+	expired, used, err := s.providerGroupSoftExpired(expiredGroup)
+	if err != nil {
+		return selection, nil, err
+	}
+	if !expired {
+		return selection, nil, nil
+	}
+
+	next, err := s.moderatorFallbackSelection(sessionID, expiredGroup)
+	if err != nil {
+		return selection, nil, fmt.Errorf("%s token quota is exhausted and no moderator fallback provider is available: %w", providerGroupLabel(expiredGroup), err)
+	}
+	reason := fmt.Sprintf(
+		"Moderator detected %s token quota exhaustion (%d/%d tracked tokens) and handed this chat context to %s.",
+		providerGroupLabel(expiredGroup),
+		used,
+		providerSoftTokenCap,
+		providerGroupLabel(providerGroupID(next.Route.ProviderPluginID)),
+	)
+	return next, &moderatorHandoff{
+		FromSelection: selection,
+		ToSelection:   next,
+		Reason:        reason,
+	}, nil
+}
+
+func (s Server) providerGroupSoftExpired(groupID string) (bool, int, error) {
+	usage, err := s.store.TokenUsageSummary()
+	if err != nil {
+		return false, 0, err
+	}
+	total := 0
+	for _, item := range usage {
+		if providerGroupID(item.ProviderPluginID) != groupID {
+			continue
+		}
+		total += item.PromptTokens + item.CompletionTokens
+	}
+	return total >= providerSoftTokenCap, total, nil
+}
+
+func (s Server) moderatorFallbackSelection(sessionID string, expiredGroup string) (chatSelection, error) {
+	session, _, err := s.store.GetSession(sessionID)
+	if err != nil {
+		return chatSelection{}, err
+	}
+	projectID := strings.TrimSpace(session.ProjectID)
+	if projectID == "" {
+		projectID = "default"
+	}
+	projectRoutes, err := s.store.ListProjectAccessRoutes(projectID)
+	if err != nil {
+		return chatSelection{}, err
+	}
+	models, err := s.store.ListProviderModels()
+	if err != nil {
+		return chatSelection{}, err
+	}
+	pref, err := s.store.ModeratorPreference(projectID)
+	if err != nil {
+		return chatSelection{}, err
+	}
+	sessionGroups, err := s.store.ListSessionProviderGroups(sessionID)
+	if err != nil {
+		return chatSelection{}, err
+	}
+	allowedGroups := map[string]bool{}
+	for _, groupID := range sessionGroups {
+		allowedGroups[providerGroupID(groupID)] = true
+	}
+
+	for _, groupID := range moderatorGroupOrder(pref, projectRoutes) {
+		if groupID == "" || groupID == expiredGroup {
+			continue
+		}
+		if len(allowedGroups) > 0 && !allowedGroups[groupID] {
+			continue
+		}
+		if expired, _, err := s.providerGroupSoftExpired(groupID); err != nil {
+			return chatSelection{}, err
+		} else if expired {
+			continue
+		}
+		if selection, ok := s.selectionForProviderGroup(sessionID, groupID, projectRoutes, models); ok {
+			return selection, nil
+		}
+	}
+	return chatSelection{}, errors.New("no executable fallback provider in the current chat")
+}
+
+func (s Server) selectionForProviderGroup(sessionID string, groupID string, routes []sqlitecli.ProjectAccessRoute, models []sqlitecli.ProviderModel) (chatSelection, bool) {
+	for _, route := range routes {
+		if !route.Enabled || route.Route.Status != "available" || providerGroupID(route.Route.ProviderPluginID) != groupID {
+			continue
+		}
+		for _, model := range preferredModelsForProvider(models, route.Route.ProviderPluginID) {
+			selection, err := s.resolveChatSelection(sessionID, route.Route.ID, model.ID)
+			if err == nil {
+				return selection, true
+			}
+		}
+	}
+	return chatSelection{}, false
+}
+
+func preferredModelsForProvider(models []sqlitecli.ProviderModel, providerID string) []sqlitecli.ProviderModel {
+	var defaults []sqlitecli.ProviderModel
+	var rest []sqlitecli.ProviderModel
+	for _, model := range models {
+		if model.ProviderPluginID != providerID || model.Status != "available" {
+			continue
+		}
+		if model.IsDefault {
+			defaults = append(defaults, model)
+			continue
+		}
+		rest = append(rest, model)
+	}
+	return append(defaults, rest...)
+}
+
+func moderatorGroupOrder(pref sqlitecli.ModeratorPreference, routes []sqlitecli.ProjectAccessRoute) []string {
+	ordered := make([]string, 0, len(routes)+2)
+	if pref.Mode == "manual" {
+		ordered = append(ordered, providerGroupID(pref.PrimaryProviderGroupID), providerGroupID(pref.SecondaryProviderGroupID))
+	}
+	for _, route := range routes {
+		if !route.Enabled {
+			continue
+		}
+		ordered = append(ordered, providerGroupID(route.Route.ProviderPluginID))
+	}
+	return compactStrings(ordered)
+}
+
+const maxContextPacketChars = 12000
+
+func (s Server) buildContextPacket(sessionID string, latestUserInput string, selection chatSelection, note string) core.ContextPacket {
+	session, messages, err := s.store.GetSession(sessionID)
+	if err != nil {
+		return core.ContextPacket{
+			ID:        fmt.Sprintf("context_packet_%d", time.Now().UTC().UnixNano()),
+			SessionID: sessionID,
+			UserInput: latestUserInput,
+			Content:   latestUserInput,
+			CreatedAt: time.Now().UTC(),
+		}
+	}
+
+	now := time.Now().UTC()
+	packet := core.ContextPacket{
+		ID:        fmt.Sprintf("context_packet_%d", now.UnixNano()),
+		ProjectID: session.ProjectID,
+		SessionID: session.ID,
+		BranchID:  "main",
+		UserInput: latestUserInput,
+		CreatedAt: now,
+	}
+	if head, err := s.store.GetHead(session.ProjectID, session.ID, "main"); err == nil {
+		packet.HeadEventID = head.EventID
+		packet.References = append(packet.References, core.ContextReference{
+			Kind: "head",
+			ID:   head.EventID,
+			Ref:  "context_heads/main",
+		})
+		if events, err := s.store.ListAncestors(head.EventID, 20); err == nil {
+			for _, event := range events {
+				packet.References = append(packet.References, core.ContextReference{
+					Kind: string(event.Type),
+					ID:   event.ID,
+					Ref:  event.PayloadRef,
+				})
+			}
+		}
+	}
+
+	lines := []string{
+		"You are Ergo Loom, a local AI work context manager.",
+		"Use Ergo Loom's local context as the authoritative conversation state.",
+		"Provider-owned CLI, app, browser, or remote sessions are execution channels and may be stale or unavailable.",
+		fmt.Sprintf("Selected route: %s / %s.", selection.Route.DisplayName, selection.Model.DisplayName),
+	}
+	if strings.TrimSpace(note) != "" {
+		lines = append(lines, "Context note: "+strings.TrimSpace(note))
+	}
+	lines = append(lines, "", "Conversation context:")
+
+	latest := strings.TrimSpace(latestUserInput)
+	contextLines := make([]string, 0, len(messages))
+	for i, message := range messages {
+		content := strings.TrimSpace(message.Content)
+		if content == "" {
+			continue
+		}
+		if i == len(messages)-1 && message.Role == "user" && content == latest {
+			continue
+		}
+		contextLines = append(contextLines, fmt.Sprintf("%s: %s", message.Role, content))
+	}
+	lines = append(lines, trimContextLines(contextLines, maxContextPacketChars/2)...)
+	lines = append(lines, "", "Latest user message:", latestUserInput)
+	packet.Content = trimContextPacket(strings.Join(lines, "\n"), maxContextPacketChars)
+	return packet
+}
+
+func trimContextLines(lines []string, maxChars int) []string {
+	if maxChars <= 0 {
+		return nil
+	}
+	selected := []string{}
+	used := 0
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := lines[i]
+		lineLen := len([]rune(line)) + 1
+		if used+lineLen > maxChars && len(selected) > 0 {
+			break
+		}
+		selected = append([]string{line}, selected...)
+		used += lineLen
+	}
+	return selected
+}
+
+func trimContextPacket(content string, maxChars int) string {
+	runes := []rune(content)
+	if maxChars <= 0 || len(runes) <= maxChars {
+		return content
+	}
+	return strings.Join([]string{
+		"You are Ergo Loom, a local AI work context manager.",
+		"The local context packet was truncated to fit the selected provider request.",
+		"",
+		string(runes[len(runes)-maxChars:]),
+	}, "\n")
+}
+
+func (s Server) moderatorHandoffPrompt(sessionID string, latestUserInput string, handoff moderatorHandoff) string {
+	_, messages, err := s.store.GetSession(sessionID)
+	if err != nil {
+		return latestUserInput
+	}
+	const maxContextChars = 12000
+	lines := []string{
+		"You are Ergo Loom. Continue this chat after a moderator provider handoff.",
+		fmt.Sprintf("Previous provider route: %s / %s.", handoff.FromSelection.Route.DisplayName, handoff.FromSelection.Model.DisplayName),
+		fmt.Sprintf("New provider route: %s / %s.", handoff.ToSelection.Route.DisplayName, handoff.ToSelection.Model.DisplayName),
+		"Use the conversation context below as the transferred provider context. Answer the latest user message directly.",
+		"",
+		"Conversation context:",
+	}
+	for _, message := range messages {
+		content := strings.TrimSpace(message.Content)
+		if content == "" {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%s: %s", message.Role, content))
+	}
+	prompt := strings.Join(lines, "\n")
+	if len([]rune(prompt)) <= maxContextChars {
+		return prompt
+	}
+	runes := []rune(prompt)
+	return strings.Join([]string{
+		"You are Ergo Loom. Continue this chat after a moderator provider handoff.",
+		"The transferred context was truncated to fit the fallback provider request.",
+		"",
+		string(runes[len(runes)-maxContextChars:]),
+	}, "\n")
+}
+
+func providerGroupID(providerID string) string {
+	switch strings.TrimSpace(providerID) {
+	case "codex", "openai", "codex/openai", "codex-openai":
+		return "codex-openai"
+	default:
+		return strings.TrimSpace(providerID)
+	}
+}
+
+func providerGroupLabel(groupID string) string {
+	switch providerGroupID(groupID) {
+	case "codex-openai":
+		return "Codex/ChatGPT"
+	case "anthropic":
+		return "Claude"
+	case "copilot":
+		return "VSCode Copilot"
+	case "gemini":
+		return "Gemini"
+	case "ollama":
+		return "Ollama(Local Model)"
+	default:
+		return groupID
+	}
 }
 
 func (s Server) resolveChatSelection(sessionID string, routeID string, modelID string) (chatSelection, error) {
@@ -977,7 +1870,7 @@ func (s Server) resolveChatSelection(sessionID string, routeID string, modelID s
 		Profile: selectedProfile,
 	}
 	if !s.drivers.CanExecute(chatRequestFromSelection(sessionIDForCapabilityCheck, "", "", selection, "")) {
-		return chatSelection{}, fmt.Errorf("%s is not executable from Ergo Loom chat yet", selectedRoute.DisplayName)
+		return chatSelection{}, fmt.Errorf("%s is not executable from Ergo Loom chat yet", selection.Route.DisplayName)
 	}
 	return selection, nil
 }
@@ -1100,6 +1993,60 @@ func detectAuthStatuses() []authStatus {
 	}
 }
 
+func detectRuntimeDiagnostics() runtimeDiagnostics {
+	return runtimeDiagnostics{
+		Desktop:       strings.TrimSpace(os.Getenv("ERGO_LOOM_DESKTOP")) == "1",
+		AppRoot:       strings.TrimSpace(os.Getenv("ERGO_LOOM_APP_ROOT")),
+		DataDir:       strings.TrimSpace(os.Getenv("ERGO_LOOM_DATA_DIR")),
+		HandoffBridge: strings.TrimSpace(os.Getenv("ERGO_LOOM_HANDOFF_BRIDGE_URL")),
+		Path:          os.Getenv("PATH"),
+		Executables: []runtimeExecutable{
+			executableDiagnostic("codex", "Codex/ChatGPT", codexExecutablePath),
+			executableDiagnostic("claude", "Claude CLI", func() (string, error) {
+				return executablePath("claude", "ERGO_CLAUDE_COMMAND", filepath.Join(os.Getenv("HOME"), ".local", "bin", "claude"))
+			}),
+			executableDiagnostic("gh", "GitHub CLI", func() (string, error) {
+				return executablePath("gh", "")
+			}),
+			runtimeExecutable{
+				ID:     "copilot-bridge",
+				Label:  "Copilot Bridge",
+				Path:   strings.TrimSpace(os.Getenv("ERGO_COPILOT_BRIDGE_URL")),
+				Status: bridgeDiagnosticStatus(os.Getenv("ERGO_COPILOT_BRIDGE_URL")),
+				Detail: bridgeDiagnosticDetail(os.Getenv("ERGO_COPILOT_BRIDGE_URL")),
+			},
+			executableDiagnostic("gemini", "Gemini CLI", func() (string, error) {
+				return executablePath("gemini", "")
+			}),
+			executableDiagnostic("ollama", "Ollama", func() (string, error) {
+				return executablePath("ollama", "ERGO_OLLAMA_COMMAND")
+			}),
+		},
+	}
+}
+
+func bridgeDiagnosticStatus(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "missing"
+	}
+	return "ready"
+}
+
+func bridgeDiagnosticDetail(value string) string {
+	if detail := strings.TrimSpace(value); detail != "" {
+		return detail
+	}
+	return "Set ERGO_COPILOT_BRIDGE_URL after starting a Copilot bridge worker"
+}
+
+func executableDiagnostic(id string, label string, resolve func() (string, error)) runtimeExecutable {
+	path, err := resolve()
+	if err != nil {
+		return runtimeExecutable{ID: id, Label: label, Status: "missing", Detail: err.Error()}
+	}
+	return runtimeExecutable{ID: id, Label: label, Path: path, Status: "ready", Detail: path}
+}
+
 func detectClaudeAuth() authStatus {
 	path, err := executablePath("claude", "ERGO_CLAUDE_COMMAND", filepath.Join(os.Getenv("HOME"), ".local", "bin", "claude"))
 	if err != nil {
@@ -1110,10 +2057,13 @@ func detectClaudeAuth() authStatus {
 	detail := compactDetail(raw)
 	if runErr != nil {
 		if strings.Contains(raw, `"loggedIn": false`) || strings.Contains(strings.ToLower(raw), "loggedin") {
-			return authStatus{ID: "claude", Label: "Claude", AccountLabel: "", Connected: false, Status: "signed_out", Detail: "Claude CLI is installed but not logged in"}
+			return authStatus{ID: "claude", Label: "Claude", AccountLabel: "", Connected: false, Status: "signed_out", Detail: "Claude CLI is installed but not logged in with a subscription token; run claude setup-token with your Pro/Max subscription account"}
 		}
 		if detail == "" {
 			detail = runErr.Error()
+		}
+		if strings.Contains(strings.ToLower(detail), "credit balance too low") {
+			detail = "Claude CLI is using API billing and reports low credit balance; run claude setup-token with your Pro/Max subscription account so Ergo Loom can use the subscription route"
 		}
 		return authStatus{ID: "claude", Label: "Claude", AccountLabel: "", Connected: false, Status: "error", Detail: detail}
 	}
@@ -1183,16 +2133,9 @@ func executablePath(name string, envVar string, candidates ...string) (string, e
 }
 
 func detectCodexAuth() authStatus {
-	path, err := exec.LookPath("codex")
-	if err != nil && strings.TrimSpace(os.Getenv("CODEX_EXEC")) != "" {
-		path = strings.TrimSpace(os.Getenv("CODEX_EXEC"))
-		err = nil
-	}
+	path, err := codexExecutablePath()
 	if err != nil {
-		path = "/Applications/Codex.app/Contents/Resources/codex"
-		if _, statErr := os.Stat(path); statErr != nil {
-			return authStatus{ID: "codex", Label: "Codex/ChatGPT", AccountLabel: "", Connected: false, Status: "missing", Detail: "Codex local runtime was not found"}
-		}
+		return authStatus{ID: "codex", Label: "Codex/ChatGPT", AccountLabel: "", Connected: false, Status: "missing", Detail: "Codex local runtime was not found"}
 	}
 	out, runErr := exec.Command(path, "login", "status").CombinedOutput()
 	detail := compactDetail(string(out))
@@ -1207,6 +2150,32 @@ func detectCodexAuth() authStatus {
 		account = "OpenAI API key"
 	}
 	return authStatus{ID: "codex", Label: "Codex/ChatGPT", AccountLabel: account, Connected: true, Status: "ready", Detail: detail}
+}
+
+func codexExecutablePath() (string, error) {
+	candidates := []string{
+		strings.TrimSpace(os.Getenv("ERGO_CODEX_COMMAND")),
+		strings.TrimSpace(os.Getenv("CODEX_EXEC")),
+		"codex",
+		"/Applications/Codex.app/Contents/Resources/codex",
+		filepath.Join(os.Getenv("HOME"), "Applications", "Codex.app", "Contents", "Resources", "codex"),
+	}
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if strings.ContainsRune(candidate, filepath.Separator) {
+			if stat, err := os.Stat(candidate); err == nil && !stat.IsDir() {
+				return candidate, nil
+			}
+			continue
+		}
+		if path, err := exec.LookPath(candidate); err == nil {
+			return path, nil
+		}
+	}
+	return "", exec.ErrNotFound
 }
 
 func detectGitHubAuth(id string, label string) authStatus {

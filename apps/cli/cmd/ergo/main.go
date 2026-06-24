@@ -10,8 +10,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/jkj-dev/ergo-loom/internal/storage/sqlitecli"
-	"github.com/jkj-dev/ergo-loom/internal/web"
+	"github.com/Floodnut/ergo-loom/internal/storage/sqlitecli"
+	"github.com/Floodnut/ergo-loom/internal/web"
 )
 
 const defaultDataDirName = ".ergo-loom"
@@ -77,6 +77,8 @@ func run(args []string) error {
 		return nil
 	case "branch":
 		return runBranch(store, args[1:])
+	case "context":
+		return runContext(store, args[1:])
 	case "providers":
 		if err := store.Init(); err != nil {
 			return err
@@ -223,6 +225,117 @@ func runBranch(store sqlitecli.Store, args []string) error {
 	return nil
 }
 
+func runContext(store sqlitecli.Store, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: ergo context <session-id> | branch <session-id> --from <event-id> | merge <session-id> --parents <event-id,event-id>")
+	}
+	switch args[0] {
+	case "branch":
+		return runContextBranch(store, args[1:])
+	case "merge":
+		return runContextMerge(store, args[1:])
+	default:
+		return runContextShow(store, args)
+	}
+}
+
+func runContextShow(store sqlitecli.Store, args []string) error {
+	flags := flag.NewFlagSet("context", flag.ContinueOnError)
+	branchID := flags.String("branch", "main", "graph branch id")
+	limit := flags.Int("limit", 20, "maximum ancestor events to print")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 {
+		return errors.New("usage: ergo context <session-id> [--branch main] [--limit 20]")
+	}
+	if err := store.Init(); err != nil {
+		return err
+	}
+	session, _, err := store.GetSession(flags.Arg(0))
+	if err != nil {
+		return err
+	}
+	head, err := store.GetHead(session.ProjectID, session.ID, *branchID)
+	if err != nil {
+		return err
+	}
+	events, err := store.ListAncestors(head.EventID, *limit)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s\t%s\t%s\t%s\n", session.ID, *branchID, "head", head.EventID)
+	for _, event := range events {
+		parents := "-"
+		if len(event.ParentEventIDs) > 0 {
+			parents = strings.Join(event.ParentEventIDs, ",")
+		}
+		fmt.Printf("%s\t%s\tparents=%s\t%s\n", event.ID, event.Type, parents, event.PayloadRef)
+	}
+	return nil
+}
+
+func runContextBranch(store sqlitecli.Store, args []string) error {
+	flags := flag.NewFlagSet("context branch", flag.ContinueOnError)
+	fromEventID := flags.String("from", "", "event id to branch from")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 || strings.TrimSpace(*fromEventID) == "" {
+		return errors.New("usage: ergo context branch <session-id> --from <event-id>")
+	}
+	if err := store.Init(); err != nil {
+		return err
+	}
+	branch, err := store.CreateGraphBranch(flags.Arg(0), *fromEventID)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("created context branch %s at %s\n", branch.ID, branch.HeadEventID)
+	return nil
+}
+
+func runContextMerge(store sqlitecli.Store, args []string) error {
+	flags := flag.NewFlagSet("context merge", flag.ContinueOnError)
+	branchID := flags.String("branch", "main", "graph branch id")
+	parentsValue := flags.String("parents", "", "comma-separated parent event ids")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 || strings.TrimSpace(*parentsValue) == "" {
+		return errors.New("usage: ergo context merge <session-id> --parents <event-id,event-id> [--branch main]")
+	}
+	parents := splitCSV(*parentsValue)
+	if len(parents) < 2 {
+		return errors.New("context merge requires at least two parent event ids")
+	}
+	if err := store.Init(); err != nil {
+		return err
+	}
+	session, _, err := store.GetSession(flags.Arg(0))
+	if err != nil {
+		return err
+	}
+	event, err := store.CreateMerge(session.ProjectID, session.ID, *branchID, parents)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("created merge event %s\n", event.ID)
+	return nil
+}
+
+func splitCSV(value string) []string {
+	parts := strings.Split(value, ",")
+	items := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			items = append(items, part)
+		}
+	}
+	return items
+}
+
 func runUsage(store sqlitecli.Store, args []string) error {
 	if len(args) > 0 && args[0] == "add" {
 		return runUsageAdd(store, args[1:])
@@ -365,6 +478,9 @@ Usage:
   ergo sessions
   ergo show <session-id>
   ergo branch <session-id> --from <message-id>
+  ergo context <session-id>
+  ergo context branch <session-id> --from <event-id>
+  ergo context merge <session-id> --parents <event-id,event-id>
   ergo providers
   ergo profiles
   ergo routes

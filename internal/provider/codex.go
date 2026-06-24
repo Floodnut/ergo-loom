@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jkj-dev/ergo-loom/internal/toolruntime"
+	"github.com/Floodnut/ergo-loom/internal/toolruntime"
 )
 
 type Event struct {
@@ -32,12 +32,8 @@ type CodexRunner struct {
 }
 
 func NewCodexRunner(workDir string) CodexRunner {
-	command := os.Getenv("ERGO_CODEX_COMMAND")
-	if command == "" {
-		command = "codex"
-	}
 	return CodexRunner{
-		Command: command,
+		Command: codexCommand(),
 		WorkDir: workDir,
 	}
 }
@@ -119,15 +115,56 @@ type CodexAppServerRunner struct {
 }
 
 func NewCodexAppServerRunner(workDir string) CodexAppServerRunner {
-	command := os.Getenv("ERGO_CODEX_COMMAND")
-	if command == "" {
-		command = "codex"
-	}
 	return CodexAppServerRunner{
-		Command: command,
+		Command: codexCommand(),
 		WorkDir: workDir,
 		Model:   os.Getenv("ERGO_CODEX_MODEL"),
 	}
+}
+
+func codexCommand() string {
+	candidates := []string{
+		os.Getenv("ERGO_CODEX_COMMAND"),
+		os.Getenv("CODEX_EXEC"),
+	}
+	if path, err := exec.LookPath("codex"); err == nil {
+		candidates = append(candidates, path)
+	}
+	candidates = append(candidates,
+		"/Applications/Codex.app/Contents/Resources/codex",
+		filepath.Join(os.Getenv("HOME"), "Applications", "Codex.app", "Contents", "Resources", "codex"),
+	)
+	if shellPath := loginShellCodexCommand(); shellPath != "" {
+		candidates = append(candidates, shellPath)
+	}
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if stat, err := os.Stat(candidate); err == nil && !stat.IsDir() {
+			return candidate
+		}
+	}
+	return "codex"
+}
+
+func loginShellCodexCommand() string {
+	out, err := exec.Command("/bin/zsh", "-lc", "command -v codex").CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return ""
+	}
+	lines := strings.Split(string(out), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" || !strings.Contains(line, "/") {
+			continue
+		}
+		if stat, err := os.Stat(line); err == nil && !stat.IsDir() {
+			return line
+		}
+	}
+	return ""
 }
 
 type CodexAppServerResponse struct {

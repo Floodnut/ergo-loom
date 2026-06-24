@@ -1,6 +1,16 @@
 if (new URLSearchParams(window.location.search).get("desktop") === "1" || window.ergoLoom) {
     document.documentElement.classList.add("desktop-shell");
 }
+function installDesktopWindowChrome() {
+    const bridge = window.ergoLoom;
+    const hitbox = document.querySelector("#window-titlebar-hitbox");
+    if (!bridge?.toggleMaximize || !hitbox)
+        return;
+    hitbox.addEventListener("dblclick", (event) => {
+        event.preventDefault();
+        bridge.toggleMaximize();
+    });
+}
 const state = {
     sessions: [],
     projects: [],
@@ -15,6 +25,10 @@ const state = {
     usage: [],
     tools: [],
     authStatuses: [],
+    diagnostics: null,
+    providerChats: [],
+    providerRefreshing: false,
+    lastProviderRefreshAt: 0,
     contextUsage: null,
     selectedSessionId: null,
     selectedModelId: "",
@@ -191,6 +205,7 @@ function q(selector) {
 }
 const els = {
     shell: q("#app-shell"),
+    windowTitlebarHitbox: q("#window-titlebar-hitbox"),
     sessions: q("#session-list"),
     messages: q("#messages"),
     chatQueueRail: q("#chat-queue-rail"),
@@ -224,8 +239,10 @@ const els = {
     projectMenuButton: q("#project-menu-button"),
     projectMenu: q("#project-menu"),
     renameProject: q("#rename-project"),
+    deleteProject: q("#delete-project"),
     aiUsagePanel: q("#ai-usage-panel"),
     usageToggle: q("#usage-toggle"),
+    providerRefresh: q("#provider-refresh"),
     usageGaugeFill: q("#usage-gauge-fill"),
     navUsage: q("#nav-token-usage"),
     routePicker: q("#route-picker"),
@@ -265,6 +282,8 @@ const els = {
     workspaceActivity: q("#workspace-activity"),
     workspaceApprovals: q("#workspace-approvals"),
     authStatusList: q("#auth-status-list"),
+    runtimeDiagnostics: q("#runtime-diagnostics"),
+    providerThreadList: q("#provider-thread-list"),
     toolRegistryList: q("#tool-registry-list"),
     terminalTabs: q("#terminal-tabs"),
     newTerminalTab: q("#new-terminal-tab"),
@@ -304,6 +323,8 @@ async function loadState() {
     state.usage = data.usage || [];
     state.tools = data.tools || [];
     state.authStatuses = data.auth || [];
+    state.diagnostics = data.diagnostics || null;
+    state.lastProviderRefreshAt = Date.now();
     state.selectedProjectId = state.project?.ID || "";
     saveProjectID(state.selectedProjectId);
     if (state.selectedSessionId && !state.sessions.some((session) => session.ID === state.selectedSessionId)) {
@@ -317,8 +338,11 @@ async function loadState() {
     renderRoutePicker();
     renderModelPicker();
     renderNavUsage();
+    renderProviderRefreshState();
     renderWorkspaceActivity();
     renderAuthStatuses();
+    renderRuntimeDiagnostics();
+    renderProviderThreads();
     renderToolRegistrySummary();
     renderTerminalPanel();
     renderFilePanel();
@@ -332,6 +356,36 @@ async function loadState() {
     else if (!state.selectedSessionId) {
         renderEmptyChat();
     }
+}
+async function refreshProviderStatus(options = {}) {
+    if (state.providerRefreshing)
+        return;
+    state.providerRefreshing = true;
+    renderProviderRefreshState();
+    try {
+        await loadState();
+        if (!options.silent) {
+            appendWorkspaceEvent("result", { toolName: "provider.refresh", text: "Provider status refreshed" });
+        }
+    }
+    catch (error) {
+        if (!options.silent) {
+            appendWorkspaceEvent("error", { toolName: "provider.refresh", text: error.message || String(error) });
+        }
+    }
+    finally {
+        state.providerRefreshing = false;
+        renderProviderRefreshState();
+    }
+}
+async function refreshProviderStatusIfStale() {
+    if (Date.now() - state.lastProviderRefreshAt < 30000)
+        return;
+    await refreshProviderStatus({ silent: true });
+}
+function renderProviderRefreshState() {
+    els.providerRefresh.classList.toggle("refreshing", state.providerRefreshing);
+    els.providerRefresh.disabled = state.providerRefreshing;
 }
 function savedProjectID() {
     return window.localStorage.getItem("ergo-loom:selected-project") || "";
@@ -380,6 +434,27 @@ async function addProviderRoute(providerID) {
         return;
     await addRouteToCurrentProject(route.ID);
 }
+async function addModelProvider(providerID) {
+    await addProviderRoute(providerID);
+    const groupID = providerGroupID(providerID);
+    if (state.selectedSessionId) {
+        const next = [...new Set([...state.selectedProviderIds, groupID])];
+        await request(`/api/sessions/${encodeURIComponent(state.selectedSessionId)}/providers`, {
+            method: "PATCH",
+            body: JSON.stringify({ providerGroupIds: next }),
+        });
+        state.selectedProviderIds = next;
+        saveSelectedProviderIDs(next);
+        await loadState();
+        await selectSession(state.selectedSessionId, { resetActivity: false });
+        return;
+    }
+    const next = [...new Set([...state.selectedProviderIds, groupID])];
+    state.selectedProviderIds = next;
+    saveSelectedProviderIDs(next);
+    renderModelPicker();
+    renderEmptyChat();
+}
 function routeStatusRank(route) {
     if (route.Status === "available")
         return 0;
@@ -421,6 +496,33 @@ async function renameProject() {
     renderProjectName();
     renderProjects();
     els.projectMenu.hidden = true;
+}
+async function deleteCurrentProject() {
+    if (!state.project || state.project.IsDefault) {
+        await appAlert({
+            title: "Default project",
+            message: "Default Project는 삭제할 수 없습니다.",
+        });
+        els.projectMenu.hidden = true;
+        return;
+    }
+    const confirmed = await appConfirm({
+        title: "Delete project",
+        message: `"${state.project.DisplayName}" 프로젝트와 하위 채팅을 삭제합니다. 이 작업은 되돌릴 수 없습니다.`,
+        confirmLabel: "Delete",
+        cancelLabel: "Cancel",
+        danger: true,
+    });
+    if (!confirmed)
+        return;
+    await request(`/api/projects/${encodeURIComponent(state.project.ID)}`, {
+        method: "DELETE",
+    });
+    state.selectedProjectId = "";
+    state.selectedSessionId = null;
+    saveProjectID("");
+    els.projectMenu.hidden = true;
+    await loadState();
 }
 async function removeProjectRoute(routeId) {
     if (!state.project)
@@ -522,6 +624,87 @@ function appAlert({ title = "Ergo Loom", message = "", confirmLabel = "OK" }) {
         requestAnimationFrame(() => els.appModalConfirm.focus());
     });
 }
+function appConfirm({ title = "Ergo Loom", message = "", confirmLabel = "OK", cancelLabel = "Cancel", danger = false }) {
+    return new Promise((resolve) => {
+        els.appModalTitle.textContent = title;
+        els.appModalMessage.textContent = message;
+        els.appModalMessage.hidden = !message;
+        els.appModalInput.hidden = true;
+        els.appModalConfirm.textContent = confirmLabel;
+        els.appModalCancel.textContent = cancelLabel;
+        els.appModalCancel.hidden = false;
+        els.appModalConfirm.classList.toggle("danger", danger);
+        els.appModal.hidden = false;
+        const cleanup = (result) => {
+            els.appModal.hidden = true;
+            els.appModalConfirm.classList.remove("danger");
+            els.appModalForm.removeEventListener("submit", onSubmit);
+            els.appModalCancel.removeEventListener("click", onCancel);
+            els.appModalClose.removeEventListener("click", onCancel);
+            els.appModalBackdrop.removeEventListener("click", onCancel);
+            document.removeEventListener("keydown", onKeyDown);
+            resolve(result);
+        };
+        const onSubmit = (event) => {
+            event?.preventDefault?.();
+            cleanup(true);
+        };
+        const onCancel = () => cleanup(false);
+        const onKeyDown = (event) => {
+            if (event.key === "Escape")
+                cleanup(false);
+            if (event.key === "Enter")
+                cleanup(true);
+        };
+        els.appModalForm.addEventListener("submit", onSubmit);
+        els.appModalCancel.addEventListener("click", onCancel);
+        els.appModalClose.addEventListener("click", onCancel);
+        els.appModalBackdrop.addEventListener("click", onCancel);
+        document.addEventListener("keydown", onKeyDown);
+        requestAnimationFrame(() => els.appModalConfirm.focus());
+    });
+}
+function appChoice({ title = "Ergo Loom", message = "", primaryLabel = "OK", secondaryLabel = "Cancel", primaryValue = "primary", secondaryValue = "secondary", dangerSecondary = false }) {
+    return new Promise((resolve) => {
+        els.appModalTitle.textContent = title;
+        els.appModalMessage.textContent = message;
+        els.appModalMessage.hidden = !message;
+        els.appModalInput.hidden = true;
+        els.appModalConfirm.textContent = primaryLabel;
+        els.appModalCancel.textContent = secondaryLabel;
+        els.appModalCancel.hidden = false;
+        els.appModalCancel.classList.toggle("danger", dangerSecondary);
+        els.appModal.hidden = false;
+        const cleanup = (result) => {
+            els.appModal.hidden = true;
+            els.appModalCancel.classList.remove("danger");
+            els.appModalForm.removeEventListener("submit", onPrimary);
+            els.appModalCancel.removeEventListener("click", onSecondary);
+            els.appModalClose.removeEventListener("click", onClose);
+            els.appModalBackdrop.removeEventListener("click", onClose);
+            document.removeEventListener("keydown", onKeyDown);
+            resolve(result);
+        };
+        const onPrimary = (event) => {
+            event?.preventDefault?.();
+            cleanup(primaryValue);
+        };
+        const onSecondary = () => cleanup(secondaryValue);
+        const onClose = () => cleanup(null);
+        const onKeyDown = (event) => {
+            if (event.key === "Escape")
+                cleanup(null);
+            if (event.key === "Enter")
+                cleanup(primaryValue);
+        };
+        els.appModalForm.addEventListener("submit", onPrimary);
+        els.appModalCancel.addEventListener("click", onSecondary);
+        els.appModalClose.addEventListener("click", onClose);
+        els.appModalBackdrop.addEventListener("click", onClose);
+        document.addEventListener("keydown", onKeyDown);
+        requestAnimationFrame(() => els.appModalConfirm.focus());
+    });
+}
 function toggleProjectRoutes() {
     const expanded = els.chatAIPanel.hidden;
     els.chatAIPanel.hidden = !expanded;
@@ -570,11 +753,27 @@ async function selectSession(sessionId, options = {}) {
     els.title.textContent = data.session.Title;
     els.subtitle.textContent = state.project?.DisplayName || "Default Project";
     state.contextUsage = data.context || null;
+    state.providerChats = data.providerChats || [];
     state.selectedProviderIds = Array.isArray(data.providerGroupIds) ? data.providerGroupIds : [];
     saveSelectedProviderIDs(state.selectedProviderIds);
+    // Sync queue from server: replace items for this session with server items
+    const otherSessionItems = state.chatQueue.filter((item) => item.sessionId !== sessionId);
+    const serverQueueItems = (data.queueItems || []).map((item) => ({
+        id: item.ID,
+        sessionId,
+        content: item.Content,
+        mode: item.Mode,
+        routeId: item.RouteID,
+        modelId: item.ModelID,
+        thinkingEffort: item.ThinkingEffort,
+        modelLabel: modelLabelForIds(item.ModelID, item.RouteID),
+        createdAt: new Date(item.CreatedAt),
+    }));
+    state.chatQueue = [...otherSessionItems, ...serverQueueItems];
     renderContextMeter();
+    renderProviderThreads();
     renderModelPicker();
-    renderMessages(data.messages || []);
+    renderMessages(data.messages || [], data.events || []);
     renderChatQueue();
     closeSearchModal();
 }
@@ -583,6 +782,7 @@ async function sendMessage(event) {
     const content = els.input.value.trim();
     if (!content)
         return;
+    await refreshProviderStatusIfStale();
     if (!selectedModelOption()) {
         await appAlert({
             title: "No model selected",
@@ -595,17 +795,17 @@ async function sendMessage(event) {
     }
     els.input.value = "";
     if (isChatRunning()) {
-        enqueueChat(content);
+        await enqueueChat(content);
         return;
     }
     await runChatInput(content);
 }
-async function runChatInput(content) {
+async function runChatInput(content, options = {}) {
     setComposerBusy(true);
     state.runningSessionId = state.selectedSessionId;
     renderSessions();
     try {
-        await streamMessage(state.selectedSessionId, content);
+        await streamMessage(state.selectedSessionId, content, options.selection);
         await loadState();
         await selectSession(state.selectedSessionId, { resetActivity: false });
     }
@@ -623,11 +823,12 @@ async function submitChatText(content) {
     const text = String(content || "").trim();
     if (!text)
         return;
+    await refreshProviderStatusIfStale();
     if (!state.selectedSessionId) {
         await createSession();
     }
     if (isChatRunning()) {
-        enqueueChat(text);
+        await enqueueChat(text);
         return;
     }
     await runChatInput(text);
@@ -681,14 +882,24 @@ function renderChatQueue() {
         els.chatQueueList.append(row);
     }
 }
-function updateQueuedChat(id, action) {
+async function updateQueuedChat(id, action) {
+    const sessionId = state.selectedSessionId;
     if (action === "remove") {
         state.chatQueue = state.chatQueue.filter((item) => item.id !== id);
+        renderChatQueue();
+        await request(`/api/sessions/${encodeURIComponent(sessionId)}/queue`, {
+            method: "PATCH",
+            body: JSON.stringify({ itemId: id, status: "removed" }),
+        }).catch(() => { });
     }
     else if (action === "steer" || action === "parallel") {
         state.chatQueue = state.chatQueue.map((item) => item.id === id ? { ...item, mode: action } : item);
+        renderChatQueue();
+        await request(`/api/sessions/${encodeURIComponent(sessionId)}/queue`, {
+            method: "PATCH",
+            body: JSON.stringify({ itemId: id, mode: action }),
+        }).catch(() => { });
     }
-    renderChatQueue();
 }
 function reorderQueuedChat(sourceId, targetId) {
     if (!sourceId || !targetId || sourceId === targetId)
@@ -702,6 +913,11 @@ function reorderQueuedChat(sourceId, targetId) {
     const [source] = state.chatQueue.splice(sourceIndex, 1);
     state.chatQueue.splice(targetIndex, 0, source);
     renderChatQueue();
+    const sessionItems = state.chatQueue.filter((item) => item.sessionId === state.selectedSessionId);
+    request(`/api/sessions/${encodeURIComponent(state.selectedSessionId)}/queue`, {
+        method: "PATCH",
+        body: JSON.stringify({ itemIds: sessionItems.map((i) => i.id) }),
+    }).catch(() => { });
 }
 function queueModeLabel(mode) {
     return mode === "parallel" ? "Parallel prep" : "Steering";
@@ -709,17 +925,48 @@ function queueModeLabel(mode) {
 function isChatRunning() {
     return Boolean(state.runningSessionId && state.runningSessionId === state.selectedSessionId);
 }
-function enqueueChat(content, mode = "steer") {
+async function enqueueChat(content, mode = "steer") {
     const selected = selectedModelOption();
-    state.chatQueue.push({
-        id: `queue-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-        sessionId: state.selectedSessionId,
-        content,
-        mode,
-        modelId: selected?.model.ID || "",
-        modelLabel: selected ? `${providerLabel(selected.model.ProviderPluginID)} · ${modelDisplayName(selected.model)}` : "No model",
-        createdAt: new Date(),
-    });
+    const sessionId = state.selectedSessionId;
+    const modelLabel = selected ? `${providerLabel(selected.model.ProviderPluginID)} · ${modelDisplayName(selected.model)}` : "No model";
+    try {
+        const data = await request(`/api/sessions/${encodeURIComponent(sessionId)}/queue`, {
+            method: "POST",
+            body: JSON.stringify({
+                content,
+                mode,
+                routeId: selected?.routeId || "",
+                modelId: selected?.model.ID || "",
+                thinkingEffort: state.thinkingEffort,
+            }),
+        });
+        const item = data.queueItem;
+        state.chatQueue.push({
+            id: item.ID,
+            sessionId,
+            content: item.Content,
+            mode: item.Mode,
+            routeId: item.RouteID,
+            modelId: item.ModelID,
+            thinkingEffort: item.ThinkingEffort,
+            modelLabel,
+            createdAt: new Date(item.CreatedAt),
+        });
+    }
+    catch {
+        // Fallback: add locally with temp id if API unavailable
+        state.chatQueue.push({
+            id: `queue-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+            sessionId,
+            content,
+            mode,
+            routeId: selected?.routeId || "",
+            modelId: selected?.model.ID || "",
+            thinkingEffort: state.thinkingEffort,
+            modelLabel,
+            createdAt: new Date(),
+        });
+    }
     renderChatQueue();
 }
 async function drainChatQueue() {
@@ -732,7 +979,43 @@ async function drainChatQueue() {
     }
     const [next] = state.chatQueue.splice(nextIndex, 1);
     renderChatQueue();
-    await runChatInput(next.content);
+    // Mark consumed on server (best effort)
+    request(`/api/sessions/${encodeURIComponent(next.sessionId)}/queue`, {
+        method: "PATCH",
+        body: JSON.stringify({ itemId: next.id, status: "consumed" }),
+    }).catch(() => { });
+    if (next.mode === "parallel") {
+        // Trigger parallel run in background and continue draining
+        triggerParallelRun(next).catch(() => { });
+        await drainChatQueue();
+        return;
+    }
+    if (next.mode === "steer") {
+        // Record steering event (best effort — run may have already finished)
+        request(`/api/sessions/${encodeURIComponent(next.sessionId)}/steering`, {
+            method: "POST",
+            body: JSON.stringify({ content: next.content }),
+        }).catch(() => { });
+    }
+    await runChatInput(next.content, {
+        selection: {
+            routeId: next.routeId,
+            modelId: next.modelId,
+            thinkingEffort: next.thinkingEffort,
+        },
+    });
+}
+async function triggerParallelRun(item) {
+    const data = await request(`/api/sessions/${encodeURIComponent(item.sessionId)}/parallel`, {
+        method: "POST",
+        body: JSON.stringify({
+            content: item.content,
+            routeId: item.routeId,
+            modelId: item.modelId,
+            thinkingEffort: item.thinkingEffort,
+        }),
+    });
+    appendActivityEvent("candidate", { candidateId: data.candidateId, text: "Parallel candidate running in background..." });
 }
 function queueTerminalCommand(event) {
     event.preventDefault();
@@ -804,16 +1087,19 @@ function stopTerminalCommand() {
     if (controller)
         controller.abort();
 }
-async function streamMessage(sessionId, content) {
+async function streamMessage(sessionId, content, selectionOverride = {}) {
     const selected = selectedModelOption();
+    const routeId = selectionOverride.routeId || selected?.routeId || "";
+    const modelId = selectionOverride.modelId || selected?.model.ID || "";
+    const thinkingEffort = selectionOverride.thinkingEffort || state.thinkingEffort;
     const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
             content,
-            routeId: selected?.routeId || "",
-            modelId: selected?.model.ID || "",
-            thinkingEffort: state.thinkingEffort,
+            routeId,
+            modelId,
+            thinkingEffort,
         }),
     });
     if (!response.ok || !response.body) {
@@ -842,7 +1128,7 @@ async function streamMessage(sessionId, content) {
                 appendMessage(event.payload.Role, event.payload.Content);
             }
             if (event.type === "assistant_start") {
-                assistantNode = appendMessage("assistant", "");
+                assistantNode = appendMessage("assistant", "", { activityIndex: nextAssistantActivityIndex() });
                 assistantActivity = ensureMessageActivity(assistantNode);
             }
             if (event.type === "assistant_delta" && assistantNode) {
@@ -915,7 +1201,7 @@ function renderSessions() {
         rename.textContent = "…";
         rename.addEventListener("click", (event) => {
             event.stopPropagation();
-            renameSession(session.ID);
+            openSessionActions(session.ID);
         });
         row.append(button, rename);
         els.sessions.append(row);
@@ -930,6 +1216,26 @@ function renderSessions() {
             renderSessions();
         });
         els.sessions.append(more);
+    }
+}
+async function openSessionActions(sessionID) {
+    const session = state.sessions.find((item) => item.ID === sessionID);
+    if (!session)
+        return;
+    const action = await appChoice({
+        title: "Chat actions",
+        message: session.Title,
+        primaryLabel: "Rename",
+        secondaryLabel: "Delete",
+        primaryValue: "rename",
+        secondaryValue: "delete",
+        dangerSecondary: true,
+    });
+    if (action === "rename") {
+        await renameSession(sessionID);
+    }
+    if (action === "delete") {
+        await deleteSession(sessionID);
     }
 }
 async function renameSession(sessionID) {
@@ -953,6 +1259,44 @@ async function renameSession(sessionID) {
         els.title.textContent = data.session.Title;
     }
     renderSessions();
+}
+async function deleteSession(sessionID) {
+    const session = state.sessions.find((item) => item.ID === sessionID);
+    if (!session)
+        return;
+    if (sessionID === state.runningSessionId) {
+        await appAlert({
+            title: "Chat is running",
+            message: "실행 중인 채팅은 완료 후 삭제할 수 있습니다.",
+        });
+        return;
+    }
+    const confirmed = await appConfirm({
+        title: "Delete chat",
+        message: `"${session.Title}" 채팅을 삭제합니다. 이 작업은 되돌릴 수 없습니다.`,
+        confirmLabel: "Delete",
+        cancelLabel: "Cancel",
+        danger: true,
+    });
+    if (!confirmed)
+        return;
+    await request(`/api/sessions/${encodeURIComponent(sessionID)}`, {
+        method: "DELETE",
+    });
+    state.chatQueue = state.chatQueue.filter((item) => item.sessionId !== sessionID);
+    if (state.selectedSessionId === sessionID) {
+        state.selectedSessionId = null;
+        resetReasoningStream();
+        clearToolApprovals();
+    }
+    await loadState();
+    if (!state.selectedSessionId && state.sessions.length > 0) {
+        await selectSession(state.sessions[0].ID);
+    }
+    else if (state.sessions.length === 0) {
+        renderEmptyChat();
+        renderChatQueue();
+    }
 }
 function renderProjects() {
     els.projects.replaceChildren();
@@ -1037,20 +1381,32 @@ function recentSearchItems() {
     }));
     return [...projects, ...chats];
 }
-function renderMessages(messages) {
+function renderMessages(messages, events = []) {
     els.messages.replaceChildren();
     if (messages.length === 0) {
         renderEmptyChat();
         return;
     }
+    const eventsByActivity = messageEventsByActivity(events);
+    let assistantIndex = 0;
     for (const message of messages) {
-        appendMessage(message.Role, message.Content);
+        if (message.Role === "assistant")
+            assistantIndex += 1;
+        const node = appendMessage(message.Role, message.Content, {
+            activityIndex: message.Role === "assistant" ? assistantIndex : 0,
+        });
+        if (message.Role === "assistant") {
+            restoreMessageActivity(node, assistantIndex, eventsByActivity.get(assistantIndex) || null);
+        }
     }
     els.messages.scrollTop = els.messages.scrollHeight;
 }
-function appendMessage(roleName, text) {
+function appendMessage(roleName, text, options = {}) {
     const item = document.createElement("article");
     item.className = `message ${roleName}`;
+    if (options.activityIndex) {
+        item.dataset.activityIndex = String(options.activityIndex);
+    }
     const role = document.createElement("div");
     role.className = "role";
     role.textContent = roleName;
@@ -1069,18 +1425,105 @@ function ensureMessageActivity(messageNode) {
     if (!activity) {
         activity = document.createElement("div");
         activity.className = "message-activity";
+        activity.dataset.activityIndex = messageNode.dataset.activityIndex || "";
         messageNode.append(activity);
     }
     return activity;
 }
-function appendMessageActivity(activity, kind, payload = {}) {
+function appendMessageActivity(activity, kind, payload = {}, options = {}) {
     if (!activity)
         return;
     const row = kind === "status"
         ? messageActivityStatus(payload)
         : messageActivityDetails(kind, payload);
     activity.append(row);
+    if (options.persistLocal === true) {
+        persistMessageActivity(activity, kind, payload);
+    }
     els.messages.scrollTop = els.messages.scrollHeight;
+}
+function restoreMessageActivity(messageNode, activityIndex, databaseEvents = null) {
+    const events = databaseEvents || loadMessageActivities(state.selectedSessionId)
+        .filter((item) => item.activityIndex === activityIndex);
+    if (events.length === 0)
+        return;
+    const activity = ensureMessageActivity(messageNode);
+    for (const event of events) {
+        appendMessageActivity(activity, event.kind, event.payload, { persist: false });
+    }
+}
+function messageEventsByActivity(events) {
+    const map = new Map();
+    for (const event of events || []) {
+        const activityIndex = Number(event.activityIndex || event.ActivityIndex || 0);
+        const kind = event.kind || event.Kind || "";
+        if (!activityIndex || !kind)
+            continue;
+        const payload = parseMessageEventPayload(event.payloadJson || event.payloadJSON || event.PayloadJSON);
+        if (!map.has(activityIndex))
+            map.set(activityIndex, []);
+        map.get(activityIndex).push({ activityIndex, kind, payload });
+    }
+    return map;
+}
+function parseMessageEventPayload(value) {
+    if (!value)
+        return {};
+    if (typeof value === "object")
+        return value;
+    try {
+        return JSON.parse(value);
+    }
+    catch {
+        return { text: String(value) };
+    }
+}
+function persistMessageActivity(activity, kind, payload = {}) {
+    const activityIndex = Number(activity.dataset.activityIndex || "0");
+    if (!state.selectedSessionId || !activityIndex)
+        return;
+    const events = loadMessageActivities(state.selectedSessionId);
+    events.push({
+        activityIndex,
+        kind,
+        payload: compactActivityPayload(payload),
+        createdAt: new Date().toISOString(),
+    });
+    saveMessageActivities(state.selectedSessionId, events.slice(-200));
+}
+function compactActivityPayload(payload = {}) {
+    return {
+        text: payload.text || "",
+        toolName: payload.toolName || "",
+        command: payload.command || "",
+        status: payload.status || "",
+        approvalId: payload.approvalId || "",
+        sessionId: payload.sessionId || "",
+        raw: payload.raw || null,
+    };
+}
+function loadMessageActivities(sessionId) {
+    if (!sessionId)
+        return [];
+    try {
+        const raw = window.localStorage.getItem(messageActivityStorageKey(sessionId));
+        const parsed = raw ? JSON.parse(raw) : [];
+        return Array.isArray(parsed) ? parsed : [];
+    }
+    catch {
+        return [];
+    }
+}
+function saveMessageActivities(sessionId, events) {
+    if (!sessionId)
+        return;
+    window.localStorage.setItem(messageActivityStorageKey(sessionId), JSON.stringify(events));
+}
+function messageActivityStorageKey(sessionId) {
+    return `ergo-loom:message-activity:${sessionId}`;
+}
+function nextAssistantActivityIndex() {
+    return els.messages.querySelectorAll(".message.assistant").length + 1;
 }
 function messageActivityStatus(payload) {
     const row = document.createElement("div");
@@ -1345,16 +1788,115 @@ function renderAuthStatuses() {
         return;
     for (const item of state.authStatuses) {
         const row = document.createElement("div");
-        row.className = `auth-status-row ${item.connected ? "connected" : "missing"}`;
+        row.className = `auth-status-row ${authStatusClass(item)}`;
         row.innerHTML = `
       <div>
         <strong>${escapeHTML(item.label)}</strong>
         <span>${escapeHTML(item.accountLabel || item.detail || item.status || "")}</span>
       </div>
-      <span>${item.connected ? "Ready" : "Needs setup"}</span>
+      <span>${escapeHTML(authStatusLabel(item))}</span>
     `;
         els.authStatusList.append(row);
     }
+}
+function authStatusClass(item) {
+    if (item.connected)
+        return "connected";
+    if (item.status === "missing")
+        return "missing";
+    if (item.id === "claude")
+        return "subscription-required";
+    if (item.id === "github" || item.id === "copilot")
+        return "auth-refresh";
+    return "setup-required";
+}
+function authStatusLabel(item) {
+    if (item.connected)
+        return "Ready";
+    if (item.id === "claude")
+        return "Subscription setup";
+    if (item.id === "github" || item.id === "copilot")
+        return "Auth refresh";
+    if (item.status === "missing")
+        return "Missing";
+    return "Needs setup";
+}
+function renderRuntimeDiagnostics() {
+    els.runtimeDiagnostics.replaceChildren();
+    const diagnostics = state.diagnostics;
+    if (!diagnostics)
+        return;
+    const label = document.createElement("div");
+    label.className = "workspace-panel-label";
+    label.textContent = "Runtime Diagnostics";
+    const list = document.createElement("div");
+    list.className = "runtime-diagnostic-list";
+    const summaryRows = [
+        ["Mode", diagnostics.desktop ? "Desktop app" : "Browser dev"],
+        ["Data", diagnostics.dataDir || "~/.ergo-loom"],
+        ["Bridge", diagnostics.handoffBridge ? "handoff worker ready" : "not configured"],
+    ];
+    for (const [name, value] of summaryRows) {
+        list.append(runtimeDiagnosticRow(name, value, value));
+    }
+    for (const item of diagnostics.executables || []) {
+        list.append(runtimeDiagnosticRow(item.label, item.status === "ready" ? item.path : item.detail, item.path || item.detail, item.status));
+    }
+    if (diagnostics.path) {
+        list.append(runtimeDiagnosticRow("PATH", diagnostics.path, diagnostics.path));
+    }
+    els.runtimeDiagnostics.append(label, list);
+}
+function runtimeDiagnosticRow(label, value, title = "", status = "") {
+    const row = document.createElement("div");
+    row.className = `runtime-diagnostic-row ${status || ""}`.trim();
+    row.title = title || value || "";
+    row.innerHTML = `
+    <strong>${escapeHTML(label)}</strong>
+    <span>${escapeHTML(value || "not available")}</span>
+  `;
+    return row;
+}
+function renderProviderThreads() {
+    els.providerThreadList.replaceChildren();
+    const label = document.createElement("div");
+    label.className = "workspace-panel-label";
+    label.textContent = "Provider Threads";
+    const list = document.createElement("div");
+    list.className = "provider-thread-items";
+    if (!state.providerChats.length) {
+        const empty = document.createElement("div");
+        empty.className = "meta";
+        empty.textContent = "No provider threads yet";
+        list.append(empty);
+    }
+    else {
+        for (const item of state.providerChats) {
+            const row = document.createElement("div");
+            row.className = "provider-thread-row";
+            row.title = item.ExternalThreadID || "";
+            row.innerHTML = `
+        <strong>${escapeHTML(providerLabel(item.ProviderPluginID))}</strong>
+        <span>${escapeHTML(providerThreadRouteLabel(item))}</span>
+        <code>${escapeHTML(shortThreadID(item.ExternalThreadID))}</code>
+      `;
+            list.append(row);
+        }
+    }
+    els.providerThreadList.append(label, list);
+}
+function providerThreadRouteLabel(item) {
+    const route = state.routes.find((candidate) => candidate.ID === item.AccessRouteID);
+    const model = state.models.find((candidate) => candidate.ID === item.ModelID);
+    return [route?.DisplayName || item.AccessRouteID, model?.DisplayName || item.ModelID]
+        .filter(Boolean)
+        .join(" · ");
+}
+function shortThreadID(value) {
+    const text = String(value || "");
+    if (text.length <= 18)
+        return text || "local";
+    return `${text.slice(0, 8)}…${text.slice(-6)}`;
 }
 function renderToolRegistrySummary() {
     els.toolRegistryList.replaceChildren();
@@ -1589,6 +2131,8 @@ function activityTitle(kind, payload) {
         return `Approval required · ${tool}${payload.sessionId ? ` · current chat` : ""}`;
     if (kind === "result")
         return `Tool result · ${tool}`;
+    if (kind === "candidate")
+        return `Parallel candidate · ${payload.candidateId || ""}`;
     return `Tool call · ${tool}`;
 }
 function resetReasoningStream() {
@@ -1603,7 +2147,9 @@ function renderEmptyChat() {
     els.title.textContent = "New chat";
     els.subtitle.textContent = state.project?.DisplayName || "Default Project";
     state.contextUsage = null;
+    state.providerChats = [];
     renderContextMeter();
+    renderProviderThreads();
     els.messages.replaceChildren();
     renderChatQueue();
     const providerOptions = availableProviderOptions();
@@ -1644,7 +2190,7 @@ function renderEmptyChat() {
                   <input type="checkbox" value="${escapeHTML(item.groupID)}" ${state.selectedProviderIds.includes(item.groupID) || index === 0 ? "checked" : ""}>
                   <span>
                     <strong>${escapeHTML(providerLabel(item.providerID))}${moderatorTagMarkup(moderator, item.groupID)}</strong>
-                    <small>${item.models.length} available model${item.models.length === 1 ? "" : "s"}</small>
+                    <small>${item.readyModels} ready · ${item.models.length} model${item.models.length === 1 ? "" : "s"}</small>
                   </span>
                 </label>
               `).join("") : `<p>사용 가능한 provider가 없어요. 좌측 AI Usage에서 provider를 연결해주세요.</p>`}
@@ -1712,6 +2258,7 @@ function renderEmptyChat() {
                 .map((node) => node.value);
             state.selectedProviderIds = selected;
             saveSelectedProviderIDs(selected);
+            renderModelPicker();
         });
     });
 }
@@ -1782,16 +2329,31 @@ async function saveModeratorFromHome(home) {
 async function chooseProjectPath() {
     let selectedPath = "";
     const bridge = window.ergoLoom;
+    const isPackagedLikeDesktop = new URLSearchParams(window.location.search).get("desktop") === "1";
     if (bridge?.chooseDirectory) {
-        const result = await bridge.chooseDirectory();
-        if (result?.canceled)
-            return;
-        selectedPath = String(result?.path || "").trim();
+        try {
+            const result = await bridge.chooseDirectory();
+            if (result?.canceled)
+                return;
+            selectedPath = String(result?.path || "").trim();
+        }
+        catch (error) {
+            const fallback = String(await appPrompt({
+                title: "프로젝트 경로 선택",
+                message: `파일 탐색기를 열지 못했습니다.\n${error?.message || String(error)}\n경로를 직접 입력하면 해당 경로의 프로젝트로 전환됩니다.`,
+                value: state.project?.RootPath || "~/.ergo-loom",
+                placeholder: "/Users/name/project",
+                confirmLabel: "Use path",
+            }) || "").trim();
+            selectedPath = fallback;
+        }
     }
     else {
         selectedPath = String(await appPrompt({
             title: "프로젝트 경로 선택",
-            message: "브라우저 개발 모드에서는 파일 탐색기 대신 경로를 직접 입력합니다. 경로가 바뀌면 현재 프로젝트 수정이 아니라 해당 경로의 프로젝트로 전환됩니다.",
+            message: isPackagedLikeDesktop
+                ? "설치 앱의 파일 선택 브리지를 찾지 못했습니다. 경로를 직접 입력하면 해당 경로의 프로젝트로 전환됩니다."
+                : "브라우저 개발 모드에서는 파일 탐색기 대신 경로를 직접 입력합니다. 경로가 바뀌면 현재 프로젝트 수정이 아니라 해당 경로의 프로젝트로 전환됩니다.",
             value: state.project?.RootPath || "~/.ergo-loom",
             placeholder: "/Users/name/project",
             confirmLabel: "Use path",
@@ -2178,17 +2740,6 @@ function usageRowsForProviders(providerIDs) {
 async function connectProvider(providerID, currentLabel = "") {
     const label = providerLabel(providerID);
     const normalizedCurrentLabel = String(currentLabel || "").trim();
-    if (providerID === "anthropic" && hasDesktopHandoffBridge()) {
-        await openClaudeHandoffSetup();
-        await request("/api/provider-profiles/connect", {
-            method: "POST",
-            body: JSON.stringify({ providerPluginId: providerID, displayName: "Claude web account" }),
-        });
-        await addProviderRoute(providerID);
-        await loadState();
-        appendActivityEvent("result", { toolName: "auth.connect", command: label, text: "Claude web handoff is ready. Sign in in the Ergo Loom Claude window if prompted, then retry the chat." });
-        return;
-    }
     try {
         if (normalizedCurrentLabel) {
             const manualName = String(await appPrompt({
@@ -2217,6 +2768,15 @@ async function connectProvider(providerID, currentLabel = "") {
         appendActivityEvent("result", { toolName: "auth.connect", command: label, text: `Connected account: ${account}` });
     }
     catch (error) {
+        if (providerID === "anthropic") {
+            await appAlert({
+                title: "Claude subscription login required",
+                message: "Claude는 claude.ai 웹 로그인 대신 Claude CLI subscription token으로 연결해야 합니다.\n\n터미널에서 `claude setup-token`을 실행해 Pro/Max 구독 계정을 연결한 뒤, AI Usage의 refresh 버튼을 눌러주세요.",
+                confirmLabel: "OK",
+            });
+            appendActivityEvent("error", { toolName: "auth.connect", command: label, text: error?.message || String(error) });
+            return;
+        }
         const message = error?.message || `${label} account bridge is not available`;
         const manualName = String(await appPrompt({
             title: `${label} account label`,
@@ -2304,9 +2864,6 @@ function providerIsConnected(providerID) {
     const auth = authForProvider(providerID);
     if (auth?.connected)
         return true;
-    if (providerID === "anthropic" && hasDesktopHandoffBridge()) {
-        return Boolean(profileForProvider(providerID));
-    }
     if (auth)
         return false;
     if (providerRequiresLiveAuth(providerID))
@@ -2398,7 +2955,7 @@ function renderModelMenu(options) {
         row.type = "button";
         const selectable = isModelSelectable(item);
         const badge = modelBadge(item);
-        const actionable = badge === "Add" || badge === "Connect";
+        const actionable = badge === "Add" || badge === "Connect" || badge === "Setup";
         row.className = `model-menu-item${item.model.ID === state.selectedModelId ? " active" : ""}${selectable ? "" : " locked"}`;
         row.disabled = !selectable && !actionable;
         row.innerHTML = `
@@ -2413,9 +2970,9 @@ function renderModelMenu(options) {
             row.addEventListener("click", () => selectModel(item.model.ID));
         }
         else if (badge === "Add") {
-            row.addEventListener("click", () => addProviderRoute(item.model.ProviderPluginID));
+            row.addEventListener("click", () => addModelProvider(item.model.ProviderPluginID));
         }
-        else if (badge === "Connect") {
+        else if (badge === "Connect" || badge === "Setup") {
             row.addEventListener("click", () => connectProvider(item.model.ProviderPluginID));
         }
         els.modelMenuList.append(row);
@@ -2431,14 +2988,26 @@ function toggleModelMenu() {
         requestAnimationFrame(() => els.modelSearch.focus());
     }
 }
+function closeModelMenu() {
+    if (els.modelMenu.hidden)
+        return;
+    els.modelMenu.hidden = true;
+    els.modelPicker.setAttribute("aria-expanded", "false");
+}
+function closeModelMenuFromOutside(event) {
+    if (els.modelMenu.hidden)
+        return;
+    if (els.modelMenu.contains(event.target) || els.modelPicker.contains(event.target))
+        return;
+    closeModelMenu();
+}
 function selectModel(modelID) {
     state.selectedModelId = modelID;
     saveSelectedModelID(modelID);
     const selected = selectedModelOption();
     els.modelPickerLabel.textContent = selected ? modelDisplayName(selected.model) : "No model";
     renderActiveRouteSummary();
-    els.modelMenu.hidden = true;
-    els.modelPicker.setAttribute("aria-expanded", "false");
+    closeModelMenu();
     renderModelMenu(modelOptions());
 }
 function modelDisplayName(model) {
@@ -2449,7 +3018,7 @@ function modelDescription(model) {
     if (model.ProviderPluginID === "codex")
         return `${provider} · local subscription route`;
     if (model.ProviderPluginID === "anthropic")
-        return `${provider} · CLI or free web handoff`;
+        return `${provider} · CLI subscription route`;
     if (model.ProviderPluginID === "copilot")
         return `${provider} · SDK or VS Code bridge`;
     if (model.ProviderPluginID === "gemini")
@@ -2473,34 +3042,49 @@ function modelOptions(options = {}) {
         }
     }
     return state.models
-        .filter((model) => !allowedGroups || allowedGroups.has(providerGroupID(model.ProviderPluginID)))
         .map((model) => ({
         model,
         route: enabledProviders.get(model.ProviderPluginID) || null,
         routeId: enabledProviders.get(model.ProviderPluginID)?.ID || "",
         connected: providerIsConnected(model.ProviderPluginID) || isFreeHandoffRoute(enabledProviders.get(model.ProviderPluginID)),
+        activeInSession: !allowedGroups || allowedGroups.has(providerGroupID(model.ProviderPluginID)),
     }));
 }
 function availableProviderOptions() {
     const groups = new Map();
-    for (const item of modelOptions({ respectSessionProviders: false }).filter(isModelSelectable).sort(compareModelOptions)) {
+    for (const routeItem of state.projectRoutes) {
+        if (!routeItem.Enabled)
+            continue;
+        const route = routeItem.Route;
+        const groupID = providerGroupID(route.ProviderPluginID);
+        const existing = groups.get(groupID);
+        if (!existing || routePreference(route) < routePreference(existing.route)) {
+            groups.set(groupID, {
+                groupID,
+                providerID: route.ProviderPluginID,
+                route,
+                models: [],
+                readyModels: 0,
+            });
+        }
+    }
+    for (const item of modelOptions({ respectSessionProviders: false }).sort(compareModelOptions)) {
         const groupID = providerGroupID(item.model.ProviderPluginID);
         const existing = groups.get(groupID);
-        if (existing) {
-            existing.models.push(item.model);
+        if (!existing) {
             continue;
         }
-        groups.set(groupID, {
-            groupID,
-            providerID: item.model.ProviderPluginID,
-            route: item.route,
-            models: [item.model],
-        });
+        existing.models.push(item.model);
+        if (isModelSelectable(item)) {
+            existing.readyModels += 1;
+        }
     }
-    return [...groups.values()];
+    return [...groups.values()]
+        .filter((item) => item.route?.Status === "available" && (providerIsConnected(item.providerID) || isSetupRoute(item.route) || isFreeHandoffRoute(item.route) || item.route.SupportsHandoff))
+        .sort((a, b) => providerGroupOrder(a.groupID) - providerGroupOrder(b.groupID));
 }
 function activeProviderGroupSet() {
-    if (!state.selectedSessionId || state.selectedProviderIds.length === 0)
+    if (state.selectedProviderIds.length === 0)
         return null;
     return new Set(state.selectedProviderIds);
 }
@@ -2533,10 +3117,8 @@ function routePreference(route) {
     if (!route)
         return 999;
     if (route.ProviderPluginID === "anthropic") {
-        if (route.Transport === "claude_cli" && providerIsConnected("anthropic"))
+        if (route.Transport === "claude_cli")
             return 0;
-        if (isFreeHandoffRoute(route))
-            return 1;
         if (route.Transport === "manual")
             return 2;
     }
@@ -2575,6 +3157,8 @@ function saveSelectedModelID(modelID) {
     window.localStorage.setItem(selectedModelStorageKey(), modelID);
 }
 function isModelSelectable(item) {
+    if (!item.activeInSession)
+        return false;
     if (!item.routeId || item.route?.Status !== "available")
         return false;
     if (item.model.Status !== "available")
@@ -2582,6 +3166,8 @@ function isModelSelectable(item) {
     return (item.connected && isExecutableRoute(item.route)) || isFreeHandoffRoute(item.route);
 }
 function modelBadge(item) {
+    if (!item.activeInSession)
+        return "Add";
     if (!item.routeId)
         return "Add";
     if (item.route?.Status !== "available")
@@ -2590,6 +3176,8 @@ function modelBadge(item) {
         return "Upgrade";
     if (isFreeHandoffRoute(item.route))
         return "Handoff";
+    if (!item.connected && isSetupRoute(item.route))
+        return "Setup";
     if (!item.connected)
         return "Connect";
     if (item.model.Status === "available")
@@ -2605,11 +3193,14 @@ function isExecutableRoute(route) {
         || (route?.ProviderPluginID === "anthropic" && route?.Transport === "claude_cli");
 }
 function isFreeHandoffRoute(route) {
+    if (route?.ProviderPluginID === "anthropic")
+        return false;
     if (!(route?.Status === "available" && route?.SupportsHandoff && route?.AccessMode === "free_handoff"))
         return false;
-    if (route.ProviderPluginID === "anthropic")
-        return hasDesktopHandoffBridge();
     return true;
+}
+function isSetupRoute(route) {
+    return route?.ProviderPluginID === "anthropic" && route?.Transport === "claude_cli";
 }
 function renderThinkingEffort() {
     const label = thinkingEffortLabel(state.thinkingEffort);
@@ -2650,6 +3241,12 @@ function uniqueProjectProviderRoutes() {
         rows.push(item);
     }
     return rows;
+}
+function modelLabelForIds(modelId, _routeId) {
+    const model = state.models.find((m) => m.ID === modelId);
+    if (!model)
+        return modelId || "Unknown model";
+    return `${providerLabel(model.ProviderPluginID)} · ${modelDisplayName(model)}`;
 }
 function providerLabel(providerID) {
     const names = {
@@ -2819,6 +3416,7 @@ els.projectToggle.addEventListener("click", toggleProjectChats);
 els.projectMenuButton.addEventListener("click", toggleProjectMenu);
 els.createProject.addEventListener("click", createProject);
 els.renameProject.addEventListener("click", renameProject);
+els.deleteProject.addEventListener("click", deleteCurrentProject);
 els.openSearch.addEventListener("click", openSearchModal);
 els.searchBackdrop.addEventListener("click", closeSearchModal);
 els.sessionSearch.addEventListener("input", searchSessions);
@@ -2828,11 +3426,17 @@ els.sessionSearch.addEventListener("keydown", (event) => {
 });
 els.activeRoute.addEventListener("click", toggleProjectRoutes);
 els.usageToggle.addEventListener("click", toggleAIUsage);
+els.providerRefresh.addEventListener("click", () => refreshProviderStatus());
 els.reasoningToggle.addEventListener("click", toggleReasoning);
 els.addRoute.addEventListener("click", addProjectRoute);
 els.composer.addEventListener("submit", sendMessage);
 els.input.addEventListener("keydown", handleComposerKeydown);
 els.modelPicker.addEventListener("click", toggleModelMenu);
+document.addEventListener("pointerdown", closeModelMenuFromOutside);
+document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape")
+        closeModelMenu();
+});
 els.modelEffort.addEventListener("click", toggleThinkingEffort);
 els.modelSearch.addEventListener("input", () => renderModelMenu(modelOptions()));
 els.workspaceTabs.addEventListener("click", (event) => {
@@ -2863,6 +3467,7 @@ els.fileReload.addEventListener("click", reloadActiveFile);
 switchWorkspaceTab(state.activeWorkspaceTab);
 renderTerminalPanel();
 renderFilePanel();
+installDesktopWindowChrome();
 loadState().catch((error) => {
     els.messages.textContent = error.message;
 });

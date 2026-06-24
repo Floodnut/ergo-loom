@@ -42,6 +42,58 @@ function appIcon(root: string, fileName = "icon.png"): string {
   return path.join(root, "build", fileName);
 }
 
+function desktopPath(existingPath = ""): string {
+  const home = os.homedir();
+  const candidates = [
+    existingPath,
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+    path.join(home, ".local/bin"),
+    path.join(home, ".npm-global/bin"),
+    path.join(home, ".yarn/bin"),
+  ];
+  return [...new Set(candidates.flatMap((value) => value.split(path.delimiter)).filter(Boolean))].join(path.delimiter);
+}
+
+function executablePath(command: string, searchPath: string): string {
+  for (const dir of searchPath.split(path.delimiter)) {
+    const candidate = path.join(dir, command);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      // Keep looking through the desktop PATH.
+    }
+  }
+  return "";
+}
+
+function codexExecutable(searchPath: string): string {
+  const candidates = [
+    process.env.ERGO_CODEX_COMMAND || "",
+    process.env.CODEX_EXEC || "",
+    executablePath("codex", searchPath),
+    "/Applications/Codex.app/Contents/Resources/codex",
+    path.join(os.homedir(), "Applications", "Codex.app", "Contents", "Resources", "codex"),
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      // Continue through known Codex install locations.
+    }
+  }
+  return "";
+}
+
 async function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -68,10 +120,14 @@ function backendCommand(root: string): { command: string; args: string[] } {
 function startBackend(root: string, dataDir: string, port: number, handoffBridgeURL: string): void {
   const addr = `127.0.0.1:${port}`;
   const backendCmd = backendCommand(root);
+  const pathForBackend = desktopPath(process.env.PATH || "");
+  const codexCommand = codexExecutable(pathForBackend);
   backend = spawn(backendCmd.command, [...backendCmd.args, "app", "--addr", addr], {
     cwd: root,
     env: {
       ...process.env,
+      PATH: pathForBackend,
+      ...(codexCommand ? { ERGO_CODEX_COMMAND: codexCommand } : {}),
       ERGO_LOOM_APP_ROOT: root,
       ERGO_LOOM_DATA_DIR: dataDir,
       ERGO_LOOM_DESKTOP: "1",
@@ -492,6 +548,21 @@ ipcMain.handle("ergo:choose-directory", async () => {
     return { canceled: true, path: "" };
   }
   return { canceled: false, path: result.filePaths[0] };
+});
+
+ipcMain.handle("ergo:toggle-maximize", (event) => {
+  const window = BrowserWindow.fromWebContents(event.sender);
+  if (!window) return { maximized: false };
+  if (window.isFullScreen()) {
+    window.setFullScreen(false);
+    return { maximized: window.isMaximized() };
+  }
+  if (window.isMaximized()) {
+    window.unmaximize();
+    return { maximized: false };
+  }
+  window.maximize();
+  return { maximized: true };
 });
 
 app.whenReady().then(() => {

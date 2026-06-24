@@ -2,6 +2,8 @@
 
 Ergo Loom is a local workspace for AI work context. It preserves original session exports from tools like Codex, VSCode Copilot, Cursor, Claude Code, and Gemini CLI, converts them into a shared internal model, and lets users inspect, branch, merge, and reuse that context across tools, accounts, and providers.
 
+The long-term context model is a local event graph: Ergo Loom owns the local context, while provider sessions and CLI processes are execution channels. See `docs/context-graph.md`.
+
 ## Product Shape
 
 - Product name: Ergo Loom
@@ -9,6 +11,7 @@ Ergo Loom is a local workspace for AI work context. It preserves original sessio
 - CLI command: `ergo`
 - Primary runtime stack: Go for core and CLI, TypeScript for UI
 - Initial persistence: local SQLite
+- Long-term context direction: structured local event files with SQLite projections
 - Provider and agent integrations should be plugin-shaped from the start
 - The default installed experience is a lightweight chat app, with the CLI installed beside it
 

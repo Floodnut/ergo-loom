@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jkj-dev/ergo-loom/internal/toolruntime"
+	"github.com/Floodnut/ergo-loom/internal/toolruntime"
 )
 
 func TestCodexRunnerRespondStreamsJSONDeltas(t *testing.T) {
