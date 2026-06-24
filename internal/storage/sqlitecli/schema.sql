@@ -415,6 +415,7 @@ CREATE TABLE IF NOT EXISTS candidate_outputs (
   chat_run_id TEXT NOT NULL REFERENCES chat_runs(id) ON DELETE CASCADE,
   session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   branch_id TEXT NOT NULL DEFAULT 'main',
+  trigger_event_id TEXT NOT NULL DEFAULT '',
   content_ref TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -423,6 +424,9 @@ CREATE TABLE IF NOT EXISTS candidate_outputs (
 
 CREATE INDEX IF NOT EXISTS idx_candidate_outputs_session
 ON candidate_outputs(session_id, status, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_candidate_outputs_trigger
+ON candidate_outputs(session_id, trigger_event_id, status);
 
 CREATE TABLE IF NOT EXISTS context_packets (
   id TEXT PRIMARY KEY,

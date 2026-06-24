@@ -213,11 +213,19 @@ type QueueItemInput struct {
 }
 
 type CandidateOutputInput struct {
-	ChatRunID string
-	SessionID string
-	BranchID  string
-	Content   string
-	Status    core.CandidateOutputStatus
+	ChatRunID      string
+	SessionID      string
+	BranchID       string
+	TriggerEventID string
+	Content        string
+	Status         core.CandidateOutputStatus
+}
+
+type CandidateMergeResult struct {
+	Candidate              core.CandidateOutput `json:"candidate"`
+	Message                core.Message         `json:"message"`
+	Event                  core.Event           `json:"event"`
+	SupersededCandidateIDs []string             `json:"supersededCandidateIds"`
 }
 
 type MessageEventInput struct {
@@ -280,7 +288,10 @@ func (s Store) Init() error {
 	if err := s.ensureProjectHandoffPolicyColumn(); err != nil {
 		return err
 	}
-	return s.ensureProjectRoutePolicyColumn()
+	if err := s.ensureProjectRoutePolicyColumn(); err != nil {
+		return err
+	}
+	return s.ensureCandidateTriggerEventColumn()
 }
 
 func (s Store) ListSessions() ([]core.Session, error) {
@@ -1436,6 +1447,7 @@ func (s Store) AddCandidateOutput(input CandidateOutputInput) (core.CandidateOut
 	input.ChatRunID = strings.TrimSpace(input.ChatRunID)
 	input.SessionID = strings.TrimSpace(input.SessionID)
 	input.BranchID = strings.TrimSpace(input.BranchID)
+	input.TriggerEventID = strings.TrimSpace(input.TriggerEventID)
 	input.Content = strings.TrimSpace(input.Content)
 	if input.ChatRunID == "" {
 		return core.CandidateOutput{}, errors.New("chat run id is required")
@@ -1455,21 +1467,22 @@ func (s Store) AddCandidateOutput(input CandidateOutputInput) (core.CandidateOut
 	id := "candidate_" + randomHex(16)
 	contentRef := filepath.ToSlash(filepath.Join("objects", "candidates", id+".json"))
 	if err := s.writeCandidateObject(contentRef, map[string]any{
-		"id":         id,
-		"chatRunId":  input.ChatRunID,
-		"sessionId":  input.SessionID,
-		"branchId":   input.BranchID,
-		"content":    input.Content,
-		"status":     input.Status,
-		"recordedAt": time.Now().UTC().Format(time.RFC3339Nano),
+		"id":             id,
+		"chatRunId":      input.ChatRunID,
+		"sessionId":      input.SessionID,
+		"branchId":       input.BranchID,
+		"triggerEventId": input.TriggerEventID,
+		"content":        input.Content,
+		"status":         input.Status,
+		"recordedAt":     time.Now().UTC().Format(time.RFC3339Nano),
 	}); err != nil {
 		return core.CandidateOutput{}, err
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	stmt := fmt.Sprintf(`
-INSERT INTO candidate_outputs (id, chat_run_id, session_id, branch_id, content_ref, status, created_at, updated_at)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
-`, quote(id), quote(input.ChatRunID), quote(input.SessionID), quote(input.BranchID), quote(contentRef), quote(string(input.Status)), quote(now), quote(now))
+INSERT INTO candidate_outputs (id, chat_run_id, session_id, branch_id, trigger_event_id, content_ref, status, created_at, updated_at)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+`, quote(id), quote(input.ChatRunID), quote(input.SessionID), quote(input.BranchID), quote(input.TriggerEventID), quote(contentRef), quote(string(input.Status)), quote(now), quote(now))
 	if err := s.run(stmt); err != nil {
 		return core.CandidateOutput{}, err
 	}
@@ -1482,11 +1495,11 @@ func (s Store) ListPendingCandidateOutputs(sessionID string) ([]core.CandidateOu
 		return nil, errors.New("session id is required")
 	}
 	out, err := s.queryJSON(fmt.Sprintf(`
-SELECT id, chat_run_id, session_id, branch_id, content_ref, status, created_at, updated_at
+SELECT id, chat_run_id, session_id, branch_id, COALESCE(trigger_event_id, '') AS trigger_event_id, content_ref, status, created_at, updated_at
 FROM candidate_outputs
-WHERE session_id = %s AND status NOT IN (%s, %s)
+WHERE session_id = %s AND status NOT IN (%s, %s, %s, %s)
 ORDER BY created_at ASC;
-`, quote(sessionID), quote(string(core.CandidateOutputAccepted)), quote(string(core.CandidateOutputRejected))))
+`, quote(sessionID), quote(string(core.CandidateOutputAccepted)), quote(string(core.CandidateOutputRejected)), quote(string(core.CandidateOutputMerged)), quote(string(core.CandidateOutputSuperseded))))
 	if err != nil {
 		return nil, err
 	}
@@ -1518,13 +1531,14 @@ func (s Store) UpdateCandidateOutput(id string, content string, status core.Cand
 		return core.CandidateOutput{}, err
 	}
 	if err := s.writeCandidateObject(existing.ContentRef, map[string]any{
-		"id":         id,
-		"chatRunId":  existing.ChatRunID,
-		"sessionId":  existing.SessionID,
-		"branchId":   existing.BranchID,
-		"content":    content,
-		"status":     string(status),
-		"recordedAt": time.Now().UTC().Format(time.RFC3339Nano),
+		"id":             id,
+		"chatRunId":      existing.ChatRunID,
+		"sessionId":      existing.SessionID,
+		"branchId":       existing.BranchID,
+		"triggerEventId": existing.TriggerEventID,
+		"content":        content,
+		"status":         string(status),
+		"recordedAt":     time.Now().UTC().Format(time.RFC3339Nano),
 	}); err != nil {
 		return core.CandidateOutput{}, err
 	}
@@ -1577,6 +1591,89 @@ WHERE id = %s;
 	return s.getCandidateOutput(id)
 }
 
+func (s Store) MergeCandidateOutput(id string) (CandidateMergeResult, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return CandidateMergeResult{}, errors.New("candidate output id is required")
+	}
+	candidate, err := s.getCandidateOutput(id)
+	if err != nil {
+		return CandidateMergeResult{}, err
+	}
+	if candidate.Status != core.CandidateOutputReady && candidate.Status != core.CandidateOutputAccepted {
+		return CandidateMergeResult{}, fmt.Errorf("candidate must be ready before merge; current status is %s", candidate.Status)
+	}
+	content, err := s.readCandidateContent(candidate.ContentRef)
+	if err != nil {
+		return CandidateMergeResult{}, err
+	}
+	if strings.TrimSpace(content) == "" {
+		return CandidateMergeResult{}, errors.New("candidate content is empty")
+	}
+
+	message, err := s.AddMessage(candidate.SessionID, "assistant", content)
+	if err != nil {
+		return CandidateMergeResult{}, err
+	}
+	session, _, err := s.GetSession(candidate.SessionID)
+	if err != nil {
+		return CandidateMergeResult{}, err
+	}
+	head, err := s.GetHead(session.ProjectID, session.ID, candidate.BranchID)
+	if err != nil {
+		return CandidateMergeResult{}, err
+	}
+	event, err := s.AppendEvent(core.EventInput{
+		Type:           core.EventCandidateMerged,
+		ProjectID:      session.ProjectID,
+		SessionID:      session.ID,
+		BranchID:       candidate.BranchID,
+		ParentEventIDs: []string{head.EventID},
+		PayloadRef:     fmt.Sprintf("candidate:%s|message:%s|chat_run:%s", candidate.ID, message.ID, candidate.ChatRunID),
+	})
+	if err != nil {
+		return CandidateMergeResult{}, err
+	}
+	if _, err := s.MoveHead(session.ProjectID, session.ID, candidate.BranchID, event.ID); err != nil {
+		return CandidateMergeResult{}, err
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	sql := fmt.Sprintf(`BEGIN;
+UPDATE candidate_outputs
+SET status = %s, updated_at = %s
+WHERE id = %s;
+`, quote(string(core.CandidateOutputMerged)), quote(now), quote(candidate.ID))
+	if candidate.TriggerEventID != "" {
+		sql += fmt.Sprintf(`UPDATE candidate_outputs
+SET status = %s, updated_at = %s
+WHERE session_id = %s
+  AND trigger_event_id = %s
+  AND status = %s
+  AND id != %s;
+`, quote(string(core.CandidateOutputSuperseded)), quote(now), quote(candidate.SessionID), quote(candidate.TriggerEventID), quote(string(core.CandidateOutputReady)), quote(candidate.ID))
+	}
+	sql += "COMMIT;\n"
+	if err := s.run(sql); err != nil {
+		return CandidateMergeResult{}, err
+	}
+
+	merged, err := s.getCandidateOutput(candidate.ID)
+	if err != nil {
+		return CandidateMergeResult{}, err
+	}
+	supersededIDs, err := s.listSupersededCandidateIDs(candidate.SessionID, candidate.TriggerEventID, candidate.ID)
+	if err != nil {
+		return CandidateMergeResult{}, err
+	}
+	return CandidateMergeResult{
+		Candidate:              merged,
+		Message:                message,
+		Event:                  event,
+		SupersededCandidateIDs: supersededIDs,
+	}, nil
+}
+
 func (s Store) writeCandidateObject(contentRef string, payload any) error {
 	if strings.TrimSpace(s.DBPath) == "" {
 		return nil
@@ -1593,9 +1690,28 @@ func (s Store) writeCandidateObject(contentRef string, payload any) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
+func (s Store) readCandidateContent(contentRef string) (string, error) {
+	contentRef = strings.TrimSpace(contentRef)
+	if contentRef == "" {
+		return "", errors.New("candidate content ref is required")
+	}
+	path := filepath.Join(filepath.Dir(s.DBPath), filepath.FromSlash(contentRef))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	var payload struct {
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return "", err
+	}
+	return payload.Content, nil
+}
+
 func (s Store) getCandidateOutput(id string) (core.CandidateOutput, error) {
 	out, err := s.queryJSON(fmt.Sprintf(`
-SELECT id, chat_run_id, session_id, branch_id, content_ref, status, created_at, updated_at
+SELECT id, chat_run_id, session_id, branch_id, COALESCE(trigger_event_id, '') AS trigger_event_id, content_ref, status, created_at, updated_at
 FROM candidate_outputs
 WHERE id = %s;
 `, quote(id)))
@@ -1610,6 +1726,38 @@ WHERE id = %s;
 		return core.CandidateOutput{}, ErrNotFound
 	}
 	return rows[0].toCore()
+}
+
+func (s Store) listSupersededCandidateIDs(sessionID string, triggerEventID string, excludeID string) ([]string, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	triggerEventID = strings.TrimSpace(triggerEventID)
+	excludeID = strings.TrimSpace(excludeID)
+	if sessionID == "" || triggerEventID == "" {
+		return nil, nil
+	}
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id
+FROM candidate_outputs
+WHERE session_id = %s
+  AND trigger_event_id = %s
+  AND status = %s
+  AND id != %s
+ORDER BY updated_at ASC, id ASC;
+`, quote(sessionID), quote(triggerEventID), quote(string(core.CandidateOutputSuperseded)), quote(excludeID)))
+	if err != nil {
+		return nil, err
+	}
+	var rows []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.ID)
+	}
+	return ids, nil
 }
 
 func (s Store) getSteeringRecord(id string) (SteeringRecord, error) {
@@ -2718,6 +2866,17 @@ func (s Store) ensureProjectRoutePolicyColumn() error {
 	return s.run(`ALTER TABLE projects ADD COLUMN route_policy TEXT NOT NULL DEFAULT 'manual';`)
 }
 
+func (s Store) ensureCandidateTriggerEventColumn() error {
+	out, err := s.queryJSON(`PRAGMA table_info(candidate_outputs);`)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(out, `"name":"trigger_event_id"`) {
+		return nil
+	}
+	return s.run(`ALTER TABLE candidate_outputs ADD COLUMN trigger_event_id TEXT NOT NULL DEFAULT '';`)
+}
+
 func (s Store) ensureSessionProjectColumn() error {
 	out, err := s.queryJSON(`PRAGMA table_info(sessions);`)
 	if err != nil {
@@ -2886,14 +3045,15 @@ type queueItemRow struct {
 }
 
 type candidateOutputRow struct {
-	ID         string `json:"id"`
-	ChatRunID  string `json:"chat_run_id"`
-	SessionID  string `json:"session_id"`
-	BranchID   string `json:"branch_id"`
-	ContentRef string `json:"content_ref"`
-	Status     string `json:"status"`
-	CreatedAt  string `json:"created_at"`
-	UpdatedAt  string `json:"updated_at"`
+	ID             string `json:"id"`
+	ChatRunID      string `json:"chat_run_id"`
+	SessionID      string `json:"session_id"`
+	BranchID       string `json:"branch_id"`
+	TriggerEventID string `json:"trigger_event_id"`
+	ContentRef     string `json:"content_ref"`
+	Status         string `json:"status"`
+	CreatedAt      string `json:"created_at"`
+	UpdatedAt      string `json:"updated_at"`
 }
 
 type registryItemRow struct {
@@ -3282,14 +3442,15 @@ func (r candidateOutputRow) toCore() (core.CandidateOutput, error) {
 		return core.CandidateOutput{}, err
 	}
 	return core.CandidateOutput{
-		ID:         r.ID,
-		ChatRunID:  r.ChatRunID,
-		SessionID:  r.SessionID,
-		BranchID:   r.BranchID,
-		ContentRef: r.ContentRef,
-		Status:     core.CandidateOutputStatus(r.Status),
-		CreatedAt:  createdAt,
-		UpdatedAt:  updatedAt,
+		ID:             r.ID,
+		ChatRunID:      r.ChatRunID,
+		SessionID:      r.SessionID,
+		BranchID:       r.BranchID,
+		TriggerEventID: r.TriggerEventID,
+		ContentRef:     r.ContentRef,
+		Status:         core.CandidateOutputStatus(r.Status),
+		CreatedAt:      createdAt,
+		UpdatedAt:      updatedAt,
 	}, nil
 }
 

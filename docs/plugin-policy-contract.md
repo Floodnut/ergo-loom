@@ -124,7 +124,66 @@ Tool categories should include:
 - kubectl
 - OpenStack CLI/API
 
-Approval decisions should be recorded as events:
+### Go Interface
+
+```go
+// internal/core/tool_approval.go
+
+type ToolCallRequest struct {
+    ID          string
+    SessionID   string
+    ToolName    string
+    Parameters  map[string]any
+    RequestedAt time.Time
+}
+
+type ApprovalVerdict string
+
+const (
+    VerdictAutoApprove ApprovalVerdict = "auto"
+    VerdictAskUser     ApprovalVerdict = "ask_user"
+    VerdictDeny        ApprovalVerdict = "deny"
+)
+
+type ApprovalResult struct {
+    Verdict ApprovalVerdict
+    Reason  string
+}
+
+type ToolApprovalPolicy interface {
+    Name() string
+    Evaluate(req ToolCallRequest) ApprovalResult
+}
+```
+
+### DB Schema
+
+```sql
+CREATE TABLE tool_call_requests (
+    id           TEXT PRIMARY KEY,
+    session_id   TEXT NOT NULL,
+    tool_name    TEXT NOT NULL,
+    parameters   TEXT NOT NULL,   -- JSON
+    status       TEXT NOT NULL DEFAULT 'pending',
+    -- pending | approved | rejected | executed | failed
+    verdict      TEXT,            -- auto | ask_user | deny
+    reason       TEXT,
+    requested_at DATETIME NOT NULL,
+    resolved_at  DATETIME
+);
+```
+
+### API
+
+```text
+POST   /api/sessions/{sessionID}/tool-calls           AI requests tool execution
+GET    /api/sessions/{sessionID}/tool-calls/pending   pending approvals for UI
+PATCH  /api/tool-calls/{id}                           user approves or rejects
+```
+
+`PATCH` body: `{ "status": "approved" | "rejected" }`
+
+### Approval Decisions as Events
 
 - `tool.requested`
 - `tool.approved`
@@ -132,12 +191,34 @@ Approval decisions should be recorded as events:
 - `tool.completed`
 - `tool.failed`
 
-Planned approval policy names:
+### Policy Names
 
-- `ask-per-command`
-- `allow-similar-after-approval`
-- `deny-by-default`
-- `project-trusted`
+| Name | Behavior |
+|---|---|
+| `safe-only` | read/search tools auto-approve; write/exec/git ask_user (recommended default) |
+| `ask-per-command` | every tool call goes to the user |
+| `allow-similar-after-approval` | once a tool+params pattern is approved, repeat runs auto-approve |
+| `deny-by-default` | all tool calls rejected unless explicitly allow-listed |
+| `project-trusted` | all tool calls auto-approved for this project |
+
+`safe-only` is the recommended default. It lets read-only exploration proceed
+without interruption while requiring explicit approval for any action that
+modifies state.
+
+### Package Location
+
+Implement in `internal/toolpolicy/policy.go` following the same Registry
+pattern as `internal/packetpolicy`, `internal/handoffpolicy`, and
+`internal/routepolicy`:
+
+```go
+func NewRegistry() Registry { ... }
+func (r Registry) Register(p core.ToolApprovalPolicy) { ... }
+func (r Registry) GetOrDefault(name string) core.ToolApprovalPolicy { ... }
+func (r Registry) List() []string { ... }
+```
+
+Register at server startup alongside the other policy registries.
 
 ## Candidate Output Lifecycle
 
@@ -147,18 +228,35 @@ transcript until accepted.
 States:
 
 ```text
-pending -> ready -> accepted
+pending -> ready -> accepted -> merged
 pending -> ready -> rejected
+pending -> ready -> superseded  (another candidate in the same turn was accepted first)
 pending -> rejected
+pending -> failed -> rejected
 ```
 
-Future states may include:
+Terminal states: `merged`, `rejected`, `superseded`.
 
-```text
-merged
-superseded
-expired
+`failed` stays visible long enough for the UI to show the provider error. It can
+then be cleaned up as `rejected`.
+
+### superseded Scope
+
+superseded applies only to candidates that share the same user turn, not the
+entire session. The scoping field is `trigger_event_id`: the event ID of the
+user message that caused this candidate run to start.
+
+```sql
+UPDATE candidate_outputs
+SET status = 'superseded'
+WHERE session_id     = ?
+  AND trigger_event_id = ?   -- same user turn only
+  AND status         = 'ready'
+  AND id             != ?    -- exclude the just-accepted candidate
 ```
+
+`candidate_outputs` must include a `trigger_event_id TEXT` column. It is set
+when the parallel run is created and must not be null.
 
 ### Accepted Candidate Semantics
 

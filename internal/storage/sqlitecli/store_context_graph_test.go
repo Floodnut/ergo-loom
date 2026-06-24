@@ -315,3 +315,90 @@ func TestCandidateOutputsAreSeparateFromMainTranscript(t *testing.T) {
 		t.Fatalf("unexpected accepted candidate: %#v", accepted)
 	}
 }
+
+func TestMergeCandidateOutputMaterializesAssistantMessage(t *testing.T) {
+	dir := t.TempDir()
+	store := Store{
+		DBPath:     filepath.Join(dir, "ergo.db"),
+		SchemaPath: "schema.sql",
+	}
+	if err := store.Init(); err != nil {
+		t.Fatalf("init store: %v", err)
+	}
+	session, err := store.CreateChatSessionForProject("default", "Candidate merge")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := store.AddMessage(session.ID, "user", "compare two answers"); err != nil {
+		t.Fatalf("add user message: %v", err)
+	}
+	head, err := store.GetHead(session.ProjectID, session.ID, "main")
+	if err != nil {
+		t.Fatalf("get head: %v", err)
+	}
+	triggerEventID := head.EventID
+	run, err := store.StartChatRun(ChatRunInput{
+		ProjectID:    session.ProjectID,
+		SessionID:    session.ID,
+		BranchID:     "main",
+		Role:         core.ChatRunRoleParallel,
+		Status:       core.ChatRunCompleted,
+		InputEventID: triggerEventID,
+	})
+	if err != nil {
+		t.Fatalf("start parallel run: %v", err)
+	}
+	first, err := store.AddCandidateOutput(CandidateOutputInput{
+		ChatRunID:      run.ID,
+		SessionID:      session.ID,
+		BranchID:       "main",
+		TriggerEventID: triggerEventID,
+		Content:        "candidate one",
+		Status:         core.CandidateOutputReady,
+	})
+	if err != nil {
+		t.Fatalf("add first candidate: %v", err)
+	}
+	second, err := store.AddCandidateOutput(CandidateOutputInput{
+		ChatRunID:      run.ID,
+		SessionID:      session.ID,
+		BranchID:       "main",
+		TriggerEventID: triggerEventID,
+		Content:        "candidate two",
+		Status:         core.CandidateOutputReady,
+	})
+	if err != nil {
+		t.Fatalf("add second candidate: %v", err)
+	}
+
+	result, err := store.MergeCandidateOutput(first.ID)
+	if err != nil {
+		t.Fatalf("merge candidate: %v", err)
+	}
+	if result.Candidate.Status != core.CandidateOutputMerged {
+		t.Fatalf("expected merged candidate, got %#v", result.Candidate)
+	}
+	if result.Message.Role != "assistant" || result.Message.Content != "candidate one" {
+		t.Fatalf("unexpected materialized message: %#v", result.Message)
+	}
+	if result.Event.Type != core.EventCandidateMerged {
+		t.Fatalf("unexpected merge event: %#v", result.Event)
+	}
+	if len(result.SupersededCandidateIDs) != 1 || result.SupersededCandidateIDs[0] != second.ID {
+		t.Fatalf("unexpected superseded ids: %#v", result.SupersededCandidateIDs)
+	}
+	pending, err := store.ListPendingCandidateOutputs(session.ID)
+	if err != nil {
+		t.Fatalf("list candidates: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("expected merged/superseded candidates hidden, got %#v", pending)
+	}
+	_, messages, err := store.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if len(messages) != 2 || messages[1].Content != "candidate one" {
+		t.Fatalf("unexpected transcript: %#v", messages)
+	}
+}

@@ -610,12 +610,14 @@ func (s Server) startParallelRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
+	triggerEventID := s.latestUserTriggerEventID(sessionID)
 	run, err := s.store.StartChatRun(sqlitecli.ChatRunInput{
 		ProjectID:       session.ProjectID,
 		SessionID:       sessionID,
 		BranchID:        "main",
 		Role:            core.ChatRunRoleParallel,
 		Status:          core.ChatRunRunning,
+		InputEventID:    triggerEventID,
 		ContextPacketID: packet.ID,
 	})
 	if err != nil {
@@ -623,11 +625,12 @@ func (s Server) startParallelRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	candidate, err := s.store.AddCandidateOutput(sqlitecli.CandidateOutputInput{
-		ChatRunID: run.ID,
-		SessionID: sessionID,
-		BranchID:  "main",
-		Content:   "",
-		Status:    core.CandidateOutputPending,
+		ChatRunID:      run.ID,
+		SessionID:      sessionID,
+		BranchID:       "main",
+		TriggerEventID: triggerEventID,
+		Content:        "",
+		Status:         core.CandidateOutputPending,
 	})
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
@@ -641,7 +644,7 @@ func (s Server) startParallelRun(w http.ResponseWriter, r *http.Request) {
 		candidateStatus := core.CandidateOutputReady
 		if runErr != nil {
 			segStatus = core.ProviderSegmentFailed
-			candidateStatus = core.CandidateOutputRejected
+			candidateStatus = core.CandidateOutputFailed
 			text = runErr.Error()
 		}
 		s.completeProviderSegment(seg.ID, segStatus, "")
@@ -673,6 +676,20 @@ func (s Server) updateCandidateOutput(w http.ResponseWriter, r *http.Request) {
 	case core.CandidateOutputAccepted, core.CandidateOutputRejected:
 	default:
 		writeError(w, errors.New("candidate status must be accepted or rejected"), http.StatusBadRequest)
+		return
+	}
+	if status == core.CandidateOutputAccepted {
+		result, err := s.store.MergeCandidateOutput(candidateID)
+		if err != nil {
+			writeError(w, err, http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{
+			"candidate":              result.Candidate,
+			"message":                result.Message,
+			"event":                  result.Event,
+			"supersededCandidateIds": result.SupersededCandidateIDs,
+		})
 		return
 	}
 	candidate, err := s.store.UpdateCandidateOutputStatus(candidateID, status)
@@ -1520,6 +1537,27 @@ func (s Server) currentHeadEventID(sessionID string) string {
 		return ""
 	}
 	return head.EventID
+}
+
+func (s Server) latestUserTriggerEventID(sessionID string) string {
+	session, _, err := s.store.GetSession(sessionID)
+	if err != nil {
+		return ""
+	}
+	head, err := s.store.GetHead(session.ProjectID, session.ID, "main")
+	if err != nil || strings.TrimSpace(head.EventID) == "" {
+		return ""
+	}
+	events, err := s.store.ListAncestors(head.EventID, 200)
+	if err != nil {
+		return ""
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Type == core.EventMessageUser {
+			return events[i].ID
+		}
+	}
+	return ""
 }
 
 func contextEventTypeForProviderEvent(kind string) (core.EventType, bool) {

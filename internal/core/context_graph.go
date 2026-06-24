@@ -25,6 +25,7 @@ const (
 	EventQueueItemReordered   EventType = "queue.item.reordered"
 	EventSteeringAdded        EventType = "steering.added"
 	EventParallelRunQueued    EventType = "parallel.run.queued"
+	EventCandidateMerged      EventType = "candidate.merged"
 )
 
 type Event struct {
@@ -144,21 +145,25 @@ type QueueItem struct {
 type CandidateOutputStatus string
 
 const (
-	CandidateOutputPending  CandidateOutputStatus = "pending"
-	CandidateOutputReady    CandidateOutputStatus = "ready"
-	CandidateOutputAccepted CandidateOutputStatus = "accepted"
-	CandidateOutputRejected CandidateOutputStatus = "rejected"
+	CandidateOutputPending    CandidateOutputStatus = "pending"
+	CandidateOutputReady      CandidateOutputStatus = "ready"
+	CandidateOutputAccepted   CandidateOutputStatus = "accepted"
+	CandidateOutputRejected   CandidateOutputStatus = "rejected"
+	CandidateOutputFailed     CandidateOutputStatus = "failed"
+	CandidateOutputMerged     CandidateOutputStatus = "merged"
+	CandidateOutputSuperseded CandidateOutputStatus = "superseded"
 )
 
 type CandidateOutput struct {
-	ID         string
-	ChatRunID  string
-	SessionID  string
-	BranchID   string
-	ContentRef string
-	Status     CandidateOutputStatus
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	ID             string
+	ChatRunID      string
+	SessionID      string
+	BranchID       string
+	TriggerEventID string
+	ContentRef     string
+	Status         CandidateOutputStatus
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 type ProviderRun struct {
