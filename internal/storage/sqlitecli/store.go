@@ -1005,7 +1005,26 @@ WHERE id = %s;
 	return s.getChatRun(id)
 }
 
-func (s Store) ActiveMainChatRun(sessionID string) (core.ChatRun, error) {
+func (s Store) UpdateChatRunStatus(id string, status core.ChatRunStatus) (core.ChatRun, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return core.ChatRun{}, errors.New("chat run id is required")
+	}
+	if status == "" {
+		status = core.ChatRunRunning
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	stmt := fmt.Sprintf(`UPDATE chat_runs
+SET status = %s, updated_at = %s
+WHERE id = %s;
+`, quote(string(status)), quote(now), quote(id))
+	if err := s.run(stmt); err != nil {
+		return core.ChatRun{}, err
+	}
+	return s.getChatRun(id)
+}
+
+func (s Store) GetActiveChatRun(sessionID string) (core.ChatRun, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return core.ChatRun{}, errors.New("session id is required")
@@ -1016,10 +1035,42 @@ SELECT id, COALESCE(project_id, '') AS project_id, session_id, branch_id, role, 
        COALESCE(output_event_id, '') AS output_event_id,
        context_packet_id, created_at, updated_at
 FROM chat_runs
-WHERE session_id = %s AND branch_id = 'main' AND role = %s AND status IN (%s, %s, %s)
+WHERE session_id = %s AND branch_id = 'main' AND role = %s AND status IN (%s, %s)
 ORDER BY created_at DESC, id DESC
 LIMIT 1;
-`, quote(sessionID), quote(string(core.ChatRunRoleMain)), quote(string(core.ChatRunRunning)), quote(string(core.ChatRunWaitingApproval)), quote(string(core.ChatRunQueued))))
+`, quote(sessionID), quote(string(core.ChatRunRoleMain)), quote(string(core.ChatRunRunning)), quote(string(core.ChatRunWaitingApproval))))
+	if err != nil {
+		return core.ChatRun{}, err
+	}
+	var rows []chatRunRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return core.ChatRun{}, err
+	}
+	if len(rows) == 0 {
+		return core.ChatRun{}, ErrNotFound
+	}
+	return rows[0].toCore()
+}
+
+func (s Store) ActiveMainChatRun(sessionID string) (core.ChatRun, error) {
+	return s.GetActiveChatRun(sessionID)
+}
+
+func (s Store) NextQueuedChatRun(sessionID string) (core.ChatRun, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return core.ChatRun{}, errors.New("session id is required")
+	}
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id, COALESCE(project_id, '') AS project_id, session_id, branch_id, role, status,
+       COALESCE(input_event_id, '') AS input_event_id,
+       COALESCE(output_event_id, '') AS output_event_id,
+       context_packet_id, created_at, updated_at
+FROM chat_runs
+WHERE session_id = %s AND branch_id = 'main' AND role = %s AND status = %s
+ORDER BY created_at ASC, id ASC
+LIMIT 1;
+`, quote(sessionID), quote(string(core.ChatRunRoleMain)), quote(string(core.ChatRunQueued))))
 	if err != nil {
 		return core.ChatRun{}, err
 	}

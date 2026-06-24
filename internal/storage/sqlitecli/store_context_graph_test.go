@@ -1,6 +1,7 @@
 package sqlitecli
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -265,6 +266,52 @@ func TestQueueItemsCanBePersistedReorderedAndConsumed(t *testing.T) {
 	}
 	if len(items) != 1 || items[0].ID != first.ID {
 		t.Fatalf("unexpected remaining queue: %#v", items)
+	}
+}
+
+func TestActiveChatRunExcludesQueuedRuns(t *testing.T) {
+	dir := t.TempDir()
+	store := Store{
+		DBPath:     filepath.Join(dir, "ergo.db"),
+		SchemaPath: "schema.sql",
+	}
+	if err := store.Init(); err != nil {
+		t.Fatalf("init store: %v", err)
+	}
+	session, err := store.CreateChatSessionForProject("default", "Active run test")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	queued, err := store.StartChatRun(ChatRunInput{
+		SessionID:       session.ID,
+		Role:            core.ChatRunRoleMain,
+		Status:          core.ChatRunQueued,
+		ContextPacketID: "packet_queued",
+	})
+	if err != nil {
+		t.Fatalf("start queued run: %v", err)
+	}
+	if _, err := store.GetActiveChatRun(session.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected queued run to be inactive, got %v", err)
+	}
+	next, err := store.NextQueuedChatRun(session.ID)
+	if err != nil {
+		t.Fatalf("next queued run: %v", err)
+	}
+	if next.ID != queued.ID {
+		t.Fatalf("expected next queued run %s, got %s", queued.ID, next.ID)
+	}
+	running, err := store.UpdateChatRunStatus(queued.ID, core.ChatRunRunning)
+	if err != nil {
+		t.Fatalf("update queued run status: %v", err)
+	}
+	active, err := store.GetActiveChatRun(session.ID)
+	if err != nil {
+		t.Fatalf("active chat run: %v", err)
+	}
+	if active.ID != running.ID {
+		t.Fatalf("expected active run %s, got %s", running.ID, active.ID)
 	}
 }
 

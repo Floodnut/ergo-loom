@@ -386,6 +386,9 @@ ON chat_runs(session_id, branch_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_chat_runs_status
 ON chat_runs(status, role);
 
+CREATE INDEX IF NOT EXISTS idx_chat_runs_session_active
+ON chat_runs(session_id, branch_id, role, status);
+
 CREATE INDEX IF NOT EXISTS idx_provider_segments_chat_run
 ON provider_segments(chat_run_id, started_at);
 

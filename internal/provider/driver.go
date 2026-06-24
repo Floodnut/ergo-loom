@@ -42,10 +42,35 @@ type ChatResponse struct {
 	Streamed         bool
 }
 
+type DriverErrorKind string
+
+const (
+	ErrKindTransient   DriverErrorKind = "transient"
+	ErrKindAuthFailure DriverErrorKind = "auth_failure"
+	ErrKindRateLimit   DriverErrorKind = "rate_limit"
+	ErrKindSessionEnd  DriverErrorKind = "session_end"
+	ErrKindUnavailable DriverErrorKind = "unavailable"
+	ErrKindFatal       DriverErrorKind = "fatal"
+)
+
+type DriverError struct {
+	Kind      DriverErrorKind
+	Message   string
+	Retryable bool
+}
+
+func (e *DriverError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Message
+}
+
 type ChatDriver interface {
 	ProviderPluginID() string
 	CanExecute(ChatRequest) bool
 	Respond(ctx context.Context, request ChatRequest, onEvent func(Event)) (ChatResponse, error)
+	Ping(ctx context.Context) error
 }
 
 type DriverRegistry struct {
@@ -92,7 +117,7 @@ func (d CodexAppServerDriver) CanExecute(request ChatRequest) bool {
 
 func (d CodexAppServerDriver) Respond(ctx context.Context, request ChatRequest, onEvent func(Event)) (ChatResponse, error) {
 	if !d.CanExecute(request) {
-		return ChatResponse{}, fmt.Errorf("%s is not executable by the Codex app-server driver", request.RouteDisplayName)
+		return ChatResponse{}, driverError(ErrKindUnavailable, "%s is not executable by the Codex app-server driver", request.RouteDisplayName)
 	}
 	runner := NewCodexAppServerRunner(d.WorkDir)
 	runner.Command = firstNonEmpty(d.Command, runner.Command)
@@ -101,12 +126,21 @@ func (d CodexAppServerDriver) Respond(ctx context.Context, request ChatRequest, 
 	runner.ApprovalHandler = request.ApprovalHandler
 
 	response, err := runner.RespondInThread(ctx, request.ExternalThreadID, request.Input, onEvent)
+	if err != nil {
+		return ChatResponse{
+			Text:             response.Text,
+			ExternalThreadID: response.ThreadID,
+			Streamed:         response.Streamed,
+		}, classifyCodexDriverError(err)
+	}
 	return ChatResponse{
 		Text:             response.Text,
 		ExternalThreadID: response.ThreadID,
 		Streamed:         response.Streamed,
-	}, err
+	}, nil
 }
+
+func (d CodexAppServerDriver) Ping(context.Context) error { return nil }
 
 type ClaudeCLIDriver struct {
 	Command string
@@ -123,14 +157,14 @@ func (d ClaudeCLIDriver) CanExecute(request ChatRequest) bool {
 
 func (d ClaudeCLIDriver) Respond(ctx context.Context, request ChatRequest, onEvent func(Event)) (ChatResponse, error) {
 	if !d.CanExecute(request) {
-		return ChatResponse{}, fmt.Errorf("%s is not executable by the Claude CLI driver", request.RouteDisplayName)
+		return ChatResponse{}, driverError(ErrKindUnavailable, "%s is not executable by the Claude CLI driver", request.RouteDisplayName)
 	}
 	if request.RouteTransport == "manual" {
 		return d.respondWithBrowserHandoff(ctx, request, onEvent)
 	}
 	command, err := claudeCommand(d.Command)
 	if err != nil {
-		return ChatResponse{}, err
+		return ChatResponse{}, classifyClaudeDriverError(err.Error())
 	}
 	sessionID := request.ExternalThreadID
 	if sessionID == "" {
@@ -163,12 +197,12 @@ func (d ClaudeCLIDriver) Respond(ctx context.Context, request ChatRequest, onEve
 	cmd.Dir = firstNonEmpty(d.WorkDir, mustGetwd())
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return ChatResponse{}, err
+		return ChatResponse{}, driverError(ErrKindFatal, err.Error())
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
-		return ChatResponse{}, err
+		return ChatResponse{}, classifyClaudeDriverError(err.Error())
 	}
 
 	var assistant strings.Builder
@@ -197,16 +231,30 @@ func (d ClaudeCLIDriver) Respond(ctx context.Context, request ChatRequest, onEve
 	}
 	if err := scanner.Err(); err != nil {
 		_ = cmd.Wait()
-		return ChatResponse{ExternalThreadID: sessionID, Streamed: streamed}, err
+		return ChatResponse{ExternalThreadID: sessionID, Streamed: streamed}, driverError(ErrKindTransient, err.Error())
 	}
 	if err := cmd.Wait(); err != nil {
-		return ChatResponse{ExternalThreadID: sessionID, Streamed: streamed}, errors.New(claudeCLIErrorDetail(firstNonEmpty(stderr.String(), assistant.String())))
+		return ChatResponse{ExternalThreadID: sessionID, Streamed: streamed}, classifyClaudeDriverError(claudeCLIErrorDetail(firstNonEmpty(stderr.String(), assistant.String())))
 	}
 	final := strings.TrimSpace(assistant.String())
 	if final == "" {
-		return ChatResponse{ExternalThreadID: sessionID, Streamed: streamed}, errors.New("claude CLI returned an empty response")
+		return ChatResponse{ExternalThreadID: sessionID, Streamed: streamed}, driverError(ErrKindTransient, "claude CLI returned an empty response")
 	}
 	return ChatResponse{Text: final, ExternalThreadID: sessionID, Streamed: streamed}, nil
+}
+
+func (d ClaudeCLIDriver) Ping(ctx context.Context) error {
+	command, err := claudeCommand(d.Command)
+	if err != nil {
+		return classifyClaudeDriverError(err.Error())
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(pingCtx, command, "--version")
+	if err := cmd.Run(); err != nil {
+		return classifyClaudeDriverError(err.Error())
+	}
+	return nil
 }
 
 type CopilotBridgeDriver struct {
@@ -229,7 +277,7 @@ func (d CopilotBridgeDriver) CanExecute(request ChatRequest) bool {
 
 func (d CopilotBridgeDriver) Respond(ctx context.Context, request ChatRequest, onEvent func(Event)) (ChatResponse, error) {
 	if !d.CanExecute(request) {
-		return ChatResponse{}, errors.New("Copilot bridge is not configured. Start an Ergo Loom Copilot bridge worker and set ERGO_COPILOT_BRIDGE_URL.")
+		return ChatResponse{}, driverError(ErrKindUnavailable, "Copilot bridge is not configured. Start an Ergo Loom Copilot bridge worker and set ERGO_COPILOT_BRIDGE_URL.")
 	}
 	bridgeURL := strings.TrimRight(strings.TrimSpace(firstNonEmpty(d.BridgeURL, os.Getenv("ERGO_COPILOT_BRIDGE_URL"))), "/")
 	onEvent(Event{Kind: "status", Text: "Sending request to Ergo Loom Copilot bridge"})
@@ -244,38 +292,58 @@ func (d CopilotBridgeDriver) Respond(ctx context.Context, request ChatRequest, o
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return ChatResponse{}, err
+		return ChatResponse{}, driverError(ErrKindFatal, err.Error())
 	}
 	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, bridgeURL+"/v1/copilot/chat", bytes.NewReader(body))
 	if err != nil {
-		return ChatResponse{}, err
+		return ChatResponse{}, driverError(ErrKindFatal, err.Error())
 	}
 	httpRequest.Header.Set("Content-Type", "application/json")
 
 	response, err := (&http.Client{Timeout: 2 * time.Minute}).Do(httpRequest)
 	if err != nil {
-		return ChatResponse{}, err
+		return ChatResponse{}, driverError(ErrKindTransient, err.Error())
 	}
 	defer response.Body.Close()
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 2*1024*1024))
 	if err != nil {
-		return ChatResponse{}, err
+		return ChatResponse{}, driverError(ErrKindTransient, err.Error())
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return ChatResponse{}, fmt.Errorf("Copilot bridge failed: %s", strings.TrimSpace(string(responseBody)))
+		return ChatResponse{}, httpDriverError(response.StatusCode, "Copilot bridge failed: "+strings.TrimSpace(string(responseBody)))
 	}
 	var result struct {
 		Text             string `json:"text"`
 		ExternalThreadID string `json:"externalThreadId"`
 	}
 	if err := json.Unmarshal(responseBody, &result); err != nil {
-		return ChatResponse{}, err
+		return ChatResponse{}, driverError(ErrKindFatal, err.Error())
 	}
 	if strings.TrimSpace(result.Text) == "" {
-		return ChatResponse{}, errors.New("Copilot bridge returned an empty response")
+		return ChatResponse{}, driverError(ErrKindTransient, "Copilot bridge returned an empty response")
 	}
 	onEvent(Event{Kind: "status", Text: "Received Copilot bridge response"})
 	return ChatResponse{Text: result.Text, ExternalThreadID: result.ExternalThreadID, Streamed: false}, nil
+}
+
+func (d CopilotBridgeDriver) Ping(ctx context.Context) error {
+	bridgeURL := strings.TrimRight(strings.TrimSpace(firstNonEmpty(d.BridgeURL, os.Getenv("ERGO_COPILOT_BRIDGE_URL"))), "/")
+	if bridgeURL == "" {
+		return driverError(ErrKindUnavailable, "Copilot bridge is not configured")
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, bridgeURL+"/healthz", nil)
+	if err != nil {
+		return driverError(ErrKindFatal, err.Error())
+	}
+	response, err := (&http.Client{Timeout: 3 * time.Second}).Do(httpRequest)
+	if err != nil {
+		return driverError(ErrKindTransient, err.Error())
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return httpDriverError(response.StatusCode, "Copilot bridge health check failed")
+	}
+	return nil
 }
 
 func (d ClaudeCLIDriver) respondWithBrowserHandoff(ctx context.Context, request ChatRequest, onEvent func(Event)) (ChatResponse, error) {
@@ -303,26 +371,26 @@ func (d ClaudeCLIDriver) respondWithBrowserHandoff(ctx context.Context, request 
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return ChatResponse{}, err
+		return ChatResponse{}, driverError(ErrKindFatal, err.Error())
 	}
 	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, bridgeURL+"/v1/claude/chat", bytes.NewReader(body))
 	if err != nil {
-		return ChatResponse{}, err
+		return ChatResponse{}, driverError(ErrKindFatal, err.Error())
 	}
 	httpRequest.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{Timeout: 2 * time.Minute}
 	response, err := client.Do(httpRequest)
 	if err != nil {
-		return ChatResponse{}, err
+		return ChatResponse{}, driverError(ErrKindTransient, err.Error())
 	}
 	defer response.Body.Close()
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 2*1024*1024))
 	if err != nil {
-		return ChatResponse{}, err
+		return ChatResponse{}, driverError(ErrKindTransient, err.Error())
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return ChatResponse{}, fmt.Errorf("Claude web handoff worker failed: %s", strings.TrimSpace(string(responseBody)))
+		return ChatResponse{}, httpDriverError(response.StatusCode, "Claude web handoff worker failed: "+strings.TrimSpace(string(responseBody)))
 	}
 
 	var result struct {
@@ -330,10 +398,10 @@ func (d ClaudeCLIDriver) respondWithBrowserHandoff(ctx context.Context, request 
 		ExternalThreadID string `json:"externalThreadId"`
 	}
 	if err := json.Unmarshal(responseBody, &result); err != nil {
-		return ChatResponse{}, err
+		return ChatResponse{}, driverError(ErrKindFatal, err.Error())
 	}
 	if strings.TrimSpace(result.Text) == "" {
-		return ChatResponse{}, errors.New("Claude web handoff worker returned an empty response")
+		return ChatResponse{}, driverError(ErrKindTransient, "Claude web handoff worker returned an empty response")
 	}
 	onEvent(Event{Kind: "status", Text: "Received Claude web response inside Ergo Loom"})
 	return ChatResponse{
@@ -600,7 +668,83 @@ func (d UnavailableDriver) CanExecute(ChatRequest) bool {
 
 func (d UnavailableDriver) Respond(context.Context, ChatRequest, func(Event)) (ChatResponse, error) {
 	if strings.TrimSpace(d.Reason) != "" {
-		return ChatResponse{}, errors.New(d.Reason)
+		return ChatResponse{}, driverError(ErrKindUnavailable, d.Reason)
 	}
-	return ChatResponse{}, errors.New("provider driver is not implemented yet")
+	return ChatResponse{}, driverError(ErrKindUnavailable, "provider driver is not implemented yet")
+}
+
+func (d UnavailableDriver) Ping(context.Context) error {
+	if strings.TrimSpace(d.Reason) != "" {
+		return driverError(ErrKindUnavailable, d.Reason)
+	}
+	return driverError(ErrKindUnavailable, "provider driver is not implemented yet")
+}
+
+func driverError(kind DriverErrorKind, format string, args ...any) *DriverError {
+	message := fmt.Sprintf(format, args...)
+	if len(args) == 0 {
+		message = format
+	}
+	return &DriverError{
+		Kind:      kind,
+		Message:   message,
+		Retryable: kind == ErrKindTransient || kind == ErrKindRateLimit || kind == ErrKindSessionEnd,
+	}
+}
+
+func httpDriverError(statusCode int, message string) *DriverError {
+	switch {
+	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
+		return driverError(ErrKindAuthFailure, message)
+	case statusCode == http.StatusTooManyRequests:
+		return driverError(ErrKindRateLimit, message)
+	case statusCode >= 500:
+		return driverError(ErrKindTransient, message)
+	default:
+		return driverError(ErrKindFatal, message)
+	}
+}
+
+func classifyCodexDriverError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var driverErr *DriverError
+	if errors.As(err, &driverErr) {
+		return driverErr
+	}
+	message := err.Error()
+	lower := strings.ToLower(message)
+	switch {
+	case strings.Contains(lower, "401") || strings.Contains(lower, "403") || strings.Contains(lower, "auth") || strings.Contains(lower, "login"):
+		return driverError(ErrKindAuthFailure, message)
+	case strings.Contains(lower, "429") || strings.Contains(lower, "rate limit"):
+		return driverError(ErrKindRateLimit, message)
+	case strings.Contains(lower, "thread") && (strings.Contains(lower, "not found") || strings.Contains(lower, "expired") || strings.Contains(lower, "ended")):
+		return driverError(ErrKindSessionEnd, message)
+	case strings.Contains(lower, "timeout") || strings.Contains(lower, "temporary") || strings.Contains(lower, "connection"):
+		return driverError(ErrKindTransient, message)
+	default:
+		return driverError(ErrKindFatal, message)
+	}
+}
+
+func classifyClaudeDriverError(message string) error {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return driverError(ErrKindFatal, "Claude CLI command failed")
+	}
+	lower := strings.ToLower(message)
+	switch {
+	case strings.Contains(lower, "not logged in") || strings.Contains(lower, "login") || strings.Contains(lower, "setup-token") || strings.Contains(lower, "auth"):
+		return driverError(ErrKindAuthFailure, message)
+	case strings.Contains(lower, "credit balance too low") || strings.Contains(lower, "rate limit") || strings.Contains(lower, "too many requests"):
+		return driverError(ErrKindRateLimit, message)
+	case strings.Contains(lower, "session") && (strings.Contains(lower, "expired") || strings.Contains(lower, "not found") || strings.Contains(lower, "ended")):
+		return driverError(ErrKindSessionEnd, message)
+	case strings.Contains(lower, "timeout") || strings.Contains(lower, "temporar") || strings.Contains(lower, "connection"):
+		return driverError(ErrKindTransient, message)
+	default:
+		return driverError(ErrKindFatal, message)
+	}
 }

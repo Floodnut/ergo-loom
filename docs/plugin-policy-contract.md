@@ -110,6 +110,81 @@ It must not:
 - approve tools
 - merge candidate outputs
 
+## Moderator
+
+Moderator is reactive, not an orchestrator. It responds to provider events and
+state changes. It does not plan work on its own.
+
+Moderator can decide:
+
+- continue
+- failover
+- suspend
+- terminate
+
+Moderator may react to:
+
+- provider segment completed
+- provider segment error
+- timeout
+- auth failure
+- token budget limit
+- user abort
+
+Moderator must not:
+
+- select the next route or model
+- build context packets
+- generate handoff summaries
+- approve or reject tools
+- choose candidate outputs
+- infer user intent
+
+When a moderator returns `failover`, the server calls `RouteSelectionPolicy`.
+The selected route is outside the moderator contract.
+
+```go
+type SegmentEndReason string
+
+const (
+    ReasonCompleted   SegmentEndReason = "completed"
+    ReasonError       SegmentEndReason = "error"
+    ReasonTimeout     SegmentEndReason = "timeout"
+    ReasonAuthFailure SegmentEndReason = "auth_failure"
+    ReasonBudgetLimit SegmentEndReason = "budget_limit"
+    ReasonSessionEnd  SegmentEndReason = "session_end"
+    ReasonUserAbort   SegmentEndReason = "user_abort"
+)
+
+type ModerationAction string
+
+const (
+    ActionContinue  ModerationAction = "continue"
+    ActionFailover  ModerationAction = "failover"
+    ActionSuspend   ModerationAction = "suspend"
+    ActionTerminate ModerationAction = "terminate"
+)
+
+type ModerationContext struct {
+    Session       Session
+    ActiveSegment ProviderSegment
+    Reason        SegmentEndReason
+    QueueDepth    int
+}
+
+type ModerationDecision struct {
+    Action ModerationAction
+}
+
+type Moderator interface {
+    OnSegmentEnd(ctx ModerationContext) ModerationDecision
+    OnBudgetWarning(ctx ModerationContext) ModerationDecision
+}
+```
+
+Route/model hints are intentionally absent. If future requirements need them,
+add optional soft hints that `RouteSelectionPolicy` may ignore.
+
 ## Tool Runtime And Approval Policy
 
 Tool execution is global to Ergo Loom, not owned by AI providers.
@@ -279,6 +354,177 @@ reasoning.
 Do not use pointer-only acceptance as the only representation. It makes replay
 and provider context packet construction harder because accepted answers would
 not look like transcript content.
+
+## Provider Expiry And Resume Contract
+
+### Error Classification
+
+Drivers must classify failures using `DriverError`. The server converts
+`DriverError.Kind` into `SegmentEndReason` before calling the Moderator.
+Unclassified errors map to `ReasonError`.
+
+```go
+// internal/provider/driver.go
+
+type DriverErrorKind string
+
+const (
+    ErrKindTransient   DriverErrorKind = "transient"    // temporary; retry is safe
+    ErrKindAuthFailure DriverErrorKind = "auth_failure" // token expired; user action needed
+    ErrKindRateLimit   DriverErrorKind = "rate_limit"   // provider throttling; back off
+    ErrKindSessionEnd  DriverErrorKind = "session_end"  // provider session ended; resume as new segment
+    ErrKindUnavailable DriverErrorKind = "unavailable"  // provider is down
+    ErrKindFatal       DriverErrorKind = "fatal"        // unrecoverable
+)
+
+type DriverError struct {
+    Kind      DriverErrorKind
+    Message   string
+    Retryable bool
+}
+
+func (e *DriverError) Error() string { return e.Message }
+```
+
+### Ping
+
+Drivers should implement `Ping` to let the Moderator or health checks verify
+that a provider session is still alive before starting a new segment.
+
+```go
+type ChatDriver interface {
+    ProviderPluginID() string
+    CanExecute(ChatRequest) bool
+    Respond(ctx context.Context, request ChatRequest, onEvent func(Event)) (ChatResponse, error)
+    Ping(ctx context.Context) error  // return nil if alive; DriverError otherwise
+}
+```
+
+Drivers that cannot implement a lightweight ping should return `nil`
+immediately (no-op). The server must not treat a nil-returning ping as a
+health guarantee.
+
+### SegmentEndReason Mapping
+
+```text
+ErrKindAuthFailure  → ReasonAuthFailure
+ErrKindRateLimit    → ReasonTimeout
+ErrKindTransient    → ReasonTimeout
+ErrKindSessionEnd   → ReasonSessionEnd  (new reason, added to core/moderator.go)
+ErrKindUnavailable  → ReasonError
+ErrKindFatal        → ReasonError
+unclassified error  → ReasonError
+```
+
+### Resume Semantics
+
+Resume does not restore a provider session. It starts a new `ProviderSegment`
+on the same or a different route, using Ergo Loom's local context packet as
+the provider's memory replacement.
+
+```text
+provider session expired (ErrKindSessionEnd)
+        ↓
+Moderator.OnSegmentEnd(reason=session_end) → ActionFailover
+        ↓
+RouteSelectionPolicy: may re-select the same route
+        ↓
+HandoffPolicy: treats session_end the same as a route change
+        ↓
+new ProviderSegment starts (ExternalThreadID is fresh)
+```
+
+`ExternalThreadID` from the expired segment is not reused. The new context
+packet reconstructs provider memory from local events.
+
+### Driver Implementation Checklist
+
+Each driver is responsible for classifying its own errors:
+
+- `ClaudeCLIDriver`: parse stderr for auth patterns; map exit codes to kinds
+- `CodexAppServerDriver`: HTTP 401/403 → auth_failure; 429 → rate_limit; 5xx → transient
+- `CopilotBridgeDriver`: same HTTP pattern as above
+
+## Active Chat Run And Queue Consumption
+
+### Definitions
+
+`GetActiveChatRun` returns the main run that is currently executing or waiting
+for user approval. `queued` runs are not active — they have not started yet.
+
+```go
+// active = running or waiting_approval only
+func (s Store) GetActiveChatRun(sessionID string) (core.ChatRun, error)
+
+// next item waiting to be consumed
+func (s Store) NextQueuedChatRun(sessionID string) (core.ChatRun, error)
+
+// transition queued → running before execution
+func (s Store) UpdateChatRunStatus(id string, status core.ChatRunStatus) error
+```
+
+The existing `ActiveMainChatRun` includes `queued` in its status filter. It
+must be narrowed to exclude `queued`, or replaced with `GetActiveChatRun`.
+
+### Incoming Message Dispatch
+
+When a new message arrives, the server checks for an active run before
+deciding how to proceed:
+
+```text
+new message arrives
+        ↓
+GetActiveChatRun()
+        ↓
+not found                      found (running / waiting_approval)
+    ↓                                    ↓
+execute immediately              mode?
+                          ┌──────────────┴──────────────┐
+                        normal                       steering
+                          ↓                              ↓
+                    AddQueueItem                  injectSteering(run.ID)
+                    (waits for active to finish)  (delivered to current run)
+```
+
+`parallel` is a separate endpoint and is not part of this dispatch.
+
+### Queue Consumption
+
+`maybeConsumeQueue` runs after every `CompleteChatRun` and after a Moderator
+`ActionTerminate` decision:
+
+```go
+func (s Server) maybeConsumeQueue(sessionID string) {
+    if _, err := s.store.GetActiveChatRun(sessionID); err == nil {
+        return // active run still present
+    }
+    run, err := s.store.NextQueuedChatRun(sessionID)
+    if err != nil {
+        return // queue empty
+    }
+    s.store.UpdateChatRunStatus(run.ID, core.ChatRunRunning)
+    go s.executeChatRun(run)
+}
+```
+
+### DB Index
+
+Add an index to support efficient active-run lookups:
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_chat_runs_session_active
+ON chat_runs(session_id, branch_id, role, status);
+```
+
+### Implementation Checklist
+
+- Narrow `ActiveMainChatRun` status filter to exclude `queued`, or add
+  `GetActiveChatRun` as a separate store method
+- Add `NextQueuedChatRun` store method
+- Add `UpdateChatRunStatus` store method
+- Add `maybeConsumeQueue` to server, call after `CompleteChatRun`
+- Update `streamSessionMessage` to check active run before executing:
+  normal → queue, steering → inject, no active run → execute immediately
 
 ## Knowledge Boundary
 

@@ -506,7 +506,7 @@ func (s Server) recordSteering(w http.ResponseWriter, r *http.Request) {
 		writeError(w, errors.New("steering content is required"), http.StatusBadRequest)
 		return
 	}
-	run, err := s.store.ActiveMainChatRun(sessionID)
+	record, run, segment, err := s.addSteeringToActiveRun(sessionID, content)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, sqlitecli.ErrNotFound) {
@@ -515,10 +515,17 @@ func (s Server) recordSteering(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err, status)
 		return
 	}
+	writeJSON(w, map[string]any{"steering": record, "chatRun": run, "providerSegment": segment})
+}
+
+func (s Server) addSteeringToActiveRun(sessionID string, content string) (sqlitecli.SteeringRecord, core.ChatRun, core.ProviderSegment, error) {
+	run, err := s.store.GetActiveChatRun(sessionID)
+	if err != nil {
+		return sqlitecli.SteeringRecord{}, core.ChatRun{}, core.ProviderSegment{}, err
+	}
 	segment, err := s.store.ActiveProviderSegment(run.ID)
 	if err != nil && !errors.Is(err, sqlitecli.ErrNotFound) {
-		writeError(w, err, http.StatusInternalServerError)
-		return
+		return sqlitecli.SteeringRecord{}, core.ChatRun{}, core.ProviderSegment{}, err
 	}
 	event := s.recordContextEventAfter(sessionID, core.EventSteeringAdded, "steering:"+run.ID, run.InputEventID)
 	record, err := s.store.RecordSteering(sqlitecli.SteeringInput{
@@ -529,10 +536,9 @@ func (s Server) recordSteering(w http.ResponseWriter, r *http.Request) {
 		Status:            "recorded",
 	})
 	if err != nil {
-		writeError(w, err, http.StatusInternalServerError)
-		return
+		return sqlitecli.SteeringRecord{}, core.ChatRun{}, core.ProviderSegment{}, err
 	}
-	writeJSON(w, map[string]any{"steering": record, "chatRun": run, "providerSegment": segment})
+	return record, run, segment, nil
 }
 
 func (s Server) listKnowledge(w http.ResponseWriter, r *http.Request) {
@@ -1196,6 +1202,7 @@ func (s Server) sessionMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	content = filtered.Content
+
 	selection, err := s.resolveChatSelection(sessionID, input.RouteID, input.ModelID)
 	if err != nil {
 		writeError(w, err, http.StatusBadRequest)
@@ -1249,6 +1256,7 @@ func (s Server) streamSessionMessage(w http.ResponseWriter, r *http.Request, ses
 
 	var input struct {
 		Content        string `json:"content"`
+		Mode           string `json:"mode"`
 		RouteID        string `json:"routeId"`
 		ModelID        string `json:"modelId"`
 		ThinkingEffort string `json:"thinkingEffort"`
@@ -1274,6 +1282,54 @@ func (s Server) streamSessionMessage(w http.ResponseWriter, r *http.Request, ses
 		return
 	}
 	content = filtered.Content
+
+	mode := core.QueueItemMode(strings.TrimSpace(input.Mode))
+	if mode == "" {
+		mode = core.QueueItemNormal
+	}
+	activeRun, activeErr := s.store.GetActiveChatRun(sessionID)
+	if activeErr != nil && !errors.Is(activeErr, sqlitecli.ErrNotFound) {
+		writeError(w, activeErr, http.StatusInternalServerError)
+		return
+	}
+	if activeErr == nil {
+		w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		if mode == core.QueueItemSteering || strings.TrimSpace(input.Mode) == "steer" {
+			record, run, segment, err := s.addSteeringToActiveRun(sessionID, content)
+			if err != nil {
+				writeStreamEvent(w, "error", map[string]string{"message": err.Error()})
+				flusher.Flush()
+				return
+			}
+			writeStreamEvent(w, "steering", map[string]any{
+				"steering":        record,
+				"chatRun":         run,
+				"providerSegment": segment,
+			})
+			flusher.Flush()
+			return
+		}
+		item, err := s.store.AddQueueItem(sqlitecli.QueueItemInput{
+			SessionID:      sessionID,
+			BranchID:       activeRun.BranchID,
+			Content:        content,
+			Mode:           core.QueueItemNormal,
+			RouteID:        input.RouteID,
+			ModelID:        input.ModelID,
+			ThinkingEffort: input.ThinkingEffort,
+		})
+		if err != nil {
+			writeStreamEvent(w, "error", map[string]string{"message": err.Error()})
+			flusher.Flush()
+			return
+		}
+		s.recordContextEvent(sessionID, core.EventQueueItemCreated, "queue:"+item.ID)
+		writeStreamEvent(w, "queued", map[string]any{"queueItem": item, "activeChatRun": activeRun})
+		flusher.Flush()
+		return
+	}
+
 	selection, err := s.resolveChatSelection(sessionID, input.RouteID, input.ModelID)
 	if err != nil {
 		writeError(w, err, http.StatusBadRequest)
@@ -1345,12 +1401,13 @@ func (s Server) streamSessionMessage(w http.ResponseWriter, r *http.Request, ses
 		flusher.Flush()
 	})
 	if err != nil {
-		s.recordContextEvent(sessionID, core.EventProviderRunCompleted, providerRunPayloadRef(selection, "error"))
+		reason := segmentEndReason(err)
+		s.recordContextEvent(sessionID, core.EventProviderRunCompleted, providerRunPayloadRef(selection, string(reason)))
 		s.completeProviderSegment(providerSegment.ID, core.ProviderSegmentFailed, "")
 		s.completeChatRun(chatRun.ID, core.ChatRunFailed, "")
-		payload := map[string]string{"message": err.Error()}
+		payload := map[string]string{"message": err.Error(), "reason": string(reason)}
 		writeStreamEvent(w, "error", payload)
-		s.recordMessageEvent(sessionID, assistantActivityIndex, "error", map[string]string{"text": err.Error(), "toolName": "chat"})
+		s.recordMessageEvent(sessionID, assistantActivityIndex, "error", map[string]string{"text": err.Error(), "toolName": "chat", "reason": string(reason)})
 		flusher.Flush()
 		_ = s.store.AddTokenUsage(sqlitecli.TokenUsageInput{
 			ProviderPluginID:  selection.Route.ProviderPluginID,
@@ -1398,6 +1455,25 @@ func (s Server) streamSessionMessage(w http.ResponseWriter, r *http.Request, ses
 	})
 	writeStreamEvent(w, "assistant_done", assistantMessage)
 	flusher.Flush()
+}
+
+func segmentEndReason(err error) core.SegmentEndReason {
+	var driverErr *provider.DriverError
+	if !errors.As(err, &driverErr) {
+		return core.ReasonError
+	}
+	switch driverErr.Kind {
+	case provider.ErrKindAuthFailure:
+		return core.ReasonAuthFailure
+	case provider.ErrKindRateLimit, provider.ErrKindTransient:
+		return core.ReasonTimeout
+	case provider.ErrKindSessionEnd:
+		return core.ReasonSessionEnd
+	case provider.ErrKindUnavailable, provider.ErrKindFatal:
+		return core.ReasonError
+	default:
+		return core.ReasonError
+	}
 }
 
 func streamTextChunks(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, text string) {
