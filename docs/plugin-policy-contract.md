@@ -672,6 +672,88 @@ ON chat_runs(session_id, branch_id, role, status);
 - Update `streamSessionMessage` to check active run before executing:
   normal → queue, steering → inject, no active run → execute immediately
 
+### Queue Concurrency Safety
+
+`maybeConsumeQueue` is called from concurrent goroutines (each completed run
+triggers it). The `GetActiveChatRun` check and `UpdateQueueItemStatus` call
+must be atomic or a race allows two goroutines to both consume items.
+
+`ConsumeNextQueueItem` merges both into a single SQL statement:
+
+```sql
+UPDATE chat_queue_items
+SET status = 'consumed'
+WHERE id = (
+  SELECT q.id FROM chat_queue_items q
+  WHERE q.session_id = ? AND q.status = 'pending'
+  AND NOT EXISTS (
+    SELECT 1 FROM chat_runs cr
+    WHERE cr.session_id = ? AND cr.status IN ('running', 'waiting_approval')
+  )
+  ORDER BY q.order_index ASC, q.created_at ASC, q.id ASC
+  LIMIT 1
+)
+RETURNING id;
+```
+
+If two goroutines race, only one will get a row back. The other receives
+`ErrNotFound` and exits cleanly.
+
+### Queue Item Mode Dispatch
+
+`maybeConsumeQueue` dispatches based on `item.Mode`:
+
+```text
+normal   → executeMainRun (default path)
+steering → cancelActiveRun(sessionID) + executeMainRun
+parallel → startParallelRunFromQueueItem (CandidateOutput, does not occupy main run slot)
+```
+
+### Steering Interrupt
+
+Steering delivery uses a per-session cancel registry on the server:
+
+```go
+type Server struct {
+    sessionCancelMu sync.Mutex
+    sessionCancels  map[string]context.CancelFunc
+}
+```
+
+`executeMainRun` registers a cancel func on entry and removes it on exit.
+`addSteeringToActiveRun` records the steering event in the graph and then calls
+`cancelActiveRun(sessionID)`. The running provider's context is cancelled, the
+segment ends with reason `steering`, and the next `executeMainRun` call builds a
+new ContextPacket that already includes the steering event from the graph.
+
+### ChatRun Cancellation
+
+```text
+DELETE /api/sessions/{sessionID}/run
+  → cancelActiveRun(sessionID)
+  → context cancelled → executeMainRun exits
+  → CompleteChatRun(ChatRunCancelled)
+  → maybeConsumeQueue (next item if any)
+```
+
+Cancellation does not roll back graph events already recorded. Delta events
+emitted before cancellation remain in the graph.
+
+### Budget Warning Threshold
+
+`OnBudgetWarning` is called in `prepareMainRun` and
+`prepareMainRunForExistingChatRun` after the ContextPacket is built:
+
+```go
+const budgetWarnRatio = 0.80
+
+if float64(len(packet.Content)) > budgetWarnRatio*float64(contextBudget) {
+    s.moderator.OnBudgetWarning(core.ModerationContext{})
+}
+```
+
+If `contextBudget` is 0 (route has no budget limit), the check is skipped.
+
 ## executeMainRun Refactoring
 
 `streamSessionMessage` currently mixes HTTP parsing, route resolution, context

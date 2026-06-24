@@ -67,6 +67,7 @@ const state = {
   runningSessionId: "",
   chatQueue: [],
   queueDragId: "",
+  plugins: null as null | { policies: { contextPackets: string[]; handoffs: string[]; routeSelection: string[]; toolApproval: { name: string; label: string }[]; kbScope: { name: string; label: string }[] } },
   searchTimer: null,
   showAllSessions: false,
 };
@@ -267,6 +268,7 @@ const els = {
   composer: q("#composer"),
   input: q("#message-input"),
   sendButton: q("#send-message"),
+  stopButton: q("#stop-run"),
   modelPicker: q("#model-picker"),
   modelPickerLabel: q("#model-picker-label"),
   modelMenu: q("#model-menu"),
@@ -319,7 +321,11 @@ async function request(path, options = {}) {
 async function loadState() {
   loadThinkingEffort();
   const projectQuery = state.selectedProjectId ? `?projectId=${encodeURIComponent(state.selectedProjectId)}` : "";
-  const data = await request(`/api/state${projectQuery}`);
+  const [data, pluginsData] = await Promise.all([
+    request(`/api/state${projectQuery}`),
+    state.plugins ? Promise.resolve(null) : request("/api/plugins").catch(() => null),
+  ]);
+  if (pluginsData) state.plugins = pluginsData;
   state.sessions = data.sessions || [];
   state.projects = data.projects || [];
   state.routes = data.routes || [];
@@ -343,6 +349,7 @@ async function loadState() {
   renderProjects();
   renderSessions();
   renderProjectRoutes();
+  renderProjectSettings();
   renderRoutePicker();
   renderModelPicker();
   renderNavUsage();
@@ -502,6 +509,57 @@ async function renameProject() {
   renderProjectName();
   renderProjects();
   els.projectMenu.hidden = true;
+}
+
+async function updateProjectSettings(patch: Record<string, string>) {
+  if (!state.project) return;
+  const data = await request(`/api/projects/${encodeURIComponent(state.project.ID)}/settings`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+  state.project = data.project;
+  state.projects = state.projects.map((p) => p.ID === data.project.ID ? data.project : p);
+  renderProjectSettings();
+}
+
+function renderProjectSettings() {
+  const panel = document.getElementById("project-settings-panel");
+  if (!panel || !state.project) return;
+  const policies = state.plugins?.policies;
+  if (!policies) return;
+
+  function policySelect(id: string, label: string, options: { name: string; label: string }[] | string[], currentValue: string, field: string) {
+    const normalizedOptions: { name: string; label: string }[] = options.map((o) =>
+      typeof o === "string" ? { name: o, label: o } : o
+    );
+    const sel = document.createElement("select");
+    sel.id = id;
+    sel.className = "policy-select";
+    for (const opt of normalizedOptions) {
+      const el = document.createElement("option");
+      el.value = opt.name;
+      el.textContent = opt.label;
+      el.selected = opt.name === currentValue;
+      sel.append(el);
+    }
+    sel.addEventListener("change", () => updateProjectSettings({ [field]: sel.value }));
+    const lbl = document.createElement("label");
+    lbl.htmlFor = id;
+    lbl.className = "policy-label";
+    lbl.textContent = label;
+    const row = document.createElement("div");
+    row.className = "policy-row";
+    row.append(lbl, sel);
+    return row;
+  }
+
+  panel.replaceChildren(
+    policySelect("policy-context", "Context", policies.contextPackets, state.project.ContextPolicy || "flat-trim", "contextPolicy"),
+    policySelect("policy-handoff", "Handoff", policies.handoffs, state.project.HandoffPolicy || "route-change", "handoffPolicy"),
+    policySelect("policy-route", "Route Selection", policies.routeSelection, state.project.RoutePolicy || "manual", "routePolicy"),
+    policySelect("policy-tool-approval", "Tool Approval", policies.toolApproval, state.project.ToolApprovalPolicy || "safe-only", "toolApprovalPolicy"),
+    policySelect("policy-kb-scope", "KB Scope", policies.kbScope, state.project.KbScopePolicy || "project-only", "kbScopePolicy"),
+  );
 }
 
 async function deleteCurrentProject() {
@@ -868,6 +926,14 @@ function setComposerBusy(busy) {
   }
   els.input.disabled = false;
   els.sendButton.disabled = !selectedModelOption();
+  els.sendButton.hidden = busy;
+  els.stopButton.hidden = !busy;
+}
+
+async function cancelActiveRun() {
+  const sessionId = state.runningSessionId || state.selectedSessionId;
+  if (!sessionId) return;
+  await request(`/api/sessions/${encodeURIComponent(sessionId)}/run`, { method: "DELETE" }).catch(() => {});
 }
 
 function renderChatQueue() {
@@ -3556,6 +3622,7 @@ els.fileRecent.addEventListener("change", () => {
   if (els.fileRecent.value) openFilePath(els.fileRecent.value);
 });
 els.fileReload.addEventListener("click", reloadActiveFile);
+els.stopButton.addEventListener("click", cancelActiveRun);
 switchWorkspaceTab(state.activeWorkspaceTab);
 renderTerminalPanel();
 renderFilePanel();
