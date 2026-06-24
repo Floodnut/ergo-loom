@@ -151,9 +151,21 @@ func systemLines(ctx core.PacketBuildContext) []string {
 		"You are Ergo Loom, a local AI work context manager.",
 		"Use Ergo Loom's local context as the authoritative conversation state.",
 		"Provider-owned CLI, app, browser, or remote sessions are execution channels and may be stale or unavailable.",
+		"",
+		"Ergo Loom concepts:",
+		"- Project: local path boundary with policy settings (context, handoff, route, tool approval, KB scope).",
+		"- Session: a conversation thread under a project.",
+		"- ChatRun: one execution turn; a session can have many ChatRuns across providers.",
+		"- ProviderSegment: one provider connection within a ChatRun. After failover or handoff a new segment starts.",
+		"- Moderator: reacts when a segment ends (token exhaustion, error). Decides to continue, handoff, or terminate. Does not select routes.",
+		"- RouteSelectionPolicy: selects which provider route to use next.",
+		"- ContextPacket: the bounded, local-first context snapshot sent to the provider each turn.",
+		"- Queue: pending user messages waiting for the active ChatRun to finish.",
+		"- Candidate Output: result from a parallel run, waiting to be accepted or rejected by the user.",
+		"- Steering: a mid-run user message that interrupts the current provider and redirects the response.",
 	}
 	if ctx.RouteLabel != "" {
-		lines = append(lines, "Selected route: "+ctx.RouteLabel+".")
+		lines = append(lines, "", "Current route: "+ctx.RouteLabel+".")
 	}
 	if strings.TrimSpace(ctx.Note) != "" {
 		lines = append(lines, "Context note: "+strings.TrimSpace(ctx.Note))

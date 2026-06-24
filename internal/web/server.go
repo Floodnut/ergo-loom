@@ -46,6 +46,8 @@ type Server struct {
 	moderator          core.Moderator
 	sessionCancelMu    sync.Mutex
 	sessionCancels     map[string]context.CancelFunc
+	sessionExcludedMu  sync.Mutex
+	sessionExcluded    map[string]map[string]bool // sessionID → set of excluded routeIDs
 }
 
 const providerSoftTokenCap = 50000
@@ -173,7 +175,8 @@ func NewServer(store sqlitecli.Store) Server {
 		routePolicies:   routepolicy.NewRegistry(),
 		knowledge:       knowledge.NewKeywordRetriever(store),
 		moderator:       core.DefaultModerator{},
-		sessionCancels: make(map[string]context.CancelFunc),
+		sessionCancels:  make(map[string]context.CancelFunc),
+		sessionExcluded: make(map[string]map[string]bool),
 		toolApprovalPolicy: []PolicyEntry{
 			{Name: "safe-only", Label: "Safe Only"},
 			{Name: "ask-per-command", Label: "Ask Per Command"},
@@ -1504,6 +1507,28 @@ func (s *Server) cancelActiveRun(sessionID string) {
 	}
 }
 
+func (s *Server) addSessionExcludedRoute(sessionID, routeID string) {
+	if sessionID == "" || routeID == "" {
+		return
+	}
+	s.sessionExcludedMu.Lock()
+	defer s.sessionExcludedMu.Unlock()
+	if s.sessionExcluded[sessionID] == nil {
+		s.sessionExcluded[sessionID] = make(map[string]bool)
+	}
+	s.sessionExcluded[sessionID][routeID] = true
+}
+
+func (s *Server) sessionExcludedRoutes(sessionID string) map[string]bool {
+	s.sessionExcludedMu.Lock()
+	defer s.sessionExcludedMu.Unlock()
+	result := make(map[string]bool)
+	for k, v := range s.sessionExcluded[sessionID] {
+		result[k] = v
+	}
+	return result
+}
+
 func (s *Server) executeMainRun(ctx context.Context, req RunRequest, onEvent func(kind string, payload any)) error {
 	if onEvent == nil {
 		onEvent = func(string, any) {}
@@ -1578,6 +1603,7 @@ func (s *Server) executeMainRun(ctx context.Context, req RunRequest, onEvent fun
 		s.recordTokenUsage(sessionID, selection, assistantInput, "", "error")
 		decision := s.moderationDecision(sessionID, providerSegment, reason)
 		if decision.Action == core.ActionFailover {
+			s.addSessionExcludedRoute(sessionID, selection.Route.ID)
 			nextSelection, failoverErr := s.resolveChatSelectionExcluding(sessionID, selection.Route.ID)
 			if failoverErr == nil {
 				selection = nextSelection
@@ -2131,7 +2157,7 @@ func (s Server) runAssistant(ctx context.Context, sessionID string, content stri
 	return response.Text, response.Streamed, err
 }
 
-func (s Server) moderatedSelectionForActiveChat(sessionID string, selection chatSelection) (chatSelection, *moderatorHandoff, error) {
+func (s *Server) moderatedSelectionForActiveChat(sessionID string, selection chatSelection) (chatSelection, *moderatorHandoff, error) {
 	expiredGroup := providerGroupID(selection.Route.ProviderPluginID)
 	expired, used, err := s.providerGroupSoftExpired(expiredGroup)
 	if err != nil {
@@ -2141,6 +2167,7 @@ func (s Server) moderatedSelectionForActiveChat(sessionID string, selection chat
 		return selection, nil, nil
 	}
 
+	s.addSessionExcludedRoute(sessionID, selection.Route.ID)
 	next, err := s.moderatorFallbackSelection(sessionID, expiredGroup)
 	if err != nil {
 		return selection, nil, fmt.Errorf("%s token quota is exhausted and no moderator fallback provider is available: %w", providerGroupLabel(expiredGroup), err)
@@ -2475,7 +2502,7 @@ func (s Server) resolveChatSelection(sessionID string, routeID string, modelID s
 	return s.resolveChatSelectionWithExclusions(sessionID, routeID, modelID, nil)
 }
 
-func (s Server) resolveChatSelectionExcluding(sessionID string, excludeRouteID string) (chatSelection, error) {
+func (s *Server) resolveChatSelectionExcluding(sessionID string, excludeRouteID string) (chatSelection, error) {
 	excluded := map[string]bool{}
 	if strings.TrimSpace(excludeRouteID) != "" {
 		excluded[strings.TrimSpace(excludeRouteID)] = true
@@ -2483,9 +2510,12 @@ func (s Server) resolveChatSelectionExcluding(sessionID string, excludeRouteID s
 	return s.resolveChatSelectionWithExclusions(sessionID, "", "", excluded)
 }
 
-func (s Server) resolveChatSelectionWithExclusions(sessionID string, routeID string, modelID string, excludedRouteIDs map[string]bool) (chatSelection, error) {
+func (s *Server) resolveChatSelectionWithExclusions(sessionID string, routeID string, modelID string, excludedRouteIDs map[string]bool) (chatSelection, error) {
 	routeID = strings.TrimSpace(routeID)
 	modelID = strings.TrimSpace(modelID)
+	for k, v := range s.sessionExcludedRoutes(sessionID) {
+		excludedRouteIDs[k] = v
+	}
 
 	project, err := s.store.DefaultProject()
 	if err != nil {
