@@ -1648,50 +1648,85 @@ func (s Server) buildContextPacket(sessionID string, latestUserInput string, sel
 		UserInput: latestUserInput,
 		CreatedAt: now,
 	}
-	if head, err := s.store.GetHead(session.ProjectID, session.ID, "main"); err == nil {
+
+	// Build message lookup for content retrieval via event PayloadRef.
+	msgByID := make(map[string]core.Message, len(messages))
+	for _, m := range messages {
+		msgByID[m.ID] = m
+	}
+
+	// Use event graph ancestry to determine message order and selection.
+	// Falls back to flat message list if head or ancestors are unavailable.
+	latest := strings.TrimSpace(latestUserInput)
+	contextLines := make([]string, 0, len(messages))
+
+	head, headErr := s.store.GetHead(session.ProjectID, session.ID, "main")
+	if headErr == nil {
 		packet.HeadEventID = head.EventID
 		packet.References = append(packet.References, core.ContextReference{
 			Kind: "head",
 			ID:   head.EventID,
 			Ref:  "context_heads/main",
 		})
-		if events, err := s.store.ListAncestors(head.EventID, 20); err == nil {
-			for _, event := range events {
+		if ancestors, err := s.store.ListAncestors(head.EventID, 200); err == nil {
+			for _, event := range ancestors {
 				packet.References = append(packet.References, core.ContextReference{
 					Kind: string(event.Type),
 					ID:   event.ID,
 					Ref:  event.PayloadRef,
 				})
+				if event.Type != core.EventMessageUser && event.Type != core.EventMessageAssistant {
+					continue
+				}
+				messageID := strings.TrimPrefix(event.PayloadRef, "message:")
+				msg, ok := msgByID[messageID]
+				if !ok {
+					continue
+				}
+				content := strings.TrimSpace(msg.Content)
+				if content == "" || (msg.Role == "user" && content == latest) {
+					continue
+				}
+				contextLines = append(contextLines, fmt.Sprintf("%s: %s", msg.Role, content))
 			}
+		}
+	} else {
+		// Fallback: flat message list in DB order.
+		for i, msg := range messages {
+			content := strings.TrimSpace(msg.Content)
+			if content == "" {
+				continue
+			}
+			if i == len(messages)-1 && msg.Role == "user" && content == latest {
+				continue
+			}
+			contextLines = append(contextLines, fmt.Sprintf("%s: %s", msg.Role, content))
 		}
 	}
 
-	lines := []string{
+	// Section: system header (always included in full).
+	systemLines := []string{
 		"You are Ergo Loom, a local AI work context manager.",
 		"Use Ergo Loom's local context as the authoritative conversation state.",
 		"Provider-owned CLI, app, browser, or remote sessions are execution channels and may be stale or unavailable.",
 		fmt.Sprintf("Selected route: %s / %s.", selection.Route.DisplayName, selection.Model.DisplayName),
 	}
 	if strings.TrimSpace(note) != "" {
-		lines = append(lines, "Context note: "+strings.TrimSpace(note))
+		systemLines = append(systemLines, "Context note: "+strings.TrimSpace(note))
 	}
-	lines = append(lines, "", "Conversation context:")
 
-	latest := strings.TrimSpace(latestUserInput)
-	contextLines := make([]string, 0, len(messages))
-	for i, message := range messages {
-		content := strings.TrimSpace(message.Content)
-		if content == "" {
-			continue
-		}
-		if i == len(messages)-1 && message.Role == "user" && content == latest {
-			continue
-		}
-		contextLines = append(contextLines, fmt.Sprintf("%s: %s", message.Role, content))
-	}
-	lines = append(lines, trimContextLines(contextLines, maxContextPacketChars/2)...)
-	lines = append(lines, "", "Latest user message:", latestUserInput)
-	packet.Content = trimContextPacket(strings.Join(lines, "\n"), maxContextPacketChars)
+	// Future sections slot in here: [kb], [summaries], [tool_snap].
+
+	// Section: messages (budget = half of total, newest messages kept first).
+	messageBudget := maxContextPacketChars / 2
+	selectedMessages := trimContextLines(contextLines, messageBudget)
+
+	// Section: latest user input (always included in full).
+	assembled := append(systemLines, "", "Conversation context:")
+	assembled = append(assembled, selectedMessages...)
+	assembled = append(assembled, "", "Latest user message:", latestUserInput)
+
+	packet.Content = trimContextPacket(strings.Join(assembled, "\n"), maxContextPacketChars)
 	return packet
 }
 
