@@ -1638,6 +1638,7 @@ func (s *Server) executeMainRun(ctx context.Context, req RunRequest, onEvent fun
 	defer func() {
 		cancel()
 		s.unregisterSessionCancel(sessionID)
+		s.maybeConsumeQueue(sessionID)
 	}()
 
 	userMessage, err := s.store.AddMessage(sessionID, "user", content)
@@ -1748,7 +1749,6 @@ func (s *Server) executeMainRun(ctx context.Context, req RunRequest, onEvent fun
 	s.recordTokenUsage(sessionID, selection, assistantInput, assistantContent, "success")
 	onEvent("assistant_done", assistantMessage)
 	onEvent("run_completed", map[string]any{"sessionId": sessionID, "chatRunId": chatRun.ID})
-	s.maybeConsumeQueue(sessionID)
 	return nil
 }
 
