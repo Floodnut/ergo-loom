@@ -1858,6 +1858,7 @@ func (s *Server) maybeConsumeQueue(sessionID string) {
 		s.cancelActiveRun(sessionID)
 		req, err := s.runRequestFromQueueItem(item)
 		if err != nil {
+			go s.maybeConsumeQueue(sessionID)
 			return
 		}
 		go func() {
@@ -1866,6 +1867,7 @@ func (s *Server) maybeConsumeQueue(sessionID string) {
 	default:
 		req, err := s.runRequestFromQueueItem(item)
 		if err != nil {
+			go s.maybeConsumeQueue(sessionID)
 			return
 		}
 		go func() {
@@ -2674,6 +2676,13 @@ func (s *Server) resolveChatSelectionWithExclusions(sessionID string, routeID st
 	}
 	if selectedRouteID == "" {
 		return chatSelection{}, errors.New("chat route is required")
+	}
+	// If the policy selected an excluded route (e.g. a queue item was created
+	// with a route that was later exhausted), fall back to the first available
+	// candidate so the queue can keep draining on a different provider.
+	if excludedRouteIDs[selectedRouteID] && len(candidates) > 0 {
+		selectedRouteID = candidates[0].RouteID
+		selectedModelID = candidates[0].ModelID
 	}
 	routeID = selectedRouteID
 	if selectedModelID != "" {
