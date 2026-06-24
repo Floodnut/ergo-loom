@@ -172,6 +172,8 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/sessions/", s.deleteSession)
 	mux.HandleFunc("POST /api/sessions/", s.sessionMessage)
 	mux.HandleFunc("POST /api/sessions", s.createSession)
+	mux.HandleFunc("GET /api/knowledge", s.listKnowledge)
+	mux.HandleFunc("POST /api/knowledge", s.addKnowledge)
 	mux.HandleFunc("POST /api/files/read", s.readFile)
 	mux.HandleFunc("POST /api/terminal/run", s.runTerminalCommand)
 	mux.HandleFunc("POST /api/tool-approvals/", s.resolveToolApproval)
@@ -443,6 +445,45 @@ func (s Server) recordSteering(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"steering": record, "chatRun": run, "providerSegment": segment})
+}
+
+func (s Server) listKnowledge(w http.ResponseWriter, r *http.Request) {
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	scope := core.KnowledgeScope(strings.TrimSpace(r.URL.Query().Get("scope")))
+	items, err := s.store.SearchKnowledge(sqlitecli.KnowledgeSearchOptions{
+		Query: q,
+		Scope: scope,
+		Limit: 20,
+	})
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"items": items})
+}
+
+func (s Server) addKnowledge(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Scope     string `json:"scope"`
+		Kind      string `json:"kind"`
+		Title     string `json:"title"`
+		ProjectID string `json:"projectId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	item, err := s.store.AddKnowledgeItem(core.KnowledgeItem{
+		Scope:     core.KnowledgeScope(strings.TrimSpace(input.Scope)),
+		Kind:      strings.TrimSpace(input.Kind),
+		Title:     strings.TrimSpace(input.Title),
+		ProjectID: strings.TrimSpace(input.ProjectID),
+	})
+	if err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"item": item})
 }
 
 func (s Server) startParallelRun(w http.ResponseWriter, r *http.Request) {
@@ -1715,14 +1756,37 @@ func (s Server) buildContextPacket(sessionID string, latestUserInput string, sel
 		systemLines = append(systemLines, "Context note: "+strings.TrimSpace(note))
 	}
 
-	// Future sections slot in here: [kb], [summaries], [tool_snap].
+	// Section: kb — relevant knowledge items via FTS on the user's input.
+	var kbLines []string
+	if strings.TrimSpace(latestUserInput) != "" {
+		if kbItems, err := s.store.SearchKnowledge(sqlitecli.KnowledgeSearchOptions{
+			Query: latestUserInput,
+			Limit: 3,
+		}); err == nil && len(kbItems) > 0 {
+			kbLines = append(kbLines, "Relevant knowledge:")
+			for _, item := range kbItems {
+				kbLines = append(kbLines, fmt.Sprintf("- [%s] %s", item.Kind, item.Title))
+				packet.References = append(packet.References, core.ContextReference{
+					Kind: "knowledge",
+					ID:   item.ID,
+					Ref:  item.ContentRef,
+				})
+			}
+		}
+	}
+	// Future sections slot in here: [summaries], [tool_snap].
 
 	// Section: messages (budget = half of total, newest messages kept first).
 	messageBudget := maxContextPacketChars / 2
 	selectedMessages := trimContextLines(contextLines, messageBudget)
 
 	// Section: latest user input (always included in full).
-	assembled := append(systemLines, "", "Conversation context:")
+	assembled := append(systemLines, "")
+	assembled = append(assembled, kbLines...)
+	if len(kbLines) > 0 {
+		assembled = append(assembled, "")
+	}
+	assembled = append(assembled, "Conversation context:")
 	assembled = append(assembled, selectedMessages...)
 	assembled = append(assembled, "", "Latest user message:", latestUserInput)
 
