@@ -44,6 +44,8 @@ type Server struct {
 	kbScopePolicy      []PolicyEntry
 	knowledge          core.KnowledgeRetriever
 	moderator          core.Moderator
+	sessionCancelMu    sync.Mutex
+	sessionCancels     map[string]context.CancelFunc
 }
 
 const providerSoftTokenCap = 50000
@@ -171,6 +173,7 @@ func NewServer(store sqlitecli.Store) Server {
 		routePolicies:   routepolicy.NewRegistry(),
 		knowledge:       knowledge.NewKeywordRetriever(store),
 		moderator:       core.DefaultModerator{},
+		sessionCancels: make(map[string]context.CancelFunc),
 		toolApprovalPolicy: []PolicyEntry{
 			{Name: "safe-only", Label: "Safe Only"},
 			{Name: "ask-per-command", Label: "Ask Per Command"},
@@ -211,6 +214,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/sessions/{sessionID}/queue", s.sessionQueue)
 	mux.HandleFunc("PATCH /api/sessions/{sessionID}/queue", s.sessionQueue)
 	mux.HandleFunc("POST /api/sessions/{sessionID}/parallel", s.startParallelRun)
+	mux.HandleFunc("DELETE /api/sessions/{sessionID}/run", s.cancelSessionRun)
 	mux.HandleFunc("PATCH /api/candidates/{candidateID}", s.updateCandidateOutput)
 	mux.HandleFunc("GET /api/sessions/", s.session)
 	mux.HandleFunc("PATCH /api/sessions/", s.renameSession)
@@ -634,7 +638,17 @@ func (s Server) recordSteering(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"steering": record, "chatRun": run, "providerSegment": segment})
 }
 
-func (s Server) addSteeringToActiveRun(sessionID string, content string) (sqlitecli.SteeringRecord, core.ChatRun, core.ProviderSegment, error) {
+func (s *Server) cancelSessionRun(w http.ResponseWriter, r *http.Request) {
+	sessionID := strings.TrimSpace(r.PathValue("sessionID"))
+	if sessionID == "" {
+		writeError(w, errors.New("session id is required"), http.StatusBadRequest)
+		return
+	}
+	s.cancelActiveRun(sessionID)
+	writeJSON(w, map[string]any{"cancelled": true})
+}
+
+func (s *Server) addSteeringToActiveRun(sessionID string, content string) (sqlitecli.SteeringRecord, core.ChatRun, core.ProviderSegment, error) {
 	run, err := s.store.GetActiveChatRun(sessionID)
 	if err != nil {
 		return sqlitecli.SteeringRecord{}, core.ChatRun{}, core.ProviderSegment{}, err
@@ -654,6 +668,7 @@ func (s Server) addSteeringToActiveRun(sessionID string, content string) (sqlite
 	if err != nil {
 		return sqlitecli.SteeringRecord{}, core.ChatRun{}, core.ProviderSegment{}, err
 	}
+	s.cancelActiveRun(sessionID)
 	return record, run, segment, nil
 }
 
@@ -1466,7 +1481,30 @@ func (s Server) streamSessionMessage(w http.ResponseWriter, r *http.Request, ses
 	})
 }
 
-func (s Server) executeMainRun(ctx context.Context, req RunRequest, onEvent func(kind string, payload any)) error {
+func (s *Server) registerSessionCancel(sessionID string, cancel context.CancelFunc) {
+	s.sessionCancelMu.Lock()
+	defer s.sessionCancelMu.Unlock()
+	if prev, ok := s.sessionCancels[sessionID]; ok {
+		prev()
+	}
+	s.sessionCancels[sessionID] = cancel
+}
+
+func (s *Server) unregisterSessionCancel(sessionID string) {
+	s.sessionCancelMu.Lock()
+	defer s.sessionCancelMu.Unlock()
+	delete(s.sessionCancels, sessionID)
+}
+
+func (s *Server) cancelActiveRun(sessionID string) {
+	s.sessionCancelMu.Lock()
+	defer s.sessionCancelMu.Unlock()
+	if cancel, ok := s.sessionCancels[sessionID]; ok {
+		cancel()
+	}
+}
+
+func (s *Server) executeMainRun(ctx context.Context, req RunRequest, onEvent func(kind string, payload any)) error {
 	if onEvent == nil {
 		onEvent = func(string, any) {}
 	}
@@ -1478,6 +1516,13 @@ func (s Server) executeMainRun(ctx context.Context, req RunRequest, onEvent func
 	if content == "" {
 		return errors.New("message content is required")
 	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	s.registerSessionCancel(sessionID, cancel)
+	defer func() {
+		cancel()
+		s.unregisterSessionCancel(sessionID)
+	}()
 
 	userMessage, err := s.store.AddMessage(sessionID, "user", content)
 	if err != nil {
@@ -1589,6 +1634,8 @@ func (s Server) executeMainRun(ctx context.Context, req RunRequest, onEvent func
 	return nil
 }
 
+const budgetWarnRatio = 0.80
+
 func (s Server) prepareMainRun(sessionID string, content string, selection chatSelection, contextNote string, activityIndex int, onEvent func(string, any)) (core.ChatRun, core.ProviderSegment, string, error) {
 	s.maybeGenerateHandoffSummary(sessionID, selection)
 	contextPacket := s.buildContextPacket(sessionID, content, selection, contextNote)
@@ -1597,6 +1644,7 @@ func (s Server) prepareMainRun(sessionID string, content string, selection chatS
 		onEvent("assistant_status", payload)
 		s.recordMessageEvent(sessionID, activityIndex, "status", payload)
 	}
+	s.maybeWarnBudget(sessionID, contextPacket, selection)
 	assistantInput := contextPacket.Content
 	packetPayload := map[string]string{"text": "Prepared Ergo Loom local context packet"}
 	onEvent("assistant_status", packetPayload)
@@ -1615,9 +1663,20 @@ func (s Server) prepareMainRunForExistingChatRun(chatRun core.ChatRun, sessionID
 		onEvent("assistant_status", payload)
 		s.recordMessageEvent(sessionID, activityIndex, "status", payload)
 	}
+	s.maybeWarnBudget(sessionID, contextPacket, selection)
 	providerSegment := s.startProviderSegment(chatRun.ID, selection, contextNote)
 	s.recordContextEvent(sessionID, core.EventProviderRunStarted, providerRunPayloadRef(selection, "started"))
 	return providerSegment, contextPacket.Content, nil
+}
+
+func (s Server) maybeWarnBudget(sessionID string, packet core.ContextPacket, selection chatSelection) {
+	budget := selection.Route.ContextBudgetChars
+	if budget <= 0 {
+		return
+	}
+	if float64(len(packet.Content)) > budgetWarnRatio*float64(budget) {
+		s.moderator.OnBudgetWarning(core.ModerationContext{})
+	}
 }
 
 func segmentEndReason(err error) core.SegmentEndReason {
@@ -1659,31 +1718,99 @@ func (s Server) moderationDecision(sessionID string, segment core.ProviderSegmen
 	})
 }
 
-func (s Server) maybeConsumeQueue(sessionID string) {
+func (s *Server) maybeConsumeQueue(sessionID string) {
 	if strings.TrimSpace(sessionID) == "" {
 		return
 	}
-	if _, err := s.store.GetActiveChatRun(sessionID); err == nil {
-		return
-	}
-	items, err := s.store.ListPendingQueueItems(sessionID)
-	if err != nil || len(items) == 0 {
-		return
-	}
-	item := items[0]
-	if _, err := s.store.UpdateQueueItemStatus(item.ID, core.QueueItemConsumed); err != nil {
-		return
-	}
-	req, err := s.runRequestFromQueueItem(item)
+	item, err := s.store.ConsumeNextQueueItem(sessionID)
 	if err != nil {
 		return
 	}
-	go func() {
-		_ = s.executeMainRun(context.Background(), req, func(string, any) {})
-	}()
+	switch item.Mode {
+	case core.QueueItemParallel:
+		go func() {
+			_ = s.startParallelRunFromQueueItem(item)
+		}()
+	case core.QueueItemSteering:
+		s.cancelActiveRun(sessionID)
+		req, err := s.runRequestFromQueueItem(item)
+		if err != nil {
+			return
+		}
+		go func() {
+			_ = s.executeMainRun(context.Background(), req, func(string, any) {})
+		}()
+	default:
+		req, err := s.runRequestFromQueueItem(item)
+		if err != nil {
+			return
+		}
+		go func() {
+			_ = s.executeMainRun(context.Background(), req, func(string, any) {})
+		}()
+	}
 }
 
-func (s Server) runRequestFromQueueItem(item core.QueueItem) (RunRequest, error) {
+func (s *Server) startParallelRunFromQueueItem(item core.QueueItem) error {
+	session, _, err := s.store.GetSession(item.SessionID)
+	if err != nil {
+		return err
+	}
+	selection, err := s.resolveChatSelection(item.SessionID, item.RouteID, item.ModelID)
+	if err != nil {
+		return err
+	}
+	packet := s.buildContextPacket(item.SessionID, item.Content, selection, "parallel run")
+	if _, err := s.store.SaveContextPacket(packet); err != nil {
+		return err
+	}
+	triggerEventID := s.latestUserTriggerEventID(item.SessionID)
+	run, err := s.store.StartChatRun(sqlitecli.ChatRunInput{
+		ProjectID:       session.ProjectID,
+		SessionID:       item.SessionID,
+		BranchID:        item.BranchID,
+		Role:            core.ChatRunRoleParallel,
+		Status:          core.ChatRunRunning,
+		InputEventID:    triggerEventID,
+		ContextPacketID: packet.ID,
+	})
+	if err != nil {
+		return err
+	}
+	candidate, err := s.store.AddCandidateOutput(sqlitecli.CandidateOutputInput{
+		ChatRunID:      run.ID,
+		SessionID:      item.SessionID,
+		BranchID:       item.BranchID,
+		TriggerEventID: triggerEventID,
+		Content:        "",
+		Status:         core.CandidateOutputPending,
+	})
+	if err != nil {
+		return err
+	}
+	thinkingEffort := strings.TrimSpace(item.ThinkingEffort)
+	go func() {
+		seg := s.startProviderSegment(run.ID, selection, "")
+		text, _, runErr := s.runAssistant(context.Background(), item.SessionID, item.Content, thinkingEffort, selection, func(provider.Event) {})
+		segStatus := core.ProviderSegmentCompleted
+		candidateStatus := core.CandidateOutputReady
+		if runErr != nil {
+			segStatus = core.ProviderSegmentFailed
+			candidateStatus = core.CandidateOutputFailed
+			text = runErr.Error()
+		}
+		s.completeProviderSegment(seg.ID, segStatus, "")
+		s.store.UpdateCandidateOutput(candidate.ID, text, candidateStatus)
+		runStatus := core.ChatRunCompleted
+		if runErr != nil {
+			runStatus = core.ChatRunFailed
+		}
+		s.store.CompleteChatRun(run.ID, runStatus, "")
+	}()
+	return nil
+}
+
+func (s *Server) runRequestFromQueueItem(item core.QueueItem) (RunRequest, error) {
 	selection, err := s.resolveChatSelection(item.SessionID, item.RouteID, item.ModelID)
 	if err != nil {
 		return RunRequest{}, err

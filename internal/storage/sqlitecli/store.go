@@ -1502,6 +1502,51 @@ WHERE id = %s;
 	return rows[0].toCore()
 }
 
+// ConsumeNextQueueItem atomically marks the next pending queue item as consumed,
+// but only when no active chat run exists for the session. Returns ErrNotFound
+// if there is nothing to consume or an active run is present.
+func (s Store) ConsumeNextQueueItem(sessionID string) (core.QueueItem, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return core.QueueItem{}, errors.New("session id is required")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	stmt := fmt.Sprintf(`
+UPDATE chat_queue_items
+SET status = %s, updated_at = %s
+WHERE id = (
+  SELECT q.id FROM chat_queue_items q
+  WHERE q.session_id = %s AND q.status = %s
+  AND NOT EXISTS (
+    SELECT 1 FROM chat_runs cr
+    WHERE cr.session_id = %s AND cr.status IN (%s, %s)
+  )
+  ORDER BY q.order_index ASC, q.created_at ASC, q.id ASC
+  LIMIT 1
+)
+RETURNING id;
+`,
+		quote(string(core.QueueItemConsumed)), quote(now),
+		quote(sessionID), quote(string(core.QueueItemPending)),
+		quote(sessionID),
+		quote(string(core.ChatRunRunning)), quote(string(core.ChatRunWaitingApproval)),
+	)
+	out, err := s.queryJSON(stmt)
+	if err != nil {
+		return core.QueueItem{}, err
+	}
+	var rows []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return core.QueueItem{}, err
+	}
+	if len(rows) == 0 {
+		return core.QueueItem{}, ErrNotFound
+	}
+	return s.getQueueItem(rows[0].ID)
+}
+
 func (s Store) AddCandidateOutput(input CandidateOutputInput) (core.CandidateOutput, error) {
 	input.ChatRunID = strings.TrimSpace(input.ChatRunID)
 	input.SessionID = strings.TrimSpace(input.SessionID)
