@@ -79,6 +79,67 @@ It must not:
 - execute tools
 - decide provider routing
 
+Knowledge lookup is injected through `PacketBuildContext.RetrieveKnowledge`.
+Context packet policies must not know whether knowledge came from keyword search,
+vector search, or a hybrid retriever.
+
+```go
+type PacketBuildContext struct {
+    // ...
+    LoadSummary       func(id string) (SummaryPayload, error)
+    RetrieveKnowledge func(text string) ([]KnowledgeItem, error)
+}
+```
+
+## Knowledge Boundary
+
+Ergo Loom always owns knowledge source of truth:
+
+- `KnowledgeItem` metadata
+- `scope`, `projectID`, `kind`, and provenance such as `source_event_id`
+- original content object referenced by `content_ref`
+- promotion decisions
+
+External systems may own derived indexes:
+
+- embedding vectors
+- semantic ranking
+- chunk/vector index layout
+- vector cache lifecycle
+
+Vectors are cache, not source of truth. A vector store may return IDs, but Ergo
+Loom must load the canonical `KnowledgeItem` from local storage before including
+it in a context packet.
+
+```go
+type KnowledgeQuery struct {
+    SessionID string
+    ProjectID string
+    Scope     KnowledgeScope
+    Text      string
+    Limit     int
+}
+
+type KnowledgeRetriever interface {
+    Search(ctx context.Context, q KnowledgeQuery) ([]KnowledgeItem, error)
+}
+
+type VectorStore interface {
+    Upsert(ctx context.Context, id string, vector []float32, metadata map[string]string) error
+    Search(ctx context.Context, vector []float32, limit int) ([]string, error)
+    Delete(ctx context.Context, id string) error
+}
+```
+
+The default retriever is keyword search backed by local SQLite. Future vector or
+hybrid retrievers must preserve the same ownership boundary.
+
+Knowledge promotion is explicit or policy-driven:
+
+- explicit user action can create `knowledge.promoted`
+- a future policy may recommend promotion from repeated summaries or stable facts
+- raw transcript dumping is not knowledge promotion
+
 ## HandoffPolicy
 
 Responsibility:
@@ -184,6 +245,60 @@ type Moderator interface {
 
 Route/model hints are intentionally absent. If future requirements need them,
 add optional soft hints that `RouteSelectionPolicy` may ignore.
+
+### Server Failover Flow
+
+When `OnSegmentEnd` returns `ActionFailover`, the server executes this sequence:
+
+```text
+ActionFailover
+    ↓
+completeProviderSegment(failed, status=failed)
+    ↓
+resolveChatSelectionExcluding(sessionID, failedRouteID)
+    → builds RouteCandidate list with failed route removed
+    → calls RouteSelectionPolicy.Select()
+    → if no candidates remain → treat as ActionSuspend
+    ↓
+maybeGenerateHandoffSummary(sessionID, nextSelection)
+    → HandoffPolicy detects route change
+    → generates and saves summary if needed
+    ↓
+executeWithSelection(ctx, sessionID, content, nextSelection, ...)
+    → starts new ProviderSegment on the new route
+```
+
+When `OnSegmentEnd` returns `ActionTerminate`:
+
+```text
+ActionTerminate
+    ↓
+completeProviderSegment(completed)
+    ↓
+maybeConsumeQueue(sessionID)
+    → GetActiveChatRun: if active run exists, do nothing
+    → NextQueuedChatRun: if queued run exists, UpdateChatRunStatus → running → execute
+```
+
+`ModerationContext.QueueDepth` must be populated before calling `OnSegmentEnd`:
+
+```go
+queueItems, _ := s.store.ListPendingQueueItems(sessionID)
+decision := moderator.OnSegmentEnd(core.ModerationContext{
+    Session:       session,
+    ActiveSegment: segment,
+    Reason:        reason,
+    QueueDepth:    len(queueItems),
+})
+```
+
+### Implementation Checklist
+
+- `handleFailover(ctx, sessionID, failedSelection, content, ...)` in `server.go`
+- `resolveChatSelectionExcluding(sessionID, excludeRouteID)` in `server.go`
+- `maybeConsumeQueue(sessionID)` in `server.go`, called after `ActionTerminate`
+- Wire `segmentEndReason` → `moderator.OnSegmentEnd` → `switch decision.Action` in `streamSessionMessage`
+- Populate `ModerationContext.QueueDepth` from `ListPendingQueueItems`
 
 ## Tool Runtime And Approval Policy
 

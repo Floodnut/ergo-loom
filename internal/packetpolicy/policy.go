@@ -62,6 +62,11 @@ func (FlatTrimPolicy) Build(ctx core.PacketBuildContext) core.ContextPacket {
 	assembled := systemLines(ctx)
 	assembled = append(assembled, "", "Conversation context:")
 	assembled = append(assembled, trimLines(contextLines, defaultBudget/2)...)
+	if kbLines, refs := knowledgeSection(ctx); len(kbLines) > 0 {
+		assembled = append(assembled, "", "Relevant knowledge:")
+		assembled = append(assembled, kbLines...)
+		packet.References = append(packet.References, refs...)
+	}
 	assembled = append(assembled, "", "Latest user message:", ctx.UserInput)
 	packet.Content = trimPacket(strings.Join(assembled, "\n"), defaultBudget)
 	return packet
@@ -117,6 +122,11 @@ func (SegmentChainPolicy) Build(ctx core.PacketBuildContext) core.ContextPacket 
 	}
 	assembled = append(assembled, "", "Conversation context:")
 	assembled = append(assembled, trimLines(contextLines, budget/2)...)
+	if kbLines, refs := knowledgeSection(ctx); len(kbLines) > 0 {
+		assembled = append(assembled, "", "Relevant knowledge:")
+		assembled = append(assembled, kbLines...)
+		packet.References = append(packet.References, refs...)
+	}
 	assembled = append(assembled, "", "Latest user message:", ctx.UserInput)
 	packet.Content = trimPacket(strings.Join(assembled, "\n"), budget)
 	return packet
@@ -149,6 +159,23 @@ func systemLines(ctx core.PacketBuildContext) []string {
 		lines = append(lines, "Context note: "+strings.TrimSpace(ctx.Note))
 	}
 	return lines
+}
+
+func knowledgeSection(ctx core.PacketBuildContext) ([]string, []core.ContextReference) {
+	if ctx.RetrieveKnowledge == nil || strings.TrimSpace(ctx.UserInput) == "" {
+		return nil, nil
+	}
+	items, err := ctx.RetrieveKnowledge(ctx.UserInput)
+	if err != nil || len(items) == 0 {
+		return nil, nil
+	}
+	lines := make([]string, 0, len(items))
+	refs := make([]core.ContextReference, 0, len(items))
+	for _, item := range items {
+		lines = append(lines, fmt.Sprintf("- [%s] %s", item.Kind, item.Title))
+		refs = append(refs, core.ContextReference{Kind: "knowledge", ID: item.ID, Ref: item.ContentRef})
+	}
+	return lines, refs
 }
 
 func messageLines(ancestors []core.Event, messages []core.Message, skipContent string) []string {

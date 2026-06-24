@@ -18,6 +18,7 @@ import (
 	"github.com/Floodnut/ergo-loom/internal/chatfilter"
 	"github.com/Floodnut/ergo-loom/internal/core"
 	"github.com/Floodnut/ergo-loom/internal/handoffpolicy"
+	"github.com/Floodnut/ergo-loom/internal/knowledge"
 	"github.com/Floodnut/ergo-loom/internal/packetpolicy"
 	"github.com/Floodnut/ergo-loom/internal/provider"
 	"github.com/Floodnut/ergo-loom/internal/routepolicy"
@@ -33,6 +34,7 @@ type Server struct {
 	packetPolicies  packetpolicy.Registry
 	handoffPolicies handoffpolicy.Registry
 	routePolicies   routepolicy.Registry
+	knowledge       core.KnowledgeRetriever
 }
 
 const providerSoftTokenCap = 50000
@@ -149,6 +151,7 @@ func NewServer(store sqlitecli.Store) Server {
 		packetPolicies:  packetpolicy.NewRegistry(),
 		handoffPolicies: handoffpolicy.NewRegistry(),
 		routePolicies:   routepolicy.NewRegistry(),
+		knowledge:       knowledge.NewKeywordRetriever(store),
 		drivers: provider.NewDriverRegistry(
 			provider.CodexAppServerDriver{},
 			provider.UnavailableDriver{ProviderID: "openai", Reason: "ChatGPT handoff driver is not implemented yet"},
@@ -2015,6 +2018,17 @@ func (s Server) buildContextPacket(sessionID string, latestUserInput string, sel
 		ContextBudget: contextBudget,
 		RouteLabel:    selection.Route.DisplayName + " / " + selection.Model.DisplayName,
 		LoadSummary:   s.store.GetSummary,
+		RetrieveKnowledge: func(text string) ([]core.KnowledgeItem, error) {
+			if s.knowledge == nil {
+				return nil, nil
+			}
+			return s.knowledge.Search(context.Background(), core.KnowledgeQuery{
+				SessionID: session.ID,
+				ProjectID: session.ProjectID,
+				Text:      text,
+				Limit:     3,
+			})
+		},
 	}
 	packet := policy.Build(pbc)
 
@@ -2024,22 +2038,6 @@ func (s Server) buildContextPacket(sessionID string, latestUserInput string, sel
 	}
 	for _, event := range ancestors {
 		packet.References = append(packet.References, core.ContextReference{Kind: string(event.Type), ID: event.ID, Ref: event.PayloadRef})
-	}
-
-	// KB section: append relevant knowledge to packet content and references.
-	if strings.TrimSpace(latestUserInput) != "" {
-		if kbItems, err := s.store.SearchKnowledge(sqlitecli.KnowledgeSearchOptions{
-			Query: latestUserInput,
-			Limit: 3,
-		}); err == nil && len(kbItems) > 0 {
-			var kbLines []string
-			kbLines = append(kbLines, "Relevant knowledge:")
-			for _, item := range kbItems {
-				kbLines = append(kbLines, fmt.Sprintf("- [%s] %s", item.Kind, item.Title))
-				packet.References = append(packet.References, core.ContextReference{Kind: "knowledge", ID: item.ID, Ref: item.ContentRef})
-			}
-			packet.Content = strings.Join([]string{packet.Content, "", strings.Join(kbLines, "\n")}, "\n")
-		}
 	}
 
 	return packet

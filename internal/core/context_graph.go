@@ -1,6 +1,9 @@
 package core
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 type EventType string
 
@@ -216,6 +219,24 @@ type KnowledgeItem struct {
 	UpdatedAt     time.Time
 }
 
+type KnowledgeQuery struct {
+	SessionID string
+	ProjectID string
+	Scope     KnowledgeScope
+	Text      string
+	Limit     int
+}
+
+type KnowledgeRetriever interface {
+	Search(ctx context.Context, q KnowledgeQuery) ([]KnowledgeItem, error)
+}
+
+type VectorStore interface {
+	Upsert(ctx context.Context, id string, vector []float32, metadata map[string]string) error
+	Search(ctx context.Context, vector []float32, limit int) ([]string, error)
+	Delete(ctx context.Context, id string) error
+}
+
 // SummaryPayload is stored as objects/summaries/<id>.json and referenced
 // by a summary.created event via PayloadRef = "summary:<id>".
 type SummaryPayload struct {
@@ -261,7 +282,8 @@ type PacketBuildContext struct {
 	RouteLabel    string // e.g. "Claude Code CLI / Claude Sonnet 4.6"
 	// LoadSummary retrieves a SummaryPayload by ID (from a summary.created event PayloadRef).
 	// May be nil if no summary loader is available.
-	LoadSummary func(id string) (SummaryPayload, error)
+	LoadSummary       func(id string) (SummaryPayload, error)
+	RetrieveKnowledge func(text string) ([]KnowledgeItem, error)
 }
 
 // ContextPacketPolicy builds a ContextPacket from a PacketBuildContext.
