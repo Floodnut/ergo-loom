@@ -2,6 +2,8 @@ if (new URLSearchParams(window.location.search).get("desktop") === "1" || (windo
   document.documentElement.classList.add("desktop-shell");
 }
 
+let sessionPushSource: EventSource | null = null;
+
 function installDesktopWindowChrome() {
   const bridge = (window as any).ergoLoom;
   const hitbox = document.querySelector("#window-titlebar-hitbox");
@@ -825,6 +827,7 @@ async function createSession() {
 async function selectSession(sessionId, options: { resetActivity?: boolean } = {}) {
   const shouldResetActivity = options.resetActivity ?? true;
   state.selectedSessionId = sessionId;
+  connectSessionPush(sessionId);
   renderSessions();
   if (shouldResetActivity) {
     resetReasoningStream();
@@ -1186,6 +1189,83 @@ function stopTerminalCommand() {
   if (controller) controller.abort();
 }
 
+// runEventContext tracks per-stream rendering state for handleRunEvent.
+function makeRunEventContext() {
+  return { assistantNode: null as Element | null, assistantContent: "", lastStatus: "", assistantActivity: null as Element | null };
+}
+
+function handleRunEvent(event: { type: string; payload: any }, ctx: ReturnType<typeof makeRunEventContext>) {
+  if (event.type === "message") {
+    appendMessage(event.payload.Role, event.payload.Content);
+  }
+  if (event.type === "assistant_start") {
+    ctx.assistantNode = appendMessage("assistant", "", { activityIndex: nextAssistantActivityIndex() });
+    ctx.assistantActivity = ensureMessageActivity(ctx.assistantNode);
+  }
+  if (event.type === "assistant_delta" && ctx.assistantNode) {
+    ctx.assistantContent += event.payload.text;
+    renderMarkdown(ctx.assistantNode.querySelector(".content"), ctx.assistantContent.trimEnd());
+    els.messages.scrollTop = els.messages.scrollHeight;
+  }
+  if (event.type === "assistant_status" && event.payload.text !== ctx.lastStatus) {
+    ctx.lastStatus = event.payload.text;
+    appendReasoning(event.payload.text);
+    appendMessageActivity(ctx.assistantActivity, "status", event.payload);
+  }
+  if (event.type === "tool_start") {
+    appendActivityEvent("tool", event.payload);
+    appendMessageActivity(ctx.assistantActivity, "tool", event.payload);
+  }
+  if (event.type === "tool_result") {
+    appendActivityEvent("result", event.payload);
+    appendMessageActivity(ctx.assistantActivity, "result", event.payload);
+  }
+  if (event.type === "approval_request") {
+    appendActivityEvent("approval", event.payload);
+    appendMessageActivity(ctx.assistantActivity, "approval", event.payload);
+    addToolApproval(event.payload);
+  }
+  if (event.type === "tool_error" || event.type === "turn_aborted") {
+    if (event.payload.approvalId) removeToolApproval(event.payload.approvalId);
+    appendActivityEvent("error", event.payload);
+    appendMessageActivity(ctx.assistantActivity, "error", event.payload);
+  }
+  if (event.type === "error") {
+    appendActivityEvent("error", { text: event.payload.message, toolName: "chat" });
+    appendMessageActivity(ctx.assistantActivity, "error", { text: event.payload.message, toolName: "chat" });
+  }
+  if (event.type === "candidate_ready" && event.payload.candidateOutput) {
+    const co = event.payload.candidateOutput;
+    appendActivityEvent("candidate", { candidateId: co.ID, text: "Parallel candidate ready" });
+  }
+  if (event.type === "run_completed") {
+    selectSession(state.selectedSessionId, { resetActivity: false }).catch(() => {});
+  }
+}
+
+function connectSessionPush(sessionId: string) {
+  if (sessionPushSource) {
+    sessionPushSource.close();
+    sessionPushSource = null;
+  }
+  if (!sessionId) return;
+  const src = new EventSource(`/api/sessions/${encodeURIComponent(sessionId)}/push`);
+  sessionPushSource = src;
+  const ctx = makeRunEventContext();
+  src.addEventListener("push", (e: MessageEvent) => {
+    if (state.selectedSessionId !== sessionId) return;
+    try {
+      const ev = JSON.parse(e.data);
+      handleRunEvent(ev, ctx);
+    } catch {}
+  });
+  src.onerror = () => {
+    if (sessionPushSource === src) {
+      setTimeout(() => connectSessionPush(sessionId), 3000);
+    }
+  };
+}
+
 async function streamMessage(sessionId, content, selectionOverride: any = {}) {
   const selected = selectedModelOption();
   const routeId = selectionOverride.routeId || selected?.routeId || "";
@@ -1194,21 +1274,13 @@ async function streamMessage(sessionId, content, selectionOverride: any = {}) {
   const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages/stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      content,
-      routeId,
-      modelId,
-      thinkingEffort,
-    }),
+    body: JSON.stringify({ content, routeId, modelId, thinkingEffort }),
   });
   if (!response.ok || !response.body) {
     throw new Error(`Request failed: ${response.status}`);
   }
 
-  let assistantNode = null;
-  let assistantContent = "";
-  let lastStatus = "";
-  let assistantActivity = null;
+  const ctx = makeRunEventContext();
   resetReasoningStream();
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -1223,48 +1295,8 @@ async function streamMessage(sessionId, content, selectionOverride: any = {}) {
     for (const line of lines) {
       if (!line.trim()) continue;
       const event = JSON.parse(line);
-      if (event.type === "message") {
-        appendMessage(event.payload.Role, event.payload.Content);
-      }
-      if (event.type === "assistant_start") {
-        assistantNode = appendMessage("assistant", "", { activityIndex: nextAssistantActivityIndex() });
-        assistantActivity = ensureMessageActivity(assistantNode);
-      }
-      if (event.type === "assistant_delta" && assistantNode) {
-        assistantContent += event.payload.text;
-        renderMarkdown(assistantNode.querySelector(".content"), assistantContent.trimEnd());
-        els.messages.scrollTop = els.messages.scrollHeight;
-      }
-      if (event.type === "assistant_status" && event.payload.text !== lastStatus) {
-        lastStatus = event.payload.text;
-        appendReasoning(event.payload.text);
-        appendMessageActivity(assistantActivity, "status", event.payload);
-      }
-      if (event.type === "tool_start") {
-        appendActivityEvent("tool", event.payload);
-        appendMessageActivity(assistantActivity, "tool", event.payload);
-      }
-      if (event.type === "tool_result") {
-        appendActivityEvent("result", event.payload);
-        appendMessageActivity(assistantActivity, "result", event.payload);
-      }
-      if (event.type === "approval_request") {
-        appendActivityEvent("approval", event.payload);
-        appendMessageActivity(assistantActivity, "approval", event.payload);
-        addToolApproval(event.payload);
-      }
-      if (event.type === "tool_error" || event.type === "turn_aborted") {
-        if (event.payload.approvalId) {
-          removeToolApproval(event.payload.approvalId);
-        }
-        appendActivityEvent("error", event.payload);
-        appendMessageActivity(assistantActivity, "error", event.payload);
-      }
-      if (event.type === "error") {
-        appendActivityEvent("error", { text: event.payload.message, toolName: "chat" });
-        appendMessageActivity(assistantActivity, "error", { text: event.payload.message, toolName: "chat" });
-        return;
-      }
+      handleRunEvent(event, ctx);
+      if (event.type === "error") return;
     }
   }
 }

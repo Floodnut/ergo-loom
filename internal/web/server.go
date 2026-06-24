@@ -35,6 +35,7 @@ type PolicyEntry struct {
 type Server struct {
 	store              sqlitecli.Store
 	approvals          *approvalBroker
+	push               *sessionPushBroker
 	filters            chatfilter.Chain
 	drivers            provider.DriverRegistry
 	packetPolicies     packetpolicy.Registry
@@ -119,6 +120,57 @@ func (s Server) projectFromRequest(r *http.Request, projects []sqlitecli.Project
 	return s.store.DefaultProject()
 }
 
+// sessionPushBroker fans out run events to long-lived SSE subscribers per session.
+// Background runs (queue, steering, parallel) publish here so the FE can render
+// results without holding an open POST stream.
+type sessionPushBroker struct {
+	mu   sync.Mutex
+	subs map[string][]chan pushEvent
+}
+
+type pushEvent struct {
+	Kind    string `json:"type"`
+	Payload any    `json:"payload"`
+}
+
+func newSessionPushBroker() *sessionPushBroker {
+	return &sessionPushBroker{subs: make(map[string][]chan pushEvent)}
+}
+
+func (b *sessionPushBroker) subscribe(sessionID string) chan pushEvent {
+	ch := make(chan pushEvent, 64)
+	b.mu.Lock()
+	b.subs[sessionID] = append(b.subs[sessionID], ch)
+	b.mu.Unlock()
+	return ch
+}
+
+func (b *sessionPushBroker) unsubscribe(sessionID string, ch chan pushEvent) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	list := b.subs[sessionID]
+	for i, c := range list {
+		if c == ch {
+			b.subs[sessionID] = append(list[:i], list[i+1:]...)
+			break
+		}
+	}
+}
+
+func (b *sessionPushBroker) publish(sessionID string, kind string, payload any) {
+	b.mu.Lock()
+	list := make([]chan pushEvent, len(b.subs[sessionID]))
+	copy(list, b.subs[sessionID])
+	b.mu.Unlock()
+	ev := pushEvent{Kind: kind, Payload: payload}
+	for _, ch := range list {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+}
+
 type approvalBroker struct {
 	mu      sync.Mutex
 	pending map[string]chan string
@@ -169,6 +221,7 @@ func NewServer(store sqlitecli.Store) Server {
 	return Server{
 		store:           store,
 		approvals:       newApprovalBroker(),
+		push:            newSessionPushBroker(),
 		filters:         chatfilter.NewChain(chatfilter.IdentityFilter{}),
 		packetPolicies:  packetpolicy.NewRegistry(),
 		handoffPolicies: handoffpolicy.NewRegistry(),
@@ -218,6 +271,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/sessions/{sessionID}/queue", s.sessionQueue)
 	mux.HandleFunc("POST /api/sessions/{sessionID}/parallel", s.startParallelRun)
 	mux.HandleFunc("DELETE /api/sessions/{sessionID}/run", s.cancelSessionRun)
+	mux.HandleFunc("GET /api/sessions/{sessionID}/push", s.sessionPush)
 	mux.HandleFunc("PATCH /api/candidates/{candidateID}", s.updateCandidateOutput)
 	mux.HandleFunc("GET /api/sessions/", s.session)
 	mux.HandleFunc("PATCH /api/sessions/", s.renameSession)
@@ -649,6 +703,43 @@ func (s *Server) cancelSessionRun(w http.ResponseWriter, r *http.Request) {
 	}
 	s.cancelActiveRun(sessionID)
 	writeJSON(w, map[string]any{"cancelled": true})
+}
+
+func (s *Server) sessionPush(w http.ResponseWriter, r *http.Request) {
+	sessionID := strings.TrimSpace(r.PathValue("sessionID"))
+	if sessionID == "" {
+		writeError(w, errors.New("session id is required"), http.StatusBadRequest)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, errors.New("streaming is not supported"), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	ch := s.push.subscribe(sessionID)
+	defer s.push.unsubscribe(sessionID, ch)
+
+	// Send a ping so the client knows the channel is open.
+	fmt.Fprintf(w, "event: connected\ndata: {}\n\n")
+	flusher.Flush()
+
+	for {
+		select {
+		case ev := <-ch:
+			data, err := json.Marshal(ev)
+			if err != nil {
+				continue
+			}
+			fmt.Fprintf(w, "event: push\ndata: %s\n\n", data)
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
 }
 
 func (s *Server) addSteeringToActiveRun(sessionID string, content string) (sqlitecli.SteeringRecord, core.ChatRun, core.ProviderSegment, error) {
@@ -1752,6 +1843,9 @@ func (s *Server) maybeConsumeQueue(sessionID string) {
 	if err != nil {
 		return
 	}
+	onEvent := func(kind string, payload any) {
+		s.push.publish(sessionID, kind, payload)
+	}
 	switch item.Mode {
 	case core.QueueItemParallel:
 		go func() {
@@ -1764,7 +1858,7 @@ func (s *Server) maybeConsumeQueue(sessionID string) {
 			return
 		}
 		go func() {
-			_ = s.executeMainRun(context.Background(), req, func(string, any) {})
+			_ = s.executeMainRun(context.Background(), req, onEvent)
 		}()
 	default:
 		req, err := s.runRequestFromQueueItem(item)
@@ -1772,7 +1866,7 @@ func (s *Server) maybeConsumeQueue(sessionID string) {
 			return
 		}
 		go func() {
-			_ = s.executeMainRun(context.Background(), req, func(string, any) {})
+			_ = s.executeMainRun(context.Background(), req, onEvent)
 		}()
 	}
 }
@@ -1826,12 +1920,16 @@ func (s *Server) startParallelRunFromQueueItem(item core.QueueItem) error {
 			text = runErr.Error()
 		}
 		s.completeProviderSegment(seg.ID, segStatus, "")
-		s.store.UpdateCandidateOutput(candidate.ID, text, candidateStatus)
+		updated, _ := s.store.UpdateCandidateOutput(candidate.ID, text, candidateStatus)
 		runStatus := core.ChatRunCompleted
 		if runErr != nil {
 			runStatus = core.ChatRunFailed
 		}
 		s.store.CompleteChatRun(run.ID, runStatus, "")
+		s.push.publish(item.SessionID, "candidate_ready", map[string]any{
+			"candidateOutput": updated,
+			"chatRunId":       run.ID,
+		})
 	}()
 	return nil
 }
