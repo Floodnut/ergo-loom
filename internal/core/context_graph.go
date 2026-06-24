@@ -211,6 +211,26 @@ type KnowledgeItem struct {
 	UpdatedAt     time.Time
 }
 
+// PacketBuildContext is the input to a ContextPacketPolicy.
+type PacketBuildContext struct {
+	Session       Session
+	Messages      []Message
+	Ancestors     []Event
+	HeadEventID   string
+	UserInput     string
+	Note          string
+	ContextBudget int    // max chars; 0 = policy default
+	RouteLabel    string // e.g. "Claude Code CLI / Claude Sonnet 4.6"
+}
+
+// ContextPacketPolicy builds a ContextPacket from a PacketBuildContext.
+// Implementations define how messages, summaries, and KB items are selected
+// and assembled. New policies can be registered without changing core logic.
+type ContextPacketPolicy interface {
+	Name() string
+	Build(ctx PacketBuildContext) ContextPacket
+}
+
 type EventInput struct {
 	Type           EventType
 	ProjectID      string

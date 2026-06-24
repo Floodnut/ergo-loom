@@ -63,10 +63,11 @@ type AccessRoute struct {
 }
 
 type Project struct {
-	ID          string
-	DisplayName string
-	RootPath    string
-	IsDefault   bool
+	ID            string
+	DisplayName   string
+	RootPath      string
+	IsDefault     bool
+	ContextPolicy string
 }
 
 type CommandRun struct {
@@ -261,7 +262,10 @@ func (s Store) Init() error {
 	if err := s.run(string(schema)); err != nil {
 		return err
 	}
-	return s.ensureSessionProjectColumn()
+	if err := s.ensureSessionProjectColumn(); err != nil {
+		return err
+	}
+	return s.ensureProjectContextPolicyColumn()
 }
 
 func (s Store) ListSessions() ([]core.Session, error) {
@@ -1767,7 +1771,7 @@ ORDER BY provider_plugin_id ASC, access_mode ASC, id ASC;
 
 func (s Store) DefaultProject() (Project, error) {
 	out, err := s.queryJSON(`
-SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy
 FROM projects
 ORDER BY is_default DESC, created_at ASC
 LIMIT 1;
@@ -1787,7 +1791,7 @@ LIMIT 1;
 
 func (s Store) ListProjects() ([]Project, error) {
 	out, err := s.queryJSON(`
-SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy
 FROM projects
 ORDER BY is_default DESC, display_name ASC;
 `)
@@ -1818,7 +1822,7 @@ VALUES (%s, %s, %s, 0);
 		return Project{}, err
 	}
 	out, err := s.queryJSON(fmt.Sprintf(`
-SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy
 FROM projects
 WHERE id = %s;
 `, quote(projectID)))
@@ -1850,9 +1854,31 @@ func (s Store) RenameProject(projectID string, displayName string) (Project, err
 		return Project{}, err
 	}
 	out, err := s.queryJSON(fmt.Sprintf(`
-SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy
 FROM projects
 WHERE id = %s;
+`, quote(projectID)))
+	if err != nil {
+		return Project{}, err
+	}
+	var rows []projectRow
+	if err := json.Unmarshal([]byte(emptyArray(out)), &rows); err != nil {
+		return Project{}, err
+	}
+	if len(rows) == 0 {
+		return Project{}, ErrNotFound
+	}
+	return rows[0].toCore(), nil
+}
+
+func (s Store) GetProject(projectID string) (Project, error) {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return Project{}, errors.New("project id is required")
+	}
+	out, err := s.queryJSON(fmt.Sprintf(`
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy
+FROM projects WHERE id = %s;
 `, quote(projectID)))
 	if err != nil {
 		return Project{}, err
@@ -1873,7 +1899,7 @@ func (s Store) DeleteProject(projectID string) error {
 		return errors.New("project id is required")
 	}
 	out, err := s.queryJSON(fmt.Sprintf(`
-SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default
+SELECT id, display_name, COALESCE(root_path, '') AS root_path, is_default, COALESCE(context_policy, 'flat-trim') AS context_policy
 FROM projects
 WHERE id = %s;
 `, quote(projectID)))
@@ -2499,6 +2525,17 @@ func (s Store) queryJSON(sql string) (string, error) {
 	return string(out), nil
 }
 
+func (s Store) ensureProjectContextPolicyColumn() error {
+	out, err := s.queryJSON(`PRAGMA table_info(projects);`)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(out, `"name":"context_policy"`) {
+		return nil
+	}
+	return s.run(`ALTER TABLE projects ADD COLUMN context_policy TEXT NOT NULL DEFAULT 'flat-trim';`)
+}
+
 func (s Store) ensureSessionProjectColumn() error {
 	out, err := s.queryJSON(`PRAGMA table_info(sessions);`)
 	if err != nil {
@@ -2713,10 +2750,11 @@ type accessRouteRow struct {
 }
 
 type projectRow struct {
-	ID          string `json:"id"`
-	DisplayName string `json:"display_name"`
-	RootPath    string `json:"root_path"`
-	IsDefault   int    `json:"is_default"`
+	ID            string `json:"id"`
+	DisplayName   string `json:"display_name"`
+	RootPath      string `json:"root_path"`
+	IsDefault     int    `json:"is_default"`
+	ContextPolicy string `json:"context_policy"`
 }
 
 type commandRunRow struct {
@@ -2735,10 +2773,11 @@ type commandRunRow struct {
 
 func (r projectRow) toCore() Project {
 	return Project{
-		ID:          r.ID,
-		DisplayName: r.DisplayName,
-		RootPath:    r.RootPath,
-		IsDefault:   r.IsDefault != 0,
+		ID:            r.ID,
+		DisplayName:   r.DisplayName,
+		RootPath:      r.RootPath,
+		IsDefault:     r.IsDefault != 0,
+		ContextPolicy: r.ContextPolicy,
 	}
 }
 

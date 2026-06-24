@@ -17,16 +17,18 @@ import (
 	webapp "github.com/Floodnut/ergo-loom/apps/desktop-or-web"
 	"github.com/Floodnut/ergo-loom/internal/chatfilter"
 	"github.com/Floodnut/ergo-loom/internal/core"
+	"github.com/Floodnut/ergo-loom/internal/packetpolicy"
 	"github.com/Floodnut/ergo-loom/internal/provider"
 	"github.com/Floodnut/ergo-loom/internal/storage/sqlitecli"
 	"github.com/Floodnut/ergo-loom/internal/toolruntime"
 )
 
 type Server struct {
-	store     sqlitecli.Store
-	approvals *approvalBroker
-	filters   chatfilter.Chain
-	drivers   provider.DriverRegistry
+	store         sqlitecli.Store
+	approvals     *approvalBroker
+	filters       chatfilter.Chain
+	drivers       provider.DriverRegistry
+	packetPolicies packetpolicy.Registry
 }
 
 const providerSoftTokenCap = 50000
@@ -137,9 +139,10 @@ func (b *approvalBroker) resolve(id string, decision string) bool {
 
 func NewServer(store sqlitecli.Store) Server {
 	return Server{
-		store:     store,
-		approvals: newApprovalBroker(),
-		filters:   chatfilter.NewChain(chatfilter.IdentityFilter{}),
+		store:          store,
+		approvals:      newApprovalBroker(),
+		filters:        chatfilter.NewChain(chatfilter.IdentityFilter{}),
+		packetPolicies: packetpolicy.NewRegistry(),
 		drivers: provider.NewDriverRegistry(
 			provider.CodexAppServerDriver{},
 			provider.UnavailableDriver{ProviderID: "openai", Reason: "ChatGPT handoff driver is not implemented yet"},
@@ -1666,8 +1669,6 @@ func moderatorGroupOrder(pref sqlitecli.ModeratorPreference, routes []sqlitecli.
 	return compactStrings(ordered)
 }
 
-const maxContextPacketChars = 12000
-
 func (s Server) buildContextPacket(sessionID string, latestUserInput string, selection chatSelection, note string) core.ContextPacket {
 	session, messages, err := s.store.GetSession(sessionID)
 	if err != nil {
@@ -1680,149 +1681,78 @@ func (s Server) buildContextPacket(sessionID string, latestUserInput string, sel
 		}
 	}
 
-	now := time.Now().UTC()
-	packet := core.ContextPacket{
-		ID:        fmt.Sprintf("context_packet_%d", now.UnixNano()),
-		ProjectID: session.ProjectID,
-		SessionID: session.ID,
-		BranchID:  "main",
-		UserInput: latestUserInput,
-		CreatedAt: now,
-	}
-
-	// Build message lookup for content retrieval via event PayloadRef.
-	msgByID := make(map[string]core.Message, len(messages))
-	for _, m := range messages {
-		msgByID[m.ID] = m
-	}
-
-	// Use event graph ancestry to determine message order and selection.
-	// Falls back to flat message list if head or ancestors are unavailable.
-	latest := strings.TrimSpace(latestUserInput)
-	contextLines := make([]string, 0, len(messages))
-
-	head, headErr := s.store.GetHead(session.ProjectID, session.ID, "main")
-	if headErr == nil {
-		packet.HeadEventID = head.EventID
-		packet.References = append(packet.References, core.ContextReference{
-			Kind: "head",
-			ID:   head.EventID,
-			Ref:  "context_heads/main",
-		})
-		if ancestors, err := s.store.ListAncestors(head.EventID, 200); err == nil {
-			for _, event := range ancestors {
-				packet.References = append(packet.References, core.ContextReference{
-					Kind: string(event.Type),
-					ID:   event.ID,
-					Ref:  event.PayloadRef,
-				})
-				if event.Type != core.EventMessageUser && event.Type != core.EventMessageAssistant {
-					continue
-				}
-				messageID := strings.TrimPrefix(event.PayloadRef, "message:")
-				msg, ok := msgByID[messageID]
-				if !ok {
-					continue
-				}
-				content := strings.TrimSpace(msg.Content)
-				if content == "" || (msg.Role == "user" && content == latest) {
-					continue
-				}
-				contextLines = append(contextLines, fmt.Sprintf("%s: %s", msg.Role, content))
-			}
-		}
-	} else {
-		// Fallback: flat message list in DB order.
-		for i, msg := range messages {
-			content := strings.TrimSpace(msg.Content)
-			if content == "" {
-				continue
-			}
-			if i == len(messages)-1 && msg.Role == "user" && content == latest {
-				continue
-			}
-			contextLines = append(contextLines, fmt.Sprintf("%s: %s", msg.Role, content))
+	// Resolve ancestors via event graph; fall back to empty slice if unavailable.
+	var ancestors []core.Event
+	var headEventID string
+	if head, err := s.store.GetHead(session.ProjectID, session.ID, "main"); err == nil {
+		headEventID = head.EventID
+		if list, err := s.store.ListAncestors(head.EventID, 200); err == nil {
+			ancestors = list
 		}
 	}
 
-	// Section: system header (always included in full).
-	systemLines := []string{
-		"You are Ergo Loom, a local AI work context manager.",
-		"Use Ergo Loom's local context as the authoritative conversation state.",
-		"Provider-owned CLI, app, browser, or remote sessions are execution channels and may be stale or unavailable.",
-		fmt.Sprintf("Selected route: %s / %s.", selection.Route.DisplayName, selection.Model.DisplayName),
+	// Determine context budget from route. 0 means policy default.
+	contextBudget := routeContextBudget(selection.Route.ID)
+
+	// Look up policy from project; fall back to flat-trim.
+	policyName := "flat-trim"
+	if proj, err := s.store.GetProject(session.ProjectID); err == nil && proj.ContextPolicy != "" {
+		policyName = proj.ContextPolicy
 	}
-	if strings.TrimSpace(note) != "" {
-		systemLines = append(systemLines, "Context note: "+strings.TrimSpace(note))
+	policy := s.packetPolicies.GetOrDefault(policyName)
+
+	pbc := core.PacketBuildContext{
+		Session:       session,
+		Messages:      messages,
+		Ancestors:     ancestors,
+		HeadEventID:   headEventID,
+		UserInput:     latestUserInput,
+		Note:          note,
+		ContextBudget: contextBudget,
+		RouteLabel:    selection.Route.DisplayName + " / " + selection.Model.DisplayName,
+	}
+	packet := policy.Build(pbc)
+
+	// Attach references for traceability.
+	if headEventID != "" {
+		packet.References = append(packet.References, core.ContextReference{Kind: "head", ID: headEventID, Ref: "context_heads/main"})
+	}
+	for _, event := range ancestors {
+		packet.References = append(packet.References, core.ContextReference{Kind: string(event.Type), ID: event.ID, Ref: event.PayloadRef})
 	}
 
-	// Section: kb — relevant knowledge items via FTS on the user's input.
-	var kbLines []string
+	// KB section: append relevant knowledge to packet content and references.
 	if strings.TrimSpace(latestUserInput) != "" {
 		if kbItems, err := s.store.SearchKnowledge(sqlitecli.KnowledgeSearchOptions{
 			Query: latestUserInput,
 			Limit: 3,
 		}); err == nil && len(kbItems) > 0 {
+			var kbLines []string
 			kbLines = append(kbLines, "Relevant knowledge:")
 			for _, item := range kbItems {
 				kbLines = append(kbLines, fmt.Sprintf("- [%s] %s", item.Kind, item.Title))
-				packet.References = append(packet.References, core.ContextReference{
-					Kind: "knowledge",
-					ID:   item.ID,
-					Ref:  item.ContentRef,
-				})
+				packet.References = append(packet.References, core.ContextReference{Kind: "knowledge", ID: item.ID, Ref: item.ContentRef})
 			}
+			packet.Content = strings.Join([]string{packet.Content, "", strings.Join(kbLines, "\n")}, "\n")
 		}
 	}
-	// Future sections slot in here: [summaries], [tool_snap].
 
-	// Section: messages (budget = half of total, newest messages kept first).
-	messageBudget := maxContextPacketChars / 2
-	selectedMessages := trimContextLines(contextLines, messageBudget)
-
-	// Section: latest user input (always included in full).
-	assembled := append(systemLines, "")
-	assembled = append(assembled, kbLines...)
-	if len(kbLines) > 0 {
-		assembled = append(assembled, "")
-	}
-	assembled = append(assembled, "Conversation context:")
-	assembled = append(assembled, selectedMessages...)
-	assembled = append(assembled, "", "Latest user message:", latestUserInput)
-
-	packet.Content = trimContextPacket(strings.Join(assembled, "\n"), maxContextPacketChars)
 	return packet
 }
 
-func trimContextLines(lines []string, maxChars int) []string {
-	if maxChars <= 0 {
-		return nil
+// routeContextBudget returns the character budget for a given access route ID.
+// Returns 0 to indicate policy default should apply.
+func routeContextBudget(routeID string) int {
+	switch routeID {
+	case "claude-code-cli":
+		return 80000
+	case "codex-subscription-cli":
+		return 60000
+	case "ollama-local":
+		return 4000
+	default:
+		return 0
 	}
-	selected := []string{}
-	used := 0
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := lines[i]
-		lineLen := len([]rune(line)) + 1
-		if used+lineLen > maxChars && len(selected) > 0 {
-			break
-		}
-		selected = append([]string{line}, selected...)
-		used += lineLen
-	}
-	return selected
-}
-
-func trimContextPacket(content string, maxChars int) string {
-	runes := []rune(content)
-	if maxChars <= 0 || len(runes) <= maxChars {
-		return content
-	}
-	return strings.Join([]string{
-		"You are Ergo Loom, a local AI work context manager.",
-		"The local context packet was truncated to fit the selected provider request.",
-		"",
-		string(runes[len(runes)-maxChars:]),
-	}, "\n")
 }
 
 func (s Server) moderatorHandoffPrompt(sessionID string, latestUserInput string, handoff moderatorHandoff) string {
