@@ -50,6 +50,27 @@ Registry categories:
 - `policies.contextPackets`
 - `policies.handoffs`
 - `policies.routeSelection`
+- `policies.toolApproval`
+- `policies.kbScope`
+
+Each policy entry in the registry has `{ name, label }` shape. UI uses these
+to populate setting dropdowns; backend uses the `name` set to validate incoming
+`PATCH /api/projects/{projectID}/settings` requests.
+
+`toolApproval` and `kbScope` are registered at server startup as static
+entries, not stored in the database. Initial values:
+
+```text
+toolApproval:
+  safe-only         — allow only read-only and safe commands, block writes
+  ask-per-command   — prompt user for each tool call before execution
+  allow-all         — execute all tool calls without approval
+
+kbScope:
+  project-only      — retrieve from current project knowledge base only
+  project-and-global — retrieve from project KB first, then global KB
+  disabled          — no knowledge retrieval
+```
 
 Provider, access route, model, and driver are distinct.
 
@@ -800,12 +821,14 @@ const (
     EventKindTurnAborted     EventKind = "turn_aborted"
 
     // Driver-internal only. Must not be passed to the onEvent callback.
-    EventKindFinal EventKind = "final"
+    eventKindFinal EventKind = "final"
 )
 ```
 
 `Event.Kind` field type changes from `string` to `EventKind`. Callers use
 `event.Kind == provider.EventKindDelta`, not `event.Kind == "delta"`.
+Tool runtime events must be converted through an explicit mapping helper, not
+with raw casts such as `provider.EventKind(toolEvent.Type)`.
 
 ### Driver Obligations
 
@@ -820,7 +843,7 @@ If a driver produces no `delta` events, it must set `ChatResponse.Streamed =
 false`. The server then calls `streamTextChunks` to simulate streaming from the
 final text.
 
-`EventKindFinal` is produced by `ClaudeCLIDriver` internally to collect the
+`eventKindFinal` is produced by drivers internally to collect the
 full text before returning. It must not be forwarded to `onEvent`. Drivers
 that accumulate text internally should follow the same pattern.
 
@@ -859,7 +882,7 @@ crash the server.
 - Change `Event.Kind` from `string` to `EventKind`
 - Replace all `event.Kind == "..."` comparisons with `EventKind` constants
 - Add `default` case to `onEvent` handler in `executeMainRun`
-- Ensure `EventKindFinal` is never passed to `onEvent` in `ClaudeCLIDriver`
+- Ensure `eventKindFinal` is never passed to `onEvent` in any driver
 
 ## Context Packet Budget Allocation
 

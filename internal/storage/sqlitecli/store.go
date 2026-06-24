@@ -2922,10 +2922,12 @@ func (s Store) ensureCandidateTriggerEventColumn() error {
 	if err != nil {
 		return err
 	}
-	if strings.Contains(out, `"name":"trigger_event_id"`) {
-		return nil
+	if !strings.Contains(out, `"name":"trigger_event_id"`) {
+		if err := s.run(`ALTER TABLE candidate_outputs ADD COLUMN trigger_event_id TEXT NOT NULL DEFAULT '';`); err != nil {
+			return err
+		}
 	}
-	return s.run(`ALTER TABLE candidate_outputs ADD COLUMN trigger_event_id TEXT NOT NULL DEFAULT '';`)
+	return s.run(`CREATE INDEX IF NOT EXISTS idx_candidate_outputs_trigger ON candidate_outputs(session_id, trigger_event_id, status);`)
 }
 
 func (s Store) ensureSessionProjectColumn() error {

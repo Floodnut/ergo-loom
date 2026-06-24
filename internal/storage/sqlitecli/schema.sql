@@ -428,9 +428,6 @@ CREATE TABLE IF NOT EXISTS candidate_outputs (
 CREATE INDEX IF NOT EXISTS idx_candidate_outputs_session
 ON candidate_outputs(session_id, status, created_at);
 
-CREATE INDEX IF NOT EXISTS idx_candidate_outputs_trigger
-ON candidate_outputs(session_id, trigger_event_id, status);
-
 CREATE TABLE IF NOT EXISTS context_packets (
   id TEXT PRIMARY KEY,
   project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,

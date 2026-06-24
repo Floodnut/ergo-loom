@@ -76,6 +76,15 @@ their priority. Provider, route, and model must stay separate:
 - Access route: how Ergo Loom reaches it, such as `claude-code-cli`.
 - Model: which model is selected, such as `Claude Sonnet 4.6`.
 
+## Schema Migration
+
+Two new columns added via the existing migration pattern:
+
+```sql
+ALTER TABLE projects ADD COLUMN tool_approval_policy TEXT NOT NULL DEFAULT 'safe-only';
+ALTER TABLE projects ADD COLUMN kb_scope_policy TEXT NOT NULL DEFAULT 'project-only';
+```
+
 ## API Shape
 
 Existing:
@@ -90,25 +99,47 @@ DELETE /api/projects/{projectID}/routes
 POST /api/projects/{projectID}/moderator
 ```
 
-Recommended next endpoint:
+New endpoint:
 
 ```text
 PATCH /api/projects/{projectID}/settings
 ```
 
-Request body:
+This endpoint handles only behavior policy fields. Identity fields (`display_name`,
+`root_path`, `is_default`) remain on `PATCH /api/projects/{projectID}`.
+
+Request body (all fields optional, only provided fields are updated):
 
 ```json
 {
-  "contextPolicy": "segment-chain",
-  "handoffPolicy": "route-change",
-  "routePolicy": "manual",
+  "contextPolicy":      "segment-chain",
+  "handoffPolicy":      "route-change",
+  "routePolicy":        "manual",
   "toolApprovalPolicy": "ask-per-command",
-  "kbScopePolicy": "project-and-global"
+  "kbScopePolicy":      "project-and-global"
 }
 ```
 
-The backend should validate each policy name against `/api/plugins`.
+Response: `200 OK` with the updated project object (same shape as `GET /api/state`
+project entries).
+
+**Validation**: each policy value must be a name registered in the corresponding
+`policies.*` category from `GET /api/plugins`. Unknown names return `400 Bad Request`.
+
+## Policy Name Binding
+
+Policy fields on a project store the registry `name`, not a display label. The
+registry is the authority. If a policy plugin is removed, the stored name becomes
+an invalid reference — the server should fall back to the default for that field
+and log a warning.
+
+```text
+project.context_policy      → policies.contextPackets[].name
+project.handoff_policy      → policies.handoffs[].name
+project.route_policy        → policies.routeSelection[].name
+project.tool_approval_policy → policies.toolApproval[].name
+project.kb_scope_policy     → policies.kbScope[].name
+```
 
 ## Collaboration Rule
 

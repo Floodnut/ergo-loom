@@ -222,7 +222,7 @@ func (d ClaudeCLIDriver) Respond(ctx context.Context, request ChatRequest, onEve
 			assistant.WriteString(event.Text)
 			streamed = true
 		}
-		if event.Kind == EventKindFinal {
+		if event.Kind == eventKindFinal {
 			assistant.Reset()
 			assistant.WriteString(event.Text)
 			continue
@@ -502,7 +502,7 @@ func claudeStreamEvent(line []byte) Event {
 	switch eventType {
 	case "assistant", "result":
 		if text != "" {
-			return Event{Kind: EventKindFinal, Text: text}
+			return Event{Kind: eventKindFinal, Text: text}
 		}
 	case "content_block_delta", "message_delta", "partial":
 		if text != "" {
